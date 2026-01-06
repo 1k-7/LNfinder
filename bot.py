@@ -44,7 +44,8 @@ total_files_found = 0
 # --- METADATA EXTRACTION ---
 def extract_metadata(file_path):
     """
-    Extracts metadata from a physical EPUB file using valid ebooklib constants.
+    Extracts metadata from a physical EPUB file.
+    Robust Cover Extraction included.
     """
     try:
         book = epub.read_epub(file_path)
@@ -64,7 +65,7 @@ def extract_metadata(file_path):
             synopsis = desc_meta[0][0]
         
         if not synopsis:
-            # Fallback to intro.xhtml (Correct constant: ITEM_DOCUMENT)
+            # Fallback to intro.xhtml
             for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
                 if 'intro' in item.get_name().lower():
                     try:
@@ -75,13 +76,32 @@ def extract_metadata(file_path):
                             break
                     except: pass
         
-        # 4. Cover (Correct constant: ITEM_IMAGE)
+        # 4. Cover (Robust Search)
         cover_image = None
-        for item in book.get_items_of_type(ebooklib.ITEM_IMAGE):
-            if item.is_cover() or 'cover' in item.get_name().lower():
+        
+        # Strategy A: Check standard Image items
+        images = list(book.get_items_of_type(ebooklib.ITEM_IMAGE))
+        
+        # Strategy B: Check 'Cover' items (if supported)
+        if hasattr(ebooklib, 'ITEM_COVER'):
+             images.extend(list(book.get_items_of_type(ebooklib.ITEM_COVER)))
+        
+        # Iterate all found images
+        for item in images:
+            name = item.get_name().lower()
+            # lncrawl uses 'cover.jpg', so check for 'cover' in filename
+            if item.is_cover() or 'cover' in name:
                 cover_image = item.get_content()
                 break
-                
+        
+        # Strategy C: Fallback - Iterate ALL items (in case type is wrong)
+        if not cover_image:
+            for item in book.get_items():
+                name = item.get_name().lower()
+                if 'cover' in name and name.endswith(('.jpg', '.jpeg', '.png')):
+                     cover_image = item.get_content()
+                     break
+
         return {
             "title": title,
             "author": author,
@@ -118,10 +138,10 @@ async def indexing_process(client, status_msg, start_id, end_id):
                     queue.task_done()
                     continue
 
-                # Run extraction in thread
+                # Run extraction
                 meta = await asyncio.to_thread(extract_metadata, path)
                 
-                # Cleanup file immediately
+                # Cleanup file
                 if os.path.exists(path):
                     os.remove(path)
 
@@ -138,7 +158,9 @@ async def indexing_process(client, status_msg, start_id, end_id):
                     })
                     global files_processed
                     files_processed += 1
-                    print(f"✅ Saved: {meta['title']}")
+                    # Explicit Log
+                    has_cover = "🖼️" if meta['cover_image'] else "❌"
+                    print(f"✅ Saved: {meta['title']} [{has_cover}]")
                 
                 queue.task_done()
                 
@@ -146,7 +168,7 @@ async def indexing_process(client, status_msg, start_id, end_id):
                 logger.error(f"⚠️ Worker Error: {e}")
                 queue.task_done()
 
-    # Start 3 Concurrent Workers
+    # Start 3 Workers
     workers = [asyncio.create_task(worker(i)) for i in range(3)]
     
     try:
@@ -210,7 +232,9 @@ PAGE_SIZE = 5
 @bot.on(events.NewMessage(pattern='/stats'))
 async def stats_handler(event):
     count = await collection.count_documents({})
-    await event.respond(f"📊 **Database Stats**\nBooks: `{count}`")
+    # Count how many have covers
+    covers = await collection.count_documents({"cover_image": {"$ne": None}})
+    await event.respond(f"📊 **Database Stats**\nBooks: `{count}`\nWith Covers: `{covers}`")
 
 @bot.on(events.NewMessage(pattern='/index', from_users=[ADMIN_ID]))
 async def start_index_handler(event):

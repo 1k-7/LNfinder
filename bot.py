@@ -44,28 +44,46 @@ total_files_found = 0
 # --- METADATA EXTRACTION ---
 def extract_metadata(file_path):
     """
-    Extracts metadata from a physical EPUB file.
-    Targeted specifically for lncrawl generated EPUBs.
+    Extracts metadata safely. Returns None only if file is completely unreadable.
     """
     try:
         book = epub.read_epub(file_path)
         
-        # 1. Title
-        title_meta = book.get_metadata('DC', 'title')
-        title = title_meta[0][0] if title_meta else "Unknown Title"
+        # 1. Title (Safe Extraction)
+        try:
+            title = book.get_metadata('DC', 'title')[0][0]
+        except (IndexError, TypeError):
+            title = "Unknown Title"
         
-        # 2. Author
-        author_meta = book.get_metadata('DC', 'creator')
-        author = author_meta[0][0] if author_meta else "Unknown Author"
+        # 2. Author (Safe Extraction)
+        try:
+            author = book.get_metadata('DC', 'creator')[0][0]
+        except (IndexError, TypeError):
+            author = "Unknown Author"
+            
+        # 3. Tags / Subjects (For better search, e.g. "Fantasy")
+        tags = []
+        try:
+            # get_metadata returns list of tuples: [('Fantasy', {}), ('Action', {})]
+            subjects = book.get_metadata('DC', 'subject')
+            for s in subjects:
+                if isinstance(s, tuple) and s[0]:
+                    tags.append(str(s[0]))
+        except Exception:
+            pass
         
-        # 3. Synopsis
+        tags_str = ", ".join(tags) if tags else ""
+
+        # 4. Synopsis
         synopsis = None
-        desc_meta = book.get_metadata('DC', 'description')
-        if desc_meta:
-            synopsis = desc_meta[0][0]
+        try:
+            desc = book.get_metadata('DC', 'description')
+            if desc:
+                synopsis = desc[0][0]
+        except: pass
         
         if not synopsis:
-            # Fallback to intro.xhtml (Correct constant: ITEM_DOCUMENT)
+            # Fallback to intro.xhtml
             for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
                 if 'intro' in item.get_name().lower():
                     try:
@@ -76,43 +94,41 @@ def extract_metadata(file_path):
                             break
                     except: pass
         
-        # 4. Cover (Strict Search)
+        # 5. Cover (Strict & Safe)
         cover_image = None
-        
-        # Only iterate over IMAGES (Binary data), ignore ITEM_COVER (HTML)
-        for item in book.get_items_of_type(ebooklib.ITEM_IMAGE):
-            name = item.get_name().lower()
-            
-            # Priority 1: Exact match for lncrawl default
-            if 'cover.jpg' in name:
-                cover_image = item.get_content()
-                break
-            
-            # Priority 2: Standard is_cover() check (Safe on ITEM_IMAGE)
-            if hasattr(item, 'is_cover') and item.is_cover():
-                cover_image = item.get_content()
-                break
-                
-            # Priority 3: Loose name match
-            if 'cover' in name:
-                cover_image = item.get_content()
-                # Don't break yet, prefer cover.jpg or is_cover if found later
-        
+        try:
+            for item in book.get_items_of_type(ebooklib.ITEM_IMAGE):
+                name = item.get_name().lower()
+                # Priority 1: Exact match for lncrawl
+                if 'cover.jpg' in name:
+                    cover_image = item.get_content()
+                    break
+                # Priority 2: Standard check
+                if hasattr(item, 'is_cover') and item.is_cover():
+                    cover_image = item.get_content()
+                    break
+                # Priority 3: Loose name match
+                if 'cover' in name:
+                    cover_image = item.get_content()
+                    # Keep looking for better match, but store this
+        except Exception:
+            pass # Keep None if failed
+
         return {
             "title": title,
             "author": author,
             "synopsis": synopsis or "No synopsis available.",
+            "tags": tags_str,
             "cover_image": cover_image
         }
     except Exception as e:
-        logger.error(f"❌ Failed to parse {file_path}: {e}")
+        logger.error(f"❌ Failed to read EPUB structure {file_path}: {e}")
         return None
 
 # --- INDEXING WORKER ---
 async def indexing_process(client, status_msg, start_id, end_id):
     global indexing_active, files_processed, total_files_found
     
-    # Load existing IDs
     existing_ids = set()
     async for doc in collection.find({}, {"file_unique_id": 1}):
         existing_ids.add(doc.get('file_unique_id'))
@@ -126,7 +142,6 @@ async def indexing_process(client, status_msg, start_id, end_id):
             try:
                 message = await queue.get()
                 
-                # Download to temp file
                 temp_filename = f"temp_{worker_id}_{message.id}.epub"
                 path = await message.download_media(file=temp_filename)
                 
@@ -134,10 +149,8 @@ async def indexing_process(client, status_msg, start_id, end_id):
                     queue.task_done()
                     continue
 
-                # Run extraction
                 meta = await asyncio.to_thread(extract_metadata, path)
                 
-                # Cleanup file
                 if os.path.exists(path):
                     os.remove(path)
 
@@ -149,13 +162,13 @@ async def indexing_process(client, status_msg, start_id, end_id):
                         "title": meta['title'],
                         "author": meta['author'],
                         "synopsis": meta['synopsis'],
+                        "tags": meta['tags'], # Added tags
                         "cover_image": meta['cover_image'],
                         "msg_id": message.id
                     })
                     global files_processed
                     files_processed += 1
                     
-                    # Log with indicator
                     has_cover = "🖼️" if meta['cover_image'] else "❌"
                     print(f"✅ Saved: {meta['title']} [{has_cover}]")
                 
@@ -165,7 +178,6 @@ async def indexing_process(client, status_msg, start_id, end_id):
                 logger.error(f"⚠️ Worker Error: {e}")
                 queue.task_done()
 
-    # Start 3 Workers
     workers = [asyncio.create_task(worker(i)) for i in range(3)]
     
     try:
@@ -190,12 +202,11 @@ async def indexing_process(client, status_msg, start_id, end_id):
                                 continue
                             await queue.put(message)
                 
-                # Update Status
                 if total_files_found - last_update_count >= 10:
                     try:
                         await status_msg.edit(
                             f"🔄 **Indexing...**\n"
-                            f"Current ID: {current_id}\n"
+                            f"ID: {current_id}\n"
                             f"Found: {total_files_found}\n"
                             f"Saved: {files_processed}"
                         )
@@ -214,12 +225,7 @@ async def indexing_process(client, status_msg, start_id, end_id):
         for w in workers: w.cancel()
         indexing_active = False
         try:
-            await status_msg.edit(
-                f"✅ **Indexing Complete!**\n"
-                f"Scanned ID: {end_id}\n"
-                f"Total Found: {total_files_found}\n"
-                f"Successfully Saved: {files_processed}"
-            )
+            await status_msg.edit(f"✅ **Done!**\nScanned: {end_id}\nSaved: {files_processed}")
         except: pass
 
 # --- BOT LOGIC ---
@@ -230,7 +236,7 @@ PAGE_SIZE = 5
 async def stats_handler(event):
     count = await collection.count_documents({})
     covers = await collection.count_documents({"cover_image": {"$ne": None}})
-    await event.respond(f"📊 **Database Stats**\nBooks: `{count}`\nWith Covers: `{covers}`")
+    await event.respond(f"📊 **Stats**\nBooks: `{count}`\nCovers: `{covers}`")
 
 @bot.on(events.NewMessage(pattern='/index', from_users=[ADMIN_ID]))
 async def start_index_handler(event):
@@ -241,22 +247,21 @@ async def start_index_handler(event):
 
     args = event.text.split()
     if len(args) < 2:
-        return await event.respond("⚠️ **Usage:**\n`/index <last_msg_id>`\nExample: `/index 5000`")
+        return await event.respond("⚠️ **Usage:**\n`/index <last_msg_id>`")
     
     try:
         if len(args) == 3:
             start_id, end_id = int(args[1]), int(args[2])
         else:
             start_id, end_id = 1, int(args[1])
-            
-        if end_id < start_id: return await event.respond("❌ End ID must be > Start ID.")
     except ValueError:
         return await event.respond("❌ Invalid ID.")
 
     indexing_active = True
-    status_msg = await event.respond(f"🚀 **Starting Indexing**\nRange: {start_id}-{end_id}...")
+    status_msg = await event.respond(f"🚀 **Starting**\nRange: {start_id}-{end_id}...")
     
-    await collection.create_index([("title", "text"), ("author", "text"), ("synopsis", "text")])
+    # Updated Index to include tags
+    await collection.create_index([("title", "text"), ("author", "text"), ("synopsis", "text"), ("tags", "text")])
     await collection.create_index("file_unique_id", unique=True)
     
     indexing_task = asyncio.create_task(indexing_process(bot, status_msg, start_id, end_id))
@@ -277,17 +282,20 @@ async def search_handler(event):
     if event.text.startswith('/'): return
     query = event.text.strip()
     
+    # 1. Text Search (Matches Title, Author, Synopsis, TAGS)
     cursor = collection.find(
         {"$text": {"$search": query}}, 
         {"score": {"$meta": "textScore"}}
     ).sort([("score", {"$meta": "textScore"})])
     results = await cursor.to_list(length=50)
     
+    # 2. Regex Fallback
     if not results:
         cursor = collection.find({
             "$or": [
                 {"title": {"$regex": query, "$options": "i"}},
-                {"author": {"$regex": query, "$options": "i"}}
+                {"author": {"$regex": query, "$options": "i"}},
+                {"tags": {"$regex": query, "$options": "i"}}
             ]
         })
         results = await cursor.to_list(length=20)
@@ -329,7 +337,10 @@ async def callback(event):
         if not b: return await event.answer("Not found")
         
         syn = (b.get('synopsis') or "No synopsis")[:800]
-        caption = f"**{b['title']}**\nAuthor: {b['author']}\n\n{syn}..."
+        tags = b.get('tags', '')
+        tag_line = f"\n🏷️ **Tags:** {tags}\n" if tags else ""
+        
+        caption = f"**{b['title']}**\nAuthor: {b['author']}{tag_line}\n\n{syn}..."
         btns = [[Button.inline("📥 Download", data=f"dl:{str(b['_id'])}")]]
         
         await event.delete()

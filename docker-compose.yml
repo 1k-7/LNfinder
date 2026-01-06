@@ -1,0 +1,23 @@
+version: '3.8'
+services:
+  mongo:
+    image: mongo:latest
+    container_name: mongodb
+    restart: always
+    volumes:
+      - mongo_data:/data/db
+
+  bot:
+    build: .
+    container_name: telegram_novel_bot
+    restart: always
+    depends_on:
+      - mongo
+    environment:
+      - MONGO_URI=mongodb://mongo:27017
+    volumes:
+      - ./sessions:/app/sessions  # Persist login sessions
+    command: python bot.py
+
+volumes:
+  mongo_data:

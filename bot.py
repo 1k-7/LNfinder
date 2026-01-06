@@ -1,6 +1,7 @@
 import asyncio
 import math
 import io
+import os
 import logging
 import warnings
 from bs4 import BeautifulSoup
@@ -8,7 +9,23 @@ from telethon import TelegramClient, events, Button
 from motor.motor_asyncio import AsyncIOMotorClient
 from ebooklib import epub
 
-from config import API_ID, API_HASH, BOT_TOKEN, CHANNEL_ID, ADMIN_ID, MONGO_URI, DB_NAME, COLLECTION_NAME
+# --- CONFIGURATION (Loaded from Environment Variables) ---
+# We use os.environ.get() to read the variables set in Docker/Cloud
+try:
+    API_ID = int(os.environ.get("API_ID"))
+    API_HASH = os.environ.get("API_HASH")
+    BOT_TOKEN = os.environ.get("BOT_TOKEN")
+    # Channel ID and Admin ID must be integers
+    CHANNEL_ID = int(os.environ.get("CHANNEL_ID")) 
+    ADMIN_ID = int(os.environ.get("ADMIN_ID"))
+    
+    # DB Defaults
+    MONGO_URI = os.environ.get("MONGO_URI", "mongodb://mongo:27017")
+    DB_NAME = os.environ.get("DB_NAME", "novel_library")
+    COLLECTION_NAME = os.environ.get("COLLECTION_NAME", "books")
+except TypeError as e:
+    print("❌ ERROR: Missing Environment Variables! Please ensure API_ID, CHANNEL_ID, and ADMIN_ID are set and are Integers.")
+    raise e
 
 # Suppress warnings
 warnings.filterwarnings("ignore")
@@ -26,17 +43,24 @@ indexing_task = None
 files_processed = 0
 total_files_found = 0
 
-# --- METADATA EXTRACTION (From previous indexer) ---
+# --- METADATA EXTRACTION ---
 def extract_metadata(file_bytes):
     try:
         book = epub.read_epub(io.BytesIO(file_bytes))
         
         # Title & Author
-        title = (book.get_metadata('DC', 'title') or [[None]])[0][0] or "Unknown"
-        author = (book.get_metadata('DC', 'creator') or [[None]])[0][0] or "Unknown"
+        title_meta = book.get_metadata('DC', 'title')
+        title = title_meta[0][0] if title_meta else "Unknown"
+        
+        author_meta = book.get_metadata('DC', 'creator')
+        author = author_meta[0][0] if author_meta else "Unknown"
         
         # Synopsis
-        synopsis = (book.get_metadata('DC', 'description') or [[None]])[0][0]
+        synopsis = None
+        desc_meta = book.get_metadata('DC', 'description')
+        if desc_meta:
+            synopsis = desc_meta[0][0]
+        
         if not synopsis:
             # Fallback to intro.xhtml for lncrawl generated epubs
             for item in book.get_items_of_type(epub.IN_EpubHtml):
@@ -62,7 +86,8 @@ def extract_metadata(file_bytes):
             "synopsis": synopsis or "No synopsis available.",
             "cover_image": cover_image
         }
-    except Exception:
+    except Exception as e:
+        # logger.error(f"Metadata error: {e}")
         return None
 
 # --- INDEXING WORKER ---
@@ -137,7 +162,9 @@ async def indexing_process(client, status_msg):
         # Cleanup
         for w in workers: w.cancel()
         indexing_active = False
-        await status_msg.edit(f"✅ **Indexing Complete!**\nTotal Scanned: {total_files_found}\nNew Added: {files_processed}")
+        try:
+            await status_msg.edit(f"✅ **Indexing Complete!**\nTotal Scanned: {total_files_found}\nNew Added: {files_processed}")
+        except: pass
 
 # --- BOT LOGIC ---
 bot = TelegramClient('bot_session', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
@@ -175,7 +202,7 @@ async def stop_index_handler(event):
 async def start_handler(event):
     await event.respond("📚 **Novel Bot**\n\nSend a keyword to search.\nAdmin commands: `/index`, `/stop_index`")
 
-# --- SEARCH & DOWNLOAD LOGIC (Same as before) ---
+# --- SEARCH & DOWNLOAD LOGIC ---
 @bot.on(events.NewMessage)
 async def search_handler(event):
     if event.text.startswith('/'): return

@@ -44,48 +44,39 @@ total_files_found = 0
 # --- METADATA EXTRACTION ---
 def extract_metadata(file_path):
     """
-    Extracts metadata safely. Returns None only if file is completely unreadable.
+    Extracts metadata, assuming Cover is always the first page (Spine[0]).
     """
     try:
         book = epub.read_epub(file_path)
         
-        # 1. Title (Safe Extraction)
-        try:
-            title = book.get_metadata('DC', 'title')[0][0]
-        except (IndexError, TypeError):
-            title = "Unknown Title"
+        # 1. Title
+        try: title = book.get_metadata('DC', 'title')[0][0]
+        except: title = "Unknown Title"
         
-        # 2. Author (Safe Extraction)
-        try:
-            author = book.get_metadata('DC', 'creator')[0][0]
-        except (IndexError, TypeError):
-            author = "Unknown Author"
+        # 2. Author
+        try: author = book.get_metadata('DC', 'creator')[0][0]
+        except: author = "Unknown Author"
             
-        # 3. Tags / Subjects (For better search, e.g. "Fantasy")
+        # 3. Tags
         tags = []
         try:
-            # get_metadata returns list of tuples: [('Fantasy', {}), ('Action', {})]
             subjects = book.get_metadata('DC', 'subject')
             for s in subjects:
-                if isinstance(s, tuple) and s[0]:
-                    tags.append(str(s[0]))
-        except Exception:
-            pass
-        
-        tags_str = ", ".join(tags) if tags else ""
+                if isinstance(s, tuple) and s[0]: tags.append(str(s[0]))
+        except: pass
+        tags_str = ", ".join(tags)
 
         # 4. Synopsis
         synopsis = None
         try:
             desc = book.get_metadata('DC', 'description')
-            if desc:
-                synopsis = desc[0][0]
+            if desc: synopsis = desc[0][0]
         except: pass
         
+        # Fallback Synopsis (Intro page)
         if not synopsis:
-            # Fallback to intro.xhtml
-            for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
-                if 'intro' in item.get_name().lower():
+            for item in book.get_items():
+                if 'intro' in item.get_name().lower() and item.media_type == 'application/xhtml+xml':
                     try:
                         soup = BeautifulSoup(item.get_content(), 'html.parser')
                         div = soup.find('div', class_='synopsis')
@@ -94,25 +85,43 @@ def extract_metadata(file_path):
                             break
                     except: pass
         
-        # 5. Cover (Strict & Safe)
+        # 5. Cover (First Page Strategy)
         cover_image = None
+        
         try:
-            for item in book.get_items_of_type(ebooklib.ITEM_IMAGE):
-                name = item.get_name().lower()
-                # Priority 1: Exact match for lncrawl
-                if 'cover.jpg' in name:
+            # Get the first item from the spine (The "First Page")
+            if book.spine:
+                # spine item is tuple: ('item_id', 'yes/no')
+                first_item_id = book.spine[0][0] 
+                first_item = book.get_item_with_id(first_item_id)
+                
+                if first_item:
+                    # Parse HTML to find the image src
+                    soup = BeautifulSoup(first_item.get_content(), 'html.parser')
+                    img_tag = soup.find('img')
+                    
+                    if img_tag and img_tag.get('src'):
+                        img_href = img_tag['src']
+                        # The href might be relative (e.g., "../images/cover.jpg")
+                        # We need to match it to an item in the book
+                        
+                        # Clean up path (remove ../ or ./ prefix)
+                        clean_href = os.path.basename(img_href)
+                        
+                        # Find the image item matching this filename
+                        for item in book.get_items():
+                            if item.media_type.startswith('image/') and clean_href in item.file_name:
+                                cover_image = item.get_content()
+                                break
+        except Exception as e:
+            logger.warning(f"Failed first-page cover extraction: {e}")
+
+        # Fallback: If First Page strategy failed, try brute force 'cover.jpg'
+        if not cover_image:
+            for item in book.get_items():
+                if item.media_type.startswith('image/') and 'cover.jpg' in item.get_name().lower():
                     cover_image = item.get_content()
                     break
-                # Priority 2: Standard check
-                if hasattr(item, 'is_cover') and item.is_cover():
-                    cover_image = item.get_content()
-                    break
-                # Priority 3: Loose name match
-                if 'cover' in name:
-                    cover_image = item.get_content()
-                    # Keep looking for better match, but store this
-        except Exception:
-            pass # Keep None if failed
 
         return {
             "title": title,
@@ -122,7 +131,7 @@ def extract_metadata(file_path):
             "cover_image": cover_image
         }
     except Exception as e:
-        logger.error(f"❌ Failed to read EPUB structure {file_path}: {e}")
+        logger.error(f"❌ Failed to read EPUB {file_path}: {e}")
         return None
 
 # --- INDEXING WORKER ---
@@ -162,7 +171,7 @@ async def indexing_process(client, status_msg, start_id, end_id):
                         "title": meta['title'],
                         "author": meta['author'],
                         "synopsis": meta['synopsis'],
-                        "tags": meta['tags'], # Added tags
+                        "tags": meta['tags'],
                         "cover_image": meta['cover_image'],
                         "msg_id": message.id
                     })
@@ -260,7 +269,6 @@ async def start_index_handler(event):
     indexing_active = True
     status_msg = await event.respond(f"🚀 **Starting**\nRange: {start_id}-{end_id}...")
     
-    # Updated Index to include tags
     await collection.create_index([("title", "text"), ("author", "text"), ("synopsis", "text"), ("tags", "text")])
     await collection.create_index("file_unique_id", unique=True)
     
@@ -282,14 +290,12 @@ async def search_handler(event):
     if event.text.startswith('/'): return
     query = event.text.strip()
     
-    # 1. Text Search (Matches Title, Author, Synopsis, TAGS)
     cursor = collection.find(
         {"$text": {"$search": query}}, 
         {"score": {"$meta": "textScore"}}
     ).sort([("score", {"$meta": "textScore"})])
     results = await cursor.to_list(length=50)
     
-    # 2. Regex Fallback
     if not results:
         cursor = collection.find({
             "$or": [

@@ -3,9 +3,11 @@ import math
 import os
 import logging
 import warnings
+import io
 from bs4 import BeautifulSoup
 from telethon import TelegramClient, events, Button
 from motor.motor_asyncio import AsyncIOMotorClient
+import ebooklib
 from ebooklib import epub
 
 # --- CONFIGURATION ---
@@ -42,8 +44,7 @@ total_files_found = 0
 # --- METADATA EXTRACTION ---
 def extract_metadata(file_path):
     """
-    Extracts metadata from a physical EPUB file.
-    Returns dict or None.
+    Extracts metadata from a physical EPUB file using valid ebooklib constants.
     """
     try:
         book = epub.read_epub(file_path)
@@ -63,8 +64,8 @@ def extract_metadata(file_path):
             synopsis = desc_meta[0][0]
         
         if not synopsis:
-            # Fallback to intro.xhtml (common in lncrawl)
-            for item in book.get_items_of_type(epub.IN_EpubHtml):
+            # Fallback to intro.xhtml (Correct constant: ITEM_DOCUMENT)
+            for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
                 if 'intro' in item.get_name().lower():
                     try:
                         soup = BeautifulSoup(item.get_content(), 'html.parser')
@@ -74,9 +75,9 @@ def extract_metadata(file_path):
                             break
                     except: pass
         
-        # 4. Cover
+        # 4. Cover (Correct constant: ITEM_IMAGE)
         cover_image = None
-        for item in book.get_items_of_type(epub.IN_EpubImage):
+        for item in book.get_items_of_type(ebooklib.ITEM_IMAGE):
             if item.is_cover() or 'cover' in item.get_name().lower():
                 cover_image = item.get_content()
                 break
@@ -95,7 +96,7 @@ def extract_metadata(file_path):
 async def indexing_process(client, status_msg, start_id, end_id):
     global indexing_active, files_processed, total_files_found
     
-    # Load existing IDs to prevent duplicates
+    # Load existing IDs
     existing_ids = set()
     async for doc in collection.find({}, {"file_unique_id": 1}):
         existing_ids.add(doc.get('file_unique_id'))
@@ -109,14 +110,21 @@ async def indexing_process(client, status_msg, start_id, end_id):
             try:
                 message = await queue.get()
                 
-                # 1. Download to temporary file
+                # Download to temp file
                 temp_filename = f"temp_{worker_id}_{message.id}.epub"
                 path = await message.download_media(file=temp_filename)
                 
-                # 2. Extract Metadata (Blocking call in thread)
+                if not path:
+                    queue.task_done()
+                    continue
+
+                # Run extraction in thread
                 meta = await asyncio.to_thread(extract_metadata, path)
                 
-                # 3. Save to DB if valid
+                # Cleanup file immediately
+                if os.path.exists(path):
+                    os.remove(path)
+
                 if meta:
                     await collection.insert_one({
                         "file_id": message.file.id,
@@ -125,25 +133,20 @@ async def indexing_process(client, status_msg, start_id, end_id):
                         "title": meta['title'],
                         "author": meta['author'],
                         "synopsis": meta['synopsis'],
-                        "cover_image": meta['cover_image'], # Binary
+                        "cover_image": meta['cover_image'],
                         "msg_id": message.id
                     })
-                    
                     global files_processed
                     files_processed += 1
                     print(f"✅ Saved: {meta['title']}")
                 
-                # 4. Delete file
-                if os.path.exists(path):
-                    os.remove(path)
-                    
                 queue.task_done()
                 
             except Exception as e:
                 logger.error(f"⚠️ Worker Error: {e}")
                 queue.task_done()
 
-    # Start 3 Concurrent Workers (Safer for disk I/O)
+    # Start 3 Concurrent Workers
     workers = [asyncio.create_task(worker(i)) for i in range(3)]
     
     try:
@@ -164,11 +167,8 @@ async def indexing_process(client, status_msg, start_id, end_id):
                         if not message: continue
                         if message.file and message.file.name and message.file.name.endswith('.epub'):
                             total_files_found += 1
-                            
-                            # Skip if already exists
                             if str(message.file.id) in existing_ids:
                                 continue
-                            
                             await queue.put(message)
                 
                 # Update Status
@@ -187,7 +187,7 @@ async def indexing_process(client, status_msg, start_id, end_id):
                 logger.error(f"Batch Error {current_id}: {e}")
             
             current_id += BATCH_SIZE
-            await asyncio.sleep(2) # Respect Telegram limits
+            await asyncio.sleep(2) 
 
         await queue.join()
         
@@ -209,7 +209,6 @@ PAGE_SIZE = 5
 
 @bot.on(events.NewMessage(pattern='/stats'))
 async def stats_handler(event):
-    """Check how many books are actually in DB"""
     count = await collection.count_documents({})
     await event.respond(f"📊 **Database Stats**\nBooks: `{count}`")
 
@@ -237,7 +236,6 @@ async def start_index_handler(event):
     indexing_active = True
     status_msg = await event.respond(f"🚀 **Starting Indexing**\nRange: {start_id}-{end_id}...")
     
-    # Create Indexes
     await collection.create_index([("title", "text"), ("author", "text"), ("synopsis", "text")])
     await collection.create_index("file_unique_id", unique=True)
     
@@ -259,14 +257,12 @@ async def search_handler(event):
     if event.text.startswith('/'): return
     query = event.text.strip()
     
-    # 1. Full Text Search (Fast)
     cursor = collection.find(
         {"$text": {"$search": query}}, 
         {"score": {"$meta": "textScore"}}
     ).sort([("score", {"$meta": "textScore"})])
     results = await cursor.to_list(length=50)
     
-    # 2. Regex Fallback (Slow but matches substrings like "Over" -> "Overgeared")
     if not results:
         cursor = collection.find({
             "$or": [

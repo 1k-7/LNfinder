@@ -9,22 +9,19 @@ from telethon import TelegramClient, events, Button
 from motor.motor_asyncio import AsyncIOMotorClient
 from ebooklib import epub
 
-# --- CONFIGURATION (Loaded from Environment Variables) ---
-# We use os.environ.get() to read the variables set in Docker/Cloud
+# --- CONFIGURATION ---
 try:
     API_ID = int(os.environ.get("API_ID"))
     API_HASH = os.environ.get("API_HASH")
     BOT_TOKEN = os.environ.get("BOT_TOKEN")
-    # Channel ID and Admin ID must be integers
     CHANNEL_ID = int(os.environ.get("CHANNEL_ID")) 
     ADMIN_ID = int(os.environ.get("ADMIN_ID"))
     
-    # DB Defaults
     MONGO_URI = os.environ.get("MONGO_URI", "mongodb://mongo:27017")
     DB_NAME = os.environ.get("DB_NAME", "novel_library")
     COLLECTION_NAME = os.environ.get("COLLECTION_NAME", "books")
-except TypeError as e:
-    print("❌ ERROR: Missing Environment Variables! Please ensure API_ID, CHANNEL_ID, and ADMIN_ID are set and are Integers.")
+except Exception as e:
+    print("❌ ERROR: Missing Env Vars! Ensure API_ID, CHANNEL_ID, ADMIN_ID are set.")
     raise e
 
 # Suppress warnings
@@ -62,7 +59,7 @@ def extract_metadata(file_bytes):
             synopsis = desc_meta[0][0]
         
         if not synopsis:
-            # Fallback to intro.xhtml for lncrawl generated epubs
+            # Fallback to intro.xhtml
             for item in book.get_items_of_type(epub.IN_EpubHtml):
                 if 'intro' in item.get_name().lower():
                     try:
@@ -87,17 +84,16 @@ def extract_metadata(file_bytes):
             "cover_image": cover_image
         }
     except Exception as e:
-        # logger.error(f"Metadata error: {e}")
         return None
 
 # --- INDEXING WORKER ---
-async def indexing_process(client, status_msg):
+async def indexing_process(client, status_msg, start_id, end_id):
     global indexing_active, files_processed, total_files_found
     
     # 1. Load existing IDs to skip
     existing_ids = set()
     async for doc in collection.find({}, {"file_unique_id": 1}):
-        existing_ids.add(doc['file_unique_id'])
+        existing_ids.add(doc.get('file_unique_id'))
     
     logger.info(f"Loaded {len(existing_ids)} existing books.")
     
@@ -130,40 +126,65 @@ async def indexing_process(client, status_msg):
                 logger.error(f"Error in worker: {e}")
                 queue.task_done()
 
-    # Start 5 concurrent workers
+    # Start Workers
     workers = [asyncio.create_task(worker()) for _ in range(5)]
     
     try:
-        count = 0
+        current_id = start_id
         last_update_count = 0
-        
-        # Iterate channel history
-        async for message in client.iter_messages(CHANNEL_ID, reverse=True):
-            if not indexing_active: break
+        BATCH_SIZE = 20  # <--- CHANGED TO 20
+
+        # Loop from Start ID to End ID in batches
+        while current_id <= end_id and indexing_active:
+            # Calculate batch range
+            batch_end = min(current_id + BATCH_SIZE, end_id + 1)
+            ids_to_fetch = list(range(current_id, batch_end))
             
-            if message.file and message.file.name and message.file.name.endswith('.epub'):
-                total_files_found += 1
-                if message.file.id in existing_ids:
-                    continue
+            if not ids_to_fetch: break
+
+            try:
+                # Batch fetch messages by ID (Allowed for Bots)
+                messages = await client.get_messages(CHANNEL_ID, ids=ids_to_fetch)
                 
-                await queue.put(message)
-                count += 1
+                if messages:
+                    for message in messages:
+                        if not message: continue # Message might be None (deleted)
+
+                        if message.file and message.file.name and message.file.name.endswith('.epub'):
+                            total_files_found += 1
+                            
+                            # Skip if already indexed
+                            if message.file.id in existing_ids:
+                                continue
+                            
+                            await queue.put(message)
                 
-                # Update status message every 50 files
-                if count - last_update_count >= 50:
+                # Update Status Message
+                if total_files_found - last_update_count >= 10: # Update more frequently
                     try:
-                        await status_msg.edit(f"🔄 **Indexing in Progress**\nFound: {total_files_found}\nQueued: {count}\nProcessed: {files_processed}")
-                        last_update_count = count
+                        await status_msg.edit(
+                            f"🔄 **Indexing...**\n"
+                            f"Current ID: {current_id}\n"
+                            f"Found: {total_files_found}\n"
+                            f"Processed: {files_processed}"
+                        )
+                        last_update_count = total_files_found
                     except: pass
+            
+            except Exception as e:
+                logger.error(f"Error fetching batch {current_id}: {e}")
+            
+            # Move to next batch
+            current_id += BATCH_SIZE
+            await asyncio.sleep(1.5) # Increased sleep slightly for safety with small batches
 
         await queue.join()
         
     finally:
-        # Cleanup
         for w in workers: w.cancel()
         indexing_active = False
         try:
-            await status_msg.edit(f"✅ **Indexing Complete!**\nTotal Scanned: {total_files_found}\nNew Added: {files_processed}")
+            await status_msg.edit(f"✅ **Indexing Complete!**\nScanned up to ID: {end_id}\nTotal Found: {total_files_found}\nAdded: {files_processed}")
         except: pass
 
 # --- BOT LOGIC ---
@@ -178,15 +199,37 @@ async def start_index_handler(event):
         await event.respond("⚠️ Indexing is already running.")
         return
 
-    indexing_active = True
-    status_msg = await event.respond("🚀 **Starting Indexing...**\nReading database state...")
+    # Parse arguments
+    args = event.text.split()
+    if len(args) < 2:
+        await event.respond("⚠️ **Usage:**\n`/index <last_msg_id>`\nExample: `/index 5000` (Indexes 1 to 5000)")
+        return
     
-    # Ensure indexes exist
+    try:
+        if len(args) == 3:
+            start_id = int(args[1])
+            end_id = int(args[2])
+        else:
+            start_id = 1
+            end_id = int(args[1])
+            
+        if end_id < start_id:
+            await event.respond("❌ End ID must be greater than Start ID.")
+            return
+
+    except ValueError:
+        await event.respond("❌ Invalid ID. Please provide numbers.")
+        return
+
+    indexing_active = True
+    status_msg = await event.respond(f"🚀 **Starting Indexing**\nRange: {start_id} to {end_id}\nReading database...")
+    
+    # Ensure indexes
     await collection.create_index([("title", "text"), ("author", "text"), ("synopsis", "text")])
     await collection.create_index("file_unique_id", unique=True)
     
     # Start background task
-    indexing_task = asyncio.create_task(indexing_process(bot, status_msg))
+    indexing_task = asyncio.create_task(indexing_process(bot, status_msg, start_id, end_id))
 
 @bot.on(events.NewMessage(pattern='/stop_index', from_users=[ADMIN_ID]))
 async def stop_index_handler(event):
@@ -196,11 +239,11 @@ async def stop_index_handler(event):
         return
         
     indexing_active = False
-    await event.respond("🛑 **Stopping...** (Workers will finish current tasks)")
+    await event.respond("🛑 **Stopping...** (Workers will finish current queue)")
 
 @bot.on(events.NewMessage(pattern='/start'))
 async def start_handler(event):
-    await event.respond("📚 **Novel Bot**\n\nSend a keyword to search.\nAdmin commands: `/index`, `/stop_index`")
+    await event.respond("📚 **Novel Bot**\n\nSend a keyword to search.\n\n**Admin:**\n`/index <last_id>` to scrape.")
 
 # --- SEARCH & DOWNLOAD LOGIC ---
 @bot.on(events.NewMessage)
@@ -266,7 +309,7 @@ async def callback(event):
         try:
             await bot.send_file(event.chat_id, b['file_id'], caption=b['title'])
         except:
-            # Fallback if file_id expired
+            # Fallback
             await bot.forward_messages(event.chat_id, b['msg_id'], CHANNEL_ID)
 
 print("Bot Running...")

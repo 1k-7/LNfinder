@@ -45,7 +45,7 @@ total_files_found = 0
 def extract_metadata(file_path):
     """
     Extracts metadata from a physical EPUB file.
-    Robust Cover Extraction included.
+    Targeted specifically for lncrawl generated EPUBs.
     """
     try:
         book = epub.read_epub(file_path)
@@ -65,7 +65,7 @@ def extract_metadata(file_path):
             synopsis = desc_meta[0][0]
         
         if not synopsis:
-            # Fallback to intro.xhtml
+            # Fallback to intro.xhtml (Correct constant: ITEM_DOCUMENT)
             for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
                 if 'intro' in item.get_name().lower():
                     try:
@@ -76,32 +76,28 @@ def extract_metadata(file_path):
                             break
                     except: pass
         
-        # 4. Cover (Robust Search)
+        # 4. Cover (Strict Search)
         cover_image = None
         
-        # Strategy A: Check standard Image items
-        images = list(book.get_items_of_type(ebooklib.ITEM_IMAGE))
-        
-        # Strategy B: Check 'Cover' items (if supported)
-        if hasattr(ebooklib, 'ITEM_COVER'):
-             images.extend(list(book.get_items_of_type(ebooklib.ITEM_COVER)))
-        
-        # Iterate all found images
-        for item in images:
+        # Only iterate over IMAGES (Binary data), ignore ITEM_COVER (HTML)
+        for item in book.get_items_of_type(ebooklib.ITEM_IMAGE):
             name = item.get_name().lower()
-            # lncrawl uses 'cover.jpg', so check for 'cover' in filename
-            if item.is_cover() or 'cover' in name:
+            
+            # Priority 1: Exact match for lncrawl default
+            if 'cover.jpg' in name:
                 cover_image = item.get_content()
                 break
+            
+            # Priority 2: Standard is_cover() check (Safe on ITEM_IMAGE)
+            if hasattr(item, 'is_cover') and item.is_cover():
+                cover_image = item.get_content()
+                break
+                
+            # Priority 3: Loose name match
+            if 'cover' in name:
+                cover_image = item.get_content()
+                # Don't break yet, prefer cover.jpg or is_cover if found later
         
-        # Strategy C: Fallback - Iterate ALL items (in case type is wrong)
-        if not cover_image:
-            for item in book.get_items():
-                name = item.get_name().lower()
-                if 'cover' in name and name.endswith(('.jpg', '.jpeg', '.png')):
-                     cover_image = item.get_content()
-                     break
-
         return {
             "title": title,
             "author": author,
@@ -158,7 +154,8 @@ async def indexing_process(client, status_msg, start_id, end_id):
                     })
                     global files_processed
                     files_processed += 1
-                    # Explicit Log
+                    
+                    # Log with indicator
                     has_cover = "🖼️" if meta['cover_image'] else "❌"
                     print(f"✅ Saved: {meta['title']} [{has_cover}]")
                 
@@ -232,7 +229,6 @@ PAGE_SIZE = 5
 @bot.on(events.NewMessage(pattern='/stats'))
 async def stats_handler(event):
     count = await collection.count_documents({})
-    # Count how many have covers
     covers = await collection.count_documents({"cover_image": {"$ne": None}})
     await event.respond(f"📊 **Database Stats**\nBooks: `{count}`\nWith Covers: `{covers}`")
 

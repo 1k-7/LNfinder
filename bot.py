@@ -398,6 +398,7 @@ async def search_handler(client, message):
             btns.append([InlineKeyboardButton(f"📖 {label}", callback_data=f"v:{str(b['_id'])}")])
         
         btns.append([InlineKeyboardButton("➡️ Next", callback_data=f"n:1:{q[:20]}")])
+        # Use HTML for Search Results (simple formatting)
         await message.reply(txt, reply_markup=InlineKeyboardMarkup(btns), parse_mode=ParseMode.HTML)
     except Exception as e: await message.reply(f"⚠️ {e}")
 
@@ -450,25 +451,21 @@ async def callback_handler(client, callback_query):
             auth = b.get('author', 'Unknown')
             syn = b.get('synopsis', 'No synopsis.')
             
-            # --- MANUAL ENTITY CONSTRUCTION ---
-            # NOTE: We DO NOT use ParseMode.HTML here because we use manual entities
-            # to guarantee the Expandable Blockquote works correctly.
-            
+            # --- MANUAL ENTITIES (FIXED) ---
+            # 1. Prepare Text
             header = f"{title}\nAuthor: {auth}\n\n"
             syn_label = "SYNOPSIS\n"
             full_text = header + syn_label + syn
             
-            # Calculate UTF-16 Offsets
+            # 2. Calculate Offsets (UTF-16)
             off_title = 0
             len_title = len_utf16(title)
-            
             off_syn_block = len_utf16(header)
             len_syn_block = len_utf16(syn_label + syn)
-            
             off_syn_label = off_syn_block
             len_syn_label = len_utf16("SYNOPSIS")
             
-            # Fallback for older Pyrogram versions
+            # 3. Choose Entity Type (Safe)
             try:
                 qt_type = MessageEntityType.EXPANDABLE_BLOCKQUOTE
             except AttributeError:
@@ -485,35 +482,29 @@ async def callback_handler(client, callback_query):
             
             await callback_query.message.delete()
             
-            # Try Sending Photo first (Cover)
-            sent = False
+            # 4. Send Message (IMPORTANT: parse_mode=None)
             if b.get('cover_image'):
-                try:
-                    f = io.BytesIO(b['cover_image']); f.name="c.jpg"
-                    await client.send_photo(
-                        callback_query.message.chat.id, 
-                        f, 
-                        caption=full_text, 
-                        caption_entities=entities, # Manual Entities
-                        reply_markup=InlineKeyboardMarkup(kb)
-                    )
-                    sent = True
-                except Exception as img_err:
-                    logger.error(f"Image Send Failed: {img_err}")
-                    # If image fails (corrupt data), fall through to text-only
-            
-            # Text Only Fallback
-            if not sent:
+                f = io.BytesIO(b['cover_image']); f.name="c.jpg"
+                await client.send_photo(
+                    callback_query.message.chat.id, 
+                    f, 
+                    caption=full_text, 
+                    caption_entities=entities, 
+                    reply_markup=InlineKeyboardMarkup(kb),
+                    parse_mode=None # Explicitly disable auto-parsing
+                )
+            else:
                 await client.send_message(
                     callback_query.message.chat.id, 
                     full_text, 
-                    entities=entities, # Manual Entities
-                    reply_markup=InlineKeyboardMarkup(kb)
+                    entities=entities, 
+                    reply_markup=InlineKeyboardMarkup(kb),
+                    parse_mode=None # Explicitly disable auto-parsing
                 )
-                
         except Exception as e: 
             logger.error(f"View Error: {e}")
-            await callback_query.answer(f"Error: {e}", show_alert=True)
+            # Fallback for error viewing
+            await callback_query.message.reply(f"❌ Error: {e}", quote=True)
 
     elif d.startswith("d:"):
         try:

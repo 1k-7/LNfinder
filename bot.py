@@ -1,13 +1,10 @@
 import asyncio
-import math
 import os
 import logging
 import warnings
 import io
 import zipfile
-import html
 import re
-import random
 import json
 import base64
 import xml.etree.ElementTree as ET
@@ -18,10 +15,10 @@ from pyrogram import Client, filters, idle
 from pyrogram.types import (
     InlineKeyboardMarkup, 
     InlineKeyboardButton, 
-    Message,
     MessageEntity
 )
 from pyrogram.enums import ParseMode, MessageEntityType
+from pyrogram.errors import FloodWait
 
 # --- CONFIGURATION ---
 try:
@@ -152,7 +149,6 @@ def parse_epub_direct(file_path):
                     if 'cover' in n.lower() and n.endswith(('.jpg','.png')): 
                         cover_href = n
                         break
-            
             if cover_href:
                 try:
                     if '/' in opf_path and '/' not in cover_href:
@@ -175,14 +171,14 @@ def parse_epub_direct(file_path):
     return meta
 
 # --- PYROGRAM CLIENT ---
+# sleep_threshold=60 prevents the bot from freezing for too long on FloodWait
 app = Client(
     "novel_bot_session",
     api_id=API_ID,
     api_hash=API_HASH,
-    bot_token=BOT_TOKEN
+    bot_token=BOT_TOKEN,
+    sleep_threshold=60 
 )
-
-PAGE_SIZE = 8
 
 # --- INDEXING PROCESS ---
 async def indexing_process(client, start_id, end_id, status_msg):
@@ -190,10 +186,8 @@ async def indexing_process(client, start_id, end_id, status_msg):
     queue = asyncio.Queue(maxsize=30)
     
     if status_msg: 
-        try:
-            await status_msg.edit("🚀 **Starting Scan...**")
-        except:
-            pass
+        try: await status_msg.edit(f"🚀 **Starting Scan...**\nRange: {start_id} - {end_id}")
+        except: pass
 
     async def worker():
         while indexing_active:
@@ -243,40 +237,56 @@ async def indexing_process(client, start_id, end_id, status_msg):
                 logger.error(f"Worker Error: {e}")
                 queue.task_done()
 
-    workers = [asyncio.create_task(worker()) for _ in range(5)]
+    # Start 3 workers (5 might trigger flood wait on download)
+    workers = [asyncio.create_task(worker()) for _ in range(3)]
     
     try:
         current_id = start_id
+        BATCH_SIZE = 50 
+        
         while current_id <= end_id and indexing_active:
-            batch_end = min(current_id + 50, end_id + 1)
+            batch_end = min(current_id + BATCH_SIZE, end_id + 1)
             ids_to_fetch = list(range(current_id, batch_end))
+            
+            # Update status continuously so we know it's not stuck
+            if status_msg and (current_id % 100 == 0):
+                try:
+                    await status_msg.edit(f"🔄 **Scanning...**\nID: `{current_id}`\nFound: `{files_processed}`")
+                except FloodWait as fw:
+                    await asyncio.sleep(fw.value)
+                except: pass
+
             if not ids_to_fetch: break
 
             try:
+                # Fetch batch
                 messages = await client.get_messages(CHANNEL_ID, ids_to_fetch)
-                for message in messages:
-                    if message and message.document and message.document.file_name and message.document.file_name.endswith('.epub'):
-                        await queue.put(message)
                 
-                if status_msg and (files_processed % 20 == 0):
-                    try:
-                        await status_msg.edit(f"🔄 **Syncing...**\nScanning: `{current_id}`\nSaved: `{files_processed}`")
-                    except:
-                        pass
+                # Iterate safeley
+                if messages:
+                    for message in messages:
+                        if message and message.document and message.document.file_name and message.document.file_name.endswith('.epub'):
+                            await queue.put(message)
+                
+            except FloodWait as e:
+                logger.warning(f"FloodWait: Sleeping {e.value}s")
+                await asyncio.sleep(e.value + 1)
+                continue # Retry same batch? Or skip? Here we skip to avoid infinite loops
             except Exception as e:
                 logger.error(f"Batch Error: {e}")
             
-            current_id += 50
-            await asyncio.sleep(0.5) 
+            current_id += BATCH_SIZE
+            await asyncio.sleep(2) # Politeness delay to prevent "Stuck" freeze
+            
         await queue.join()
+        
     finally:
         for w in workers: w.cancel()
         indexing_active = False
         if status_msg:
             try:
-                await status_msg.edit(f"✅ **Done!**\nAdded: `{files_processed}`")
-            except:
-                pass
+                await status_msg.edit(f"✅ **Done!**\nScanned: `{end_id}`\nAdded: `{files_processed}`")
+            except: pass
 
 # --- COMMANDS ---
 
@@ -398,7 +408,6 @@ async def search_handler(client, message):
             btns.append([InlineKeyboardButton(f"📖 {label}", callback_data=f"v:{str(b['_id'])}")])
         
         btns.append([InlineKeyboardButton("➡️ Next", callback_data=f"n:1:{q[:20]}")])
-        # Use HTML for Search Results (simple formatting)
         await message.reply(txt, reply_markup=InlineKeyboardMarkup(btns), parse_mode=ParseMode.HTML)
     except Exception as e: await message.reply(f"⚠️ {e}")
 
@@ -451,60 +460,82 @@ async def callback_handler(client, callback_query):
             auth = b.get('author', 'Unknown')
             syn = b.get('synopsis', 'No synopsis.')
             
-            # --- MANUAL ENTITIES (FIXED) ---
-            # 1. Prepare Text
-            header = f"{title}\nAuthor: {auth}\n\n"
-            syn_label = "SYNOPSIS\n"
-            full_text = header + syn_label + syn
+            # --- MESSAGE 1: HEADER (Title/Author) in BLOCKQUOTE ---
+            header_text = f"{title}\nAuthor: {auth}"
+            header_len = len_utf16(header_text)
+            title_len = len_utf16(title)
             
-            # 2. Calculate Offsets (UTF-16)
-            off_title = 0
-            len_title = len_utf16(title)
-            off_syn_block = len_utf16(header)
-            len_syn_block = len_utf16(syn_label + syn)
-            off_syn_label = off_syn_block
-            len_syn_label = len_utf16("SYNOPSIS")
+            header_entities = [
+                # 1. Blockquote entire header
+                MessageEntity(type=MessageEntityType.BLOCKQUOTE, offset=0, length=header_len),
+                # 2. Bold Title
+                MessageEntity(type=MessageEntityType.BOLD, offset=0, length=title_len)
+            ]
+
+            # --- MESSAGE 2: SYNOPSIS in EXPANDABLE BLOCKQUOTE ---
+            syn_label = "SYNOPSIS"
+            syn_full_text = f"{syn_label}\n{syn}"
             
-            # 3. Choose Entity Type (Safe)
+            syn_total_len = len_utf16(syn_full_text)
+            label_len = len_utf16(syn_label)
+            
+            # Determine Entity (Safe Fallback)
             try:
                 qt_type = MessageEntityType.EXPANDABLE_BLOCKQUOTE
             except AttributeError:
                 qt_type = MessageEntityType.BLOCKQUOTE
             
-            entities = [
-                MessageEntity(type=MessageEntityType.BOLD, offset=off_title, length=len_title),
-                MessageEntity(type=qt_type, offset=off_syn_block, length=len_syn_block),
-                MessageEntity(type=MessageEntityType.BOLD, offset=off_syn_label, length=len_syn_label),
-                MessageEntity(type=MessageEntityType.UNDERLINE, offset=off_syn_label, length=len_syn_label)
+            syn_entities = [
+                # 1. Expandable Quote
+                MessageEntity(type=qt_type, offset=0, length=syn_total_len),
+                # 2. Bold + Underline Label
+                MessageEntity(type=MessageEntityType.BOLD, offset=0, length=label_len),
+                MessageEntity(type=MessageEntityType.UNDERLINE, offset=0, length=label_len)
             ]
             
             kb = [[InlineKeyboardButton("📥 Download", callback_data=f"d:{bid}")]]
             
             await callback_query.message.delete()
             
-            # 4. Send Message (IMPORTANT: parse_mode=None)
+            # 1. Send Header (Photo or Text)
             if b.get('cover_image'):
-                f = io.BytesIO(b['cover_image']); f.name="c.jpg"
-                await client.send_photo(
-                    callback_query.message.chat.id, 
-                    f, 
-                    caption=full_text, 
-                    caption_entities=entities, 
-                    reply_markup=InlineKeyboardMarkup(kb),
-                    parse_mode=None # Explicitly disable auto-parsing
-                )
+                try:
+                    f = io.BytesIO(b['cover_image']); f.name="c.jpg"
+                    await client.send_photo(
+                        callback_query.message.chat.id, 
+                        f, 
+                        caption=header_text, 
+                        caption_entities=header_entities, 
+                        parse_mode=None
+                    )
+                except:
+                    # Fallback
+                    await client.send_message(
+                        callback_query.message.chat.id, 
+                        header_text, 
+                        entities=header_entities, 
+                        parse_mode=None
+                    )
             else:
                 await client.send_message(
                     callback_query.message.chat.id, 
-                    full_text, 
-                    entities=entities, 
-                    reply_markup=InlineKeyboardMarkup(kb),
-                    parse_mode=None # Explicitly disable auto-parsing
+                    header_text, 
+                    entities=header_entities, 
+                    parse_mode=None
                 )
+            
+            # 2. Send Synopsis
+            await client.send_message(
+                callback_query.message.chat.id, 
+                syn_full_text, 
+                entities=syn_entities, 
+                reply_markup=InlineKeyboardMarkup(kb),
+                parse_mode=None
+            )
+                
         except Exception as e: 
             logger.error(f"View Error: {e}")
-            # Fallback for error viewing
-            await callback_query.message.reply(f"❌ Error: {e}", quote=True)
+            await callback_query.answer("Error displaying.", show_alert=True)
 
     elif d.startswith("d:"):
         try:

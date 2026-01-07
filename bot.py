@@ -101,7 +101,6 @@ def get_button_label(book_doc):
     """
     full_title = get_display_title(book_doc)
     # Regex to remove chapter info at the end (e.g., "Title c1-20" -> "Title")
-    # Matches space followed by c/ch/vol + digits + optional range
     clean_label = re.sub(r'\s+(c|ch|chap|vol|v)\.?\s*\d+(?:[-–]\d+)?.*$', '', full_title, flags=re.IGNORECASE)
     return clean_label.strip()
 
@@ -179,17 +178,30 @@ def parse_epub_direct(file_path):
 async def indexing_process(client, start_id, end_id, status_msg=None):
     global indexing_active, files_processed
     queue = asyncio.Queue(maxsize=30)
-    if status_msg: try: await status_msg.edit("🚀 **Scanning...**"); except: pass
+    
+    if status_msg:
+        try:
+            await status_msg.edit("🚀 **Scanning...**")
+        except:
+            pass
 
     async def worker():
         while indexing_active:
             try:
                 msg = await queue.get()
                 fname = f"temp_{msg.id}.epub"
-                try: path = await msg.download_media(file=fname)
-                except: queue.task_done(); continue
                 
-                if not path: queue.task_done(); continue
+                path = None
+                try: 
+                    path = await msg.download_media(file=fname)
+                except: 
+                    queue.task_done()
+                    continue
+                
+                if not path: 
+                    queue.task_done()
+                    continue
+                    
                 meta = await asyncio.to_thread(parse_epub_direct, path)
                 if os.path.exists(path): os.remove(path)
 
@@ -209,11 +221,15 @@ async def indexing_process(client, start_id, end_id, status_msg=None):
                         "cover_image": meta['cover_image'],
                         "msg_id": msg.id
                     })
-                    global files_processed; files_processed += 1
+                    global files_processed
+                    files_processed += 1
                     print(f"✅ {meta['title']}")
-                except DuplicateKeyError: pass
+                except DuplicateKeyError:
+                    pass
+                
                 queue.task_done()
-            except: queue.task_done()
+            except: 
+                queue.task_done()
 
     workers = [asyncio.create_task(worker()) for _ in range(5)]
     
@@ -228,16 +244,26 @@ async def indexing_process(client, start_id, end_id, status_msg=None):
                 for m in msgs:
                     if m and m.file and m.file.name and m.file.name.endswith('.epub'):
                         await queue.put(m)
+                        
                 if status_msg and files_processed % 20 == 0:
-                    try: await status_msg.edit(f"🔄 Scan: `{curr}`\nSaved: `{files_processed}`"); except: pass
-            except: pass
+                    try: 
+                        await status_msg.edit(f"🔄 Scan: `{curr}`\nSaved: `{files_processed}`")
+                    except: 
+                        pass
+            except: 
+                pass
+            
             curr += 50
             await asyncio.sleep(0.5)
         await queue.join()
     finally:
         for w in workers: w.cancel()
         indexing_active = False
-        if status_msg: try: await status_msg.edit(f"✅ Done! Added: `{files_processed}`"); except: pass
+        if status_msg: 
+            try: 
+                await status_msg.edit(f"✅ Done! Added: `{files_processed}`")
+            except: 
+                pass
 
 # --- STARTUP ---
 async def startup():
@@ -419,16 +445,11 @@ async def cb(e):
             syn = b.get('synopsis', 'No synopsis.')
             
             # --- MANUALLY CONSTRUCT ENTITIES ---
-            # 1. Header Block: Title (Bold) + Author
             header_text = f"{title}\nAuthor: {auth}\n\n"
-            
-            # 2. Synopsis Header
             syn_label = "SYNOPSIS\n"
-            
-            # 3. Full text string
             full_text = header_text + syn_label + syn
             
-            # 4. Calculate UTF-16 offsets for Telegram Entities
+            # Offsets
             off_title = 0
             len_title = len_utf16(title)
             
@@ -438,13 +459,9 @@ async def cb(e):
             off_syn_label = off_syn_block
             len_syn_label = len_utf16("SYNOPSIS")
             
-            # 5. Define Entities
             entities = [
-                # Bold Title
                 MessageEntityBold(offset=off_title, length=len_title),
-                # Collapsed Blockquote (covers Synopsis Label + Text)
                 MessageEntityBlockquoteExpandable(offset=off_syn_block, length=len_syn_block),
-                # Bold+Underline "SYNOPSIS" title
                 MessageEntityBold(offset=off_syn_label, length=len_syn_label),
                 MessageEntityUnderline(offset=off_syn_label, length=len_syn_label)
             ]

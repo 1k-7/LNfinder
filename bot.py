@@ -14,7 +14,7 @@ from bs4 import BeautifulSoup
 from telethon import TelegramClient, events, Button
 from telethon.errors import MessageNotModifiedError
 from motor.motor_asyncio import AsyncIOMotorClient
-from pymongo.errors import DuplicateKeyError, BulkWriteError
+from pymongo.errors import DuplicateKeyError, BulkWriteError, OperationFailure
 
 # --- CONFIGURATION ---
 try:
@@ -50,8 +50,6 @@ logger = logging.getLogger(__name__)
 # 1. Primary (Azure)
 try:
     azure_client = AsyncIOMotorClient(AZURE_URL)
-    # Ping to check connection
-    # azure_client.admin.command('ping') 
     db = azure_client[DB_NAME]
     collection = db[COLLECTION_NAME]
     logger.info("✅ Connected to Azure Cosmos DB.")
@@ -79,7 +77,6 @@ async def ensure_indexes():
     logger.info("⚙️ Verifying Azure Indexes...")
     try:
         # Cosmos DB requires specific index management usually, but Motor helps.
-        # Note: Text indexes on Cosmos might need manual creation in Portal depending on API version.
         await collection.create_index([("title", "text"), ("author", "text"), ("synopsis", "text"), ("tags", "text")])
         await collection.create_index("file_unique_id", unique=True)
         await collection.create_index("msg_id")
@@ -305,17 +302,14 @@ async def migrate_handler(event):
             batch = []
             
             async for doc in cursor:
-                # Clean _id to let Azure generate its own or upsert by unique key
                 if '_id' in doc: del doc['_id']
                 batch.append(doc)
                 
                 if len(batch) >= 100:
                     try:
-                        # Insert ordered=False continues even if duplicates fail
                         await collection.insert_many(batch, ordered=False)
                         total_migrated += len(batch)
                     except BulkWriteError as bwe:
-                        # Just duplicates, calculate actual inserted
                         inserted = bwe.details['nInserted']
                         total_migrated += inserted
                     except Exception as e:
@@ -323,14 +317,12 @@ async def migrate_handler(event):
                         logger.error(f"Batch Error: {e}")
                     
                     batch = []
-                    # Sleep slightly to avoid Azure 429 (Request Rate Too Large)
                     await asyncio.sleep(0.2)
                     
                     if total_migrated % 1000 == 0:
                         try: await status.edit(f"📥 Migrating... {total_migrated} books done.")
                         except: pass
 
-            # Flush remaining
             if batch:
                 try:
                     await collection.insert_many(batch, ordered=False)
@@ -407,16 +399,11 @@ async def import_handler(event):
         
         for i in range(0, total, batch_size):
             chunk = data[i:i+batch_size]
-            if new_bot:
-                # Logic to fetch fresh IDs if needed (Simplified for brevity)
-                pass 
-                
             for item in chunk:
                 if item.get('cover_image'):
                     try: item['cover_image'] = base64.b64decode(item['cover_image'])
                     except: item['cover_image'] = None
                 if '_id' in item: del item['_id']
-                
                 try:
                     await collection.replace_one({"file_unique_id": item['file_unique_id']}, item, upsert=True)
                 except: pass
@@ -465,7 +452,7 @@ async def stop_index_handler(event):
 async def start_handler(event):
     await event.respond("📚 **Novel Bot (Azure Edition)**\nSend a keyword to search.")
 
-# --- SEARCH ---
+# --- SEARCH (FAILSAFE) ---
 @bot.on(events.NewMessage)
 async def search_handler(event):
     if event.text.startswith('/'): return
@@ -473,18 +460,38 @@ async def search_handler(event):
 
 async def perform_search(event, query, page):
     skip = page * PAGE_SIZE
+    
+    # === FAILSAFE SEARCH LOGIC ===
+    # 1. Try Text Search. If it fails (missing index), catch error and fallback.
     try:
-        # Full Text
         cnt = await collection.count_documents({"$text": {"$search": query}})
         if cnt > 0:
-            cur = collection.find({"$text": {"$search": query}}, {"score": {"$meta": "textScore"}}).sort([("score", {"$meta": "textScore"})])
+            cursor = collection.find(
+                {"$text": {"$search": query}}, 
+                {"score": {"$meta": "textScore"}}
+            ).sort([("score", {"$meta": "textScore"})])
         else:
-            # Regex
-            reg = {"$or": [{"title": {"$regex": query, "$options": "i"}}, {"author": {"$regex": query, "$options": "i"}}, {"tags": {"$regex": query, "$options": "i"}}]}
-            cnt = await collection.count_documents(reg)
-            cur = collection.find(reg)
+            raise OperationFailure("No results or no index, fallback to regex") # Force fallback
             
-        res = await cur.skip(skip).limit(PAGE_SIZE).to_list(length=PAGE_SIZE)
+    except (OperationFailure, Exception) as e:
+        # Fallback to Regex (Slower but works without Text Index)
+        regex_query = {
+            "$or": [
+                {"title": {"$regex": query, "$options": "i"}}, 
+                {"author": {"$regex": query, "$options": "i"}}, 
+                {"tags": {"$regex": query, "$options": "i"}}
+            ]
+        }
+        try:
+            cnt = await collection.count_documents(regex_query)
+            cursor = collection.find(regex_query)
+        except Exception as deep_error:
+            await event.respond(f"❌ **Fatal Search Error**:\n`{deep_error}`")
+            return
+
+    # 2. Pagination & Display
+    try:
+        res = await cursor.skip(skip).limit(PAGE_SIZE).to_list(length=PAGE_SIZE)
         
         if not res:
             if isinstance(event, events.CallbackQuery.Event): await event.answer("End of results.", alert=True)
@@ -508,9 +515,9 @@ async def perform_search(event, query, page):
         
         if isinstance(event, events.CallbackQuery.Event): await event.edit(txt, buttons=btns, parse_mode='html')
         else: await event.respond(txt, buttons=btns, parse_mode='html')
+        
     except Exception as e:
-        logger.error(f"Search Error: {e}")
-        await event.respond("⚠️ Database error.")
+        await event.respond(f"⚠️ Search Logic Error: `{e}`")
 
 @bot.on(events.CallbackQuery)
 async def callback(event):

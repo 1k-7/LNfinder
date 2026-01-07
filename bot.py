@@ -42,6 +42,18 @@ indexing_active = False
 files_processed = 0
 total_files_found = 0
 
+# --- BACKGROUND INDEX INIT ---
+async def ensure_indexes():
+    """Run DB index creation in background to avoid blocking startup."""
+    try:
+        logger.info("⚙️ Optimizing Database Indexes...")
+        await collection.create_index([("title", "text"), ("author", "text"), ("synopsis", "text"), ("tags", "text")])
+        await collection.create_index("file_unique_id", unique=True)
+        await collection.create_index("msg_id")
+        logger.info("✅ Database Indexes Ready.")
+    except Exception as e:
+        logger.error(f"Index Creation Failed: {e}")
+
 # --- METADATA EXTRACTION ---
 def parse_epub_direct(file_path):
     meta = {
@@ -198,12 +210,13 @@ async def indexing_process(client, start_id, end_id, status_msg=None):
                 logger.error(f"⚠️ Worker Error: {e}")
                 queue.task_done()
 
+    # Start 5 concurrent workers
     workers = [asyncio.create_task(worker(i)) for i in range(5)]
     
     try:
         current_id = start_id
         last_update_count = 0
-        BATCH_SIZE = 20 
+        BATCH_SIZE = 50 
 
         while current_id <= end_id and indexing_active:
             batch_end = min(current_id + BATCH_SIZE, end_id + 1)
@@ -251,10 +264,8 @@ async def startup_sync():
     global indexing_active
     logger.info("⚙️ Bot Starting...")
     
-    # Fire and forget index creation
-    asyncio.create_task(collection.create_index([("title", "text"), ("author", "text"), ("synopsis", "text"), ("tags", "text")]))
-    asyncio.create_task(collection.create_index("file_unique_id", unique=True))
-    asyncio.create_task(collection.create_index("msg_id"))
+    # FIX: Wrap index creation in a task properly
+    asyncio.create_task(ensure_indexes())
 
     try:
         last_book = await collection.find_one(sort=[("msg_id", -1)])
@@ -294,6 +305,7 @@ async def start_index_handler(event):
     
     indexing_active = True
     msg = await event.respond(f"🚀 **Starting Manual Index**\nRange: {start} - {end}")
+    
     asyncio.create_task(indexing_process(bot, start, end, msg))
 
 @bot.on(events.NewMessage(pattern='/stop_index', from_users=[ADMIN_ID]))
@@ -402,10 +414,8 @@ async def callback(event):
         if not raw_synopsis or raw_synopsis.strip() == "": raw_synopsis = "No synopsis available."
         synopsis = html.escape(raw_synopsis)
         
-        # UI Structure
         header_html = f"<blockquote><b>{title}</b>\nAuthor: {author}</blockquote>"
-        
-        # Added Header: SYNOPSIS in Bold+Underline inside blockquote
+        # Synopsis Header
         body_html = f"<blockquote><b><u>SYNOPSIS</u></b>\n{synopsis}</blockquote>"
         
         btns = [[Button.inline("📥 Download EPUB", data=f"dl:{str(b['_id'])}")]]
@@ -418,13 +428,13 @@ async def callback(event):
             full_html = f"{header_html}\n{body_html}"
             
             if len(full_html) <= 1024:
-                # Fits in caption -> One message with everything
+                # Fits in one message
                 await bot.send_file(event.chat_id, f, caption=full_html, buttons=btns, parse_mode='html')
             else:
-                # Split -> Image with Header
+                # Split
                 await bot.send_file(event.chat_id, f, caption=header_html, parse_mode='html')
                 
-                # ... then Synopsis with Buttons attached to the end
+                # Check Synopsis Length
                 if len(body_html) > 4096:
                     chunks = [body_html[i:i+4096] for i in range(0, len(body_html), 4096)]
                     for i, chunk in enumerate(chunks):

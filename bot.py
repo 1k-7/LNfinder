@@ -24,12 +24,9 @@ try:
     CHANNEL_ID = int(os.environ.get("CHANNEL_ID")) 
     ADMIN_ID = int(os.environ.get("ADMIN_ID"))
     
-    # PRIMARY DATABASE (AZURE COSMOS DB)
     AZURE_URL = os.environ.get("AZURE_URL")
-    if not AZURE_URL:
-        raise ValueError("❌ Missing AZURE_URL! Please set your Cosmos DB connection string.")
+    if not AZURE_URL: raise ValueError("Missing AZURE_URL")
         
-    # LEGACY DATABASES (FOR MIGRATION ONLY)
     LEGACY_STR = os.environ.get("MONGO_URI") or os.environ.get("MONGO_URL") or ""
     LEGACY_URIS = LEGACY_STR.split() if LEGACY_STR else []
     
@@ -46,147 +43,186 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # --- DATABASE SETUP ---
-
-# 1. Primary (Azure)
 try:
     azure_client = AsyncIOMotorClient(AZURE_URL)
     db = azure_client[DB_NAME]
     collection = db[COLLECTION_NAME]
     logger.info("✅ Connected to Azure Cosmos DB.")
 except Exception as e:
-    logger.error(f"❌ Failed to connect to Azure: {e}")
+    logger.error(f"❌ Connection Error: {e}")
     exit(1)
 
-# 2. Legacy (Old MongoDBs)
+# Legacy DBs
 legacy_collections = []
-if LEGACY_URIS:
-    for uri in LEGACY_URIS:
-        try:
-            cli = AsyncIOMotorClient(uri)
-            legacy_collections.append(cli[DB_NAME][COLLECTION_NAME])
-        except: pass
-    logger.info(f"🔗 Detected {len(legacy_collections)} legacy databases for migration.")
+for uri in LEGACY_URIS:
+    try:
+        cli = AsyncIOMotorClient(uri)
+        legacy_collections.append(cli[DB_NAME][COLLECTION_NAME])
+    except: pass
 
 # --- GLOBAL STATE ---
 indexing_active = False
 files_processed = 0
-total_files_found = 0
 
-# --- HELPER: Ensure Indexes (Azure) ---
+# --- HELPER: Ensure Indexes ---
 async def ensure_indexes():
-    logger.info("⚙️ Verifying Azure Indexes...")
+    logger.info("⚙️ Verifying Indexes...")
     try:
         await collection.create_index([("title", "text"), ("author", "text"), ("synopsis", "text"), ("tags", "text")])
         await collection.create_index("file_unique_id", unique=True)
         await collection.create_index("msg_id")
         logger.info("✅ Indexes Ready.")
     except Exception as e:
-        logger.warning(f"⚠️ Index check failed (Ignore if using Cosmos Free Tier limited throughput): {e}")
+        logger.warning(f"⚠️ Index Warning: {e}")
 
-# --- METADATA EXTRACTION ---
+# --- METADATA EXTRACTION (ROBUST FIX) ---
 def parse_epub_direct(file_path):
     meta = {
-        "title": "Unknown Title",
+        "title": None, # Start None to detect failure
         "author": "Unknown Author",
         "synopsis": "No synopsis available.",
         "tags": "",
         "cover_image": None
     }
+    
     try:
         with zipfile.ZipFile(file_path, 'r') as z:
+            # 1. Locate OPF File
+            opf_path = None
             try:
+                # Try container.xml first
                 container = z.read('META-INF/container.xml')
                 root = ET.fromstring(container)
-                ns = {'n': 'urn:oasis:names:tc:opendocument:xmlns:container'}
-                opf_path = root.find('.//n:rootfile', ns).get('full-path')
-            except:
-                opf_path = next((f for f in z.namelist() if f.endswith('.opf')), None)
+                # Scan purely for the 'full-path' attribute, ignore namespace tags
+                for child in root.iter():
+                    if child.get('full-path'):
+                        opf_path = child.get('full-path')
+                        break
+            except: pass
             
-            if not opf_path: return meta
+            # Fallback: scan for any .opf
+            if not opf_path:
+                for name in z.namelist():
+                    if name.endswith('.opf'):
+                        opf_path = name
+                        break
+            
+            if not opf_path: return meta # Invalid EPUB
 
+            # 2. Parse OPF (The Nuclear Option)
             opf_data = z.read(opf_path)
-            it = ET.iterparse(io.BytesIO(opf_data))
-            for _, el in it:
-                if '}' in el.tag: el.tag = el.tag.split('}', 1)[1]
-            root = it.root
             
-            metadata = root.find('metadata')
-            manifest = root.find('manifest')
-            
-            if metadata is not None:
-                t = metadata.find('title')
-                if t is not None and t.text: meta['title'] = t.text
-                c = metadata.find('creator')
-                if c is not None and c.text: meta['author'] = c.text
-                d = metadata.find('description')
-                if d is not None and d.text: meta['synopsis'] = d.text
-                subjects = [s.text for s in metadata.findall('subject') if s.text]
-                meta['tags'] = ", ".join(subjects)
+            # We iterate purely as binary string to avoid XML encoding issues initially?
+            # No, standard ET is better, but we iterate EVERYTHING.
+            try:
+                root = ET.fromstring(opf_data)
+                
+                # Iterate EVERY element in the tree
+                for elem in root.iter():
+                    # Clean tag name (remove {namespace})
+                    tag = elem.tag.split('}')[-1].lower() if '}' in elem.tag else elem.tag.lower()
+                    
+                    if not elem.text: continue
+                    text = elem.text.strip()
+                    if not text: continue
 
+                    if tag == 'title':
+                        meta['title'] = text
+                    elif tag == 'creator':
+                        meta['author'] = text
+                    elif tag == 'description':
+                        meta['synopsis'] = text
+                    elif tag == 'subject':
+                        meta['tags'] += text + ", "
+
+            except Exception as e:
+                logger.error(f"XML Parse Error: {e}")
+
+            # 3. Extract Cover (Heuristic Search)
             cover_href = None
-            if metadata is not None:
-                for m in metadata.findall('meta'):
-                    if m.get('name') == 'cover':
-                        cover_id = m.get('content')
-                        for item in manifest.findall('item'):
-                            if item.get('id') == cover_id:
-                                cover_href = item.get('href')
-                                break
-            if not cover_href and manifest is not None:
-                for item in manifest.findall('item'):
-                    if item.get('properties') == 'cover-image':
+            
+            # A. Check manifest items for 'cover-image' property or id='cover'
+            # We need to find the Manifest block first
+            manifest = None
+            for elem in root.iter():
+                tag = elem.tag.split('}')[-1].lower()
+                if tag == 'manifest':
+                    manifest = elem
+                    break
+            
+            if manifest:
+                for item in manifest:
+                    item_id = item.get('id', '').lower()
+                    props = item.get('properties', '').lower()
+                    if 'cover' in item_id or 'cover-image' in props:
                         cover_href = item.get('href')
                         break
+            
+            # B. Check 'meta' tags for name='cover'
+            if not cover_href:
+                for elem in root.iter():
+                    tag = elem.tag.split('}')[-1].lower()
+                    if tag == 'meta' and elem.get('name') == 'cover':
+                        cover_id = elem.get('content')
+                        # Find matching item in manifest
+                        if manifest:
+                            for item in manifest:
+                                if item.get('id') == cover_id:
+                                    cover_href = item.get('href')
+                                    break
+            
+            # C. Filename Fallback
             if not cover_href:
                 for name in z.namelist():
-                    if 'cover.jpg' in name.lower():
+                    lower_name = name.lower()
+                    if 'cover.jpg' in lower_name or 'cover.png' in lower_name:
                         cover_href = name
                         break
 
+            # Read Cover Data
             if cover_href:
                 try:
+                    # Resolve relative paths
                     if '/' in opf_path and '/' not in cover_href and cover_href not in z.namelist():
                         folder = opf_path.rsplit('/', 1)[0]
                         full_path = f"{folder}/{cover_href}"
                     else:
                         full_path = cover_href
+                    
                     if full_path in z.namelist():
                         meta['cover_image'] = z.read(full_path)
                 except: pass
 
+            # 4. HTML Fallback for Synopsis
             if meta['synopsis'] == "No synopsis available.":
+                # Find intro/description html file
                 for name in z.namelist():
-                    if 'intro' in name.lower() and name.endswith(('.html', '.xhtml')):
-                        try:
-                            html = z.read(name)
-                            soup = BeautifulSoup(html, 'html.parser')
-                            div = soup.find('div', class_='synopsis')
-                            if div:
-                                meta['synopsis'] = div.get_text(strip=True)
-                                break
-                        except: pass
-    except Exception: pass
+                    if 'intro' in name.lower() or 'desc' in name.lower():
+                        if name.endswith(('html', 'xhtml')):
+                            try:
+                                html_content = z.read(name)
+                                soup = BeautifulSoup(html_content, 'html.parser')
+                                ps = soup.find_all('p')
+                                if ps:
+                                    meta['synopsis'] = "\n".join([p.get_text() for p in ps[:6]])
+                                    break
+                            except: pass
+
+    except Exception:
+        pass
+    
+    # Final cleanup
+    if meta['tags'].endswith(", "): meta['tags'] = meta['tags'][:-2]
+    
     return meta
 
 # --- INDEXING PROCESS ---
 async def indexing_process(client, start_id, end_id, status_msg=None):
-    global indexing_active, files_processed, total_files_found
+    global indexing_active, files_processed
     queue = asyncio.Queue(maxsize=30)
     
     if status_msg: 
-        try: await status_msg.edit("📚 **Loading Azure State...**")
-        except: pass
-
-    # Load existing IDs from Azure
-    existing_ids = set()
-    try:
-        async for doc in collection.find({}, {"file_unique_id": 1}):
-            existing_ids.add(doc.get('file_unique_id'))
-    except Exception as e:
-        logger.error(f"Failed to load state: {e}")
-
-    if status_msg: 
-        try: await status_msg.edit(f"✅ Azure Loaded ({len(existing_ids)} books).\n🚀 **Starting Scan...**")
+        try: await status_msg.edit("🚀 **Starting Scan...**")
         except: pass
 
     async def worker(worker_id):
@@ -202,7 +238,10 @@ async def indexing_process(client, start_id, end_id, status_msg=None):
                 meta = await asyncio.to_thread(parse_epub_direct, path)
                 if os.path.exists(path): os.remove(path)
 
-                if meta['title'] == "Unknown Title": meta['title'] = message.file.name
+                # Fallback: If title extraction failed, use filename
+                if not meta['title']:
+                    clean_name = message.file.name.replace('.epub', '').replace('_', ' ')
+                    meta['title'] = clean_name
 
                 try:
                     await collection.insert_one({
@@ -229,7 +268,6 @@ async def indexing_process(client, start_id, end_id, status_msg=None):
     
     try:
         current_id = start_id
-        last_update_count = 0
         BATCH_SIZE = 50 
         while current_id <= end_id and indexing_active:
             batch_end = min(current_id + BATCH_SIZE, end_id + 1)
@@ -238,20 +276,14 @@ async def indexing_process(client, start_id, end_id, status_msg=None):
 
             try:
                 messages = await client.get_messages(CHANNEL_ID, ids=ids_to_fetch)
-                if messages:
-                    for message in messages:
-                        if not message: continue
-                        if message.file and message.file.name and message.file.name.endswith('.epub'):
-                            total_files_found += 1
-                            if str(message.file.id) in existing_ids: continue
-                            await queue.put(message)
+                for message in messages:
+                    if message and message.file and message.file.name and message.file.name.endswith('.epub'):
+                        await queue.put(message)
                 
-                if status_msg and (total_files_found - last_update_count >= 20):
-                    try:
-                        await status_msg.edit(f"🔄 **Syncing Library...**\nScanning ID: `{current_id}` / `{end_id}`\nFound Files: `{total_files_found}`\nSaved New: `{files_processed}`")
-                        last_update_count = total_files_found
+                if status_msg and (files_processed % 20 == 0):
+                    try: await status_msg.edit(f"🔄 **Syncing...**\nScanning: `{current_id}`\nSaved: `{files_processed}`")
                     except: pass
-            except Exception as e: logger.error(f"Batch Error {current_id}: {e}")
+            except Exception as e: logger.error(f"Batch Error: {e}")
             current_id += BATCH_SIZE
             await asyncio.sleep(0.5) 
         await queue.join()
@@ -259,8 +291,7 @@ async def indexing_process(client, start_id, end_id, status_msg=None):
         for w in workers: w.cancel()
         indexing_active = False
         if status_msg: 
-            try: 
-                await status_msg.edit(f"✅ **Sync Complete!**\nScanned up to: `{end_id}`\nTotal Added: `{files_processed}`")
+            try: await status_msg.edit(f"✅ **Done!**\nAdded: `{files_processed}`")
             except: pass
 
 # --- STARTUP ---
@@ -271,187 +302,15 @@ async def startup_check():
     max_id = 0
     try:
         last_book = await collection.find_one(sort=[("msg_id", -1)])
-        if last_book and last_book.get('msg_id', 0) > max_id: max_id = last_book['msg_id']
+        if last_book: max_id = last_book.get('msg_id', 0)
     except: pass
-    
-    start_id = max_id + 1
-    logger.info(f"📍 Azure Last ID: {max_id}. Ready to resume from {start_id}.")
+    logger.info(f"📍 Ready. Resume ID: {max_id + 1}")
 
 # --- BOT SETUP ---
 bot = TelegramClient('bot_session', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 PAGE_SIZE = 8
 
-# --- MIGRATION LOGIC (MONGO -> AZURE) ---
-@bot.on(events.NewMessage(pattern='/migrate', from_users=[ADMIN_ID]))
-async def migrate_handler(event):
-    if not legacy_collections:
-        return await event.respond("❌ No legacy `MONGO_URI` found to migrate from.")
-    
-    status = await event.respond("🚀 **Starting Migration to Azure...**")
-    
-    total_migrated = 0
-    errors = 0
-    
-    for i, col in enumerate(legacy_collections):
-        try:
-            count = await col.count_documents({})
-            await status.edit(f"📥 Migrating DB {i+1} ({count} books)...")
-            
-            cursor = col.find({})
-            batch = []
-            
-            async for doc in cursor:
-                if '_id' in doc: del doc['_id']
-                batch.append(doc)
-                
-                if len(batch) >= 100:
-                    try:
-                        await collection.insert_many(batch, ordered=False)
-                        total_migrated += len(batch)
-                    except BulkWriteError as bwe:
-                        inserted = bwe.details['nInserted']
-                        total_migrated += inserted
-                    except Exception as e:
-                        errors += 1
-                        logger.error(f"Batch Error: {e}")
-                    
-                    batch = []
-                    await asyncio.sleep(0.2)
-                    
-                    if total_migrated % 1000 == 0:
-                        try: await status.edit(f"📥 Migrating... {total_migrated} books done.")
-                        except: pass
-
-            if batch:
-                try:
-                    await collection.insert_many(batch, ordered=False)
-                    total_migrated += len(batch)
-                except BulkWriteError as bwe:
-                    total_migrated += bwe.details['nInserted']
-                except: pass
-                
-        except Exception as e:
-            logger.error(f"Migration Error DB {i}: {e}")
-            
-    await status.edit(f"✅ **Migration Complete!**\nBooks Moved: `{total_migrated}`\nErrors: `{errors}`\nYou can now remove `MONGO_URL`.")
-
-# --- EXPORT / IMPORT ---
-@bot.on(events.NewMessage(pattern='/export', from_users=[ADMIN_ID]))
-async def export_handler(event):
-    status = await event.respond("📦 **Exporting from Azure...**")
-    file_path = "library_backup.json"
-    zip_path = "library_backup.zip"
-    
-    try:
-        with open(file_path, 'w', encoding='utf-8') as f:
-            f.write('[')
-            first = True
-            count = 0
-            async for doc in collection.find({}):
-                if not first: f.write(',')
-                first = False
-                if doc.get('cover_image'):
-                    doc['cover_image'] = base64.b64encode(doc['cover_image']).decode('utf-8')
-                doc['_id'] = str(doc['_id'])
-                json.dump(doc, f)
-                count += 1
-                if count % 1000 == 0:
-                    try: await status.edit(f"📦 Exporting... ({count})")
-                    except: pass
-            f.write(']')
-            
-        await status.edit(f"📦 Compressing...")
-        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            zipf.write(file_path)
-            
-        await status.edit("🚀 Uploading...")
-        await bot.send_file(event.chat_id, zip_path, caption=f"✅ **Azure Backup**\nBooks: {count}")
-    except Exception as e:
-        await event.respond(f"❌ Error: {e}")
-    finally:
-        if os.path.exists(file_path): os.remove(file_path)
-        if os.path.exists(zip_path): os.remove(zip_path)
-
-@bot.on(events.NewMessage(pattern='/import', from_users=[ADMIN_ID]))
-async def import_handler(event):
-    args = event.text.split()
-    new_bot = 'nb' in args
-    reply = await event.get_reply_message()
-    if not reply or not reply.file: return await event.respond("Reply to file.")
-    
-    status = await event.respond("📥 **Importing to Azure...**")
-    path = await reply.download_media()
-    
-    try:
-        if zipfile.is_zipfile(path):
-            with zipfile.ZipFile(path, 'r') as z:
-                z.extractall()
-                path = z.namelist()[0]
-        
-        with open(path, 'r') as f: data = json.load(f)
-        
-        total = len(data)
-        await status.edit(f"📥 Importing {total} books...")
-        
-        imported = 0
-        batch_size = 50
-        
-        for i in range(0, total, batch_size):
-            chunk = data[i:i+batch_size]
-            for item in chunk:
-                if item.get('cover_image'):
-                    try: item['cover_image'] = base64.b64decode(item['cover_image'])
-                    except: item['cover_image'] = None
-                if '_id' in item: del item['_id']
-                try:
-                    await collection.replace_one({"file_unique_id": item['file_unique_id']}, item, upsert=True)
-                except: pass
-            
-            imported += len(chunk)
-            if i % 500 == 0:
-                try: await status.edit(f"📥 Importing... {imported}/{total}")
-                except: pass
-                
-        await status.edit(f"✅ **Done!**")
-    except Exception as e:
-        await event.respond(f"❌ Error: {e}")
-    finally:
-        if os.path.exists(path): os.remove(path)
-
-# --- COMMANDS ---
-@bot.on(events.NewMessage(pattern='/stats'))
-async def stats_handler(event):
-    try:
-        docs = await collection.count_documents({})
-        covers = await collection.count_documents({"cover_image": {"$ne": None}})
-        await event.respond(f"📊 **Azure Library Stats**\n\n📚 Books: `{docs}`\n🖼️ Covers: `{covers}`\n🔄 Indexer: `{indexing_active}`")
-    except Exception as e:
-        await event.respond(f"⚠️ Error fetching stats: {e}")
-
-@bot.on(events.NewMessage(pattern='/index', from_users=[ADMIN_ID]))
-async def start_index_handler(event):
-    global indexing_active
-    if indexing_active: return await event.respond("⚠️ Running.")
-    args = event.text.split()
-    start, end = 1, 0
-    if len(args) == 2: end = int(args[1])
-    elif len(args) == 3: start, end = int(args[1]), int(args[2])
-    else: return await event.respond("Usage: `/index <end>`")
-    indexing_active = True
-    msg = await event.respond(f"🚀 **Azure Indexing** {start}-{end}")
-    asyncio.create_task(indexing_process(bot, start, end, msg))
-
-@bot.on(events.NewMessage(pattern='/stop_index', from_users=[ADMIN_ID]))
-async def stop_index_handler(event):
-    global indexing_active
-    indexing_active = False
-    await event.respond("🛑 Stopping...")
-
-@bot.on(events.NewMessage(pattern='/start'))
-async def start_handler(event):
-    await event.respond("📚 **Novel Bot (Azure Edition)**\nSend a keyword to search.")
-
-# --- SEARCH (FAILSAFE) ---
+# --- SEARCH ---
 @bot.on(events.NewMessage)
 async def search_handler(event):
     if event.text.startswith('/'): return
@@ -460,49 +319,42 @@ async def search_handler(event):
 async def perform_search(event, query, page):
     skip = page * PAGE_SIZE
     
-    # 1. Search Logic (Safe)
     try:
-        # Try Text Search
-        cnt = await collection.count_documents({"$text": {"$search": query}})
-        if cnt > 0:
-            cursor = collection.find(
-                {"$text": {"$search": query}}, 
-                {"score": {"$meta": "textScore"}}
-            ).sort([("score", {"$meta": "textScore"})])
-        else:
-            raise OperationFailure("Fallback")
-            
-    except (OperationFailure, Exception):
-        # Fallback Regex
-        regex_query = {
-            "$or": [
-                {"title": {"$regex": query, "$options": "i"}}, 
-                {"author": {"$regex": query, "$options": "i"}}, 
-                {"tags": {"$regex": query, "$options": "i"}}
-            ]
-        }
+        # Failsafe Search: Try Text -> Fallback to Regex
         try:
+            cnt = await collection.count_documents({"$text": {"$search": query}})
+            if cnt > 0:
+                cursor = collection.find({"$text": {"$search": query}}, {"score": {"$meta": "textScore"}}).sort([("score", {"$meta": "textScore"})])
+            else:
+                raise OperationFailure("Fallback")
+        except (OperationFailure, Exception):
+            regex_query = {
+                "$or": [
+                    {"title": {"$regex": query, "$options": "i"}}, 
+                    {"file_name": {"$regex": query, "$options": "i"}},
+                    {"author": {"$regex": query, "$options": "i"}},
+                    {"tags": {"$regex": query, "$options": "i"}}
+                ]
+            }
             cnt = await collection.count_documents(regex_query)
             cursor = collection.find(regex_query)
-        except Exception as e:
-            return await event.respond(f"❌ Search Error: `{e}`")
-
-    # 2. Pagination & Display (Safe)
-    try:
+            
         res = await cursor.skip(skip).limit(PAGE_SIZE).to_list(length=PAGE_SIZE)
         
         if not res:
-            if isinstance(event, events.CallbackQuery.Event): await event.answer("End of results.", alert=True)
-            else: await event.respond("❌ No matches found.")
+            if isinstance(event, events.CallbackQuery.Event): await event.answer("End.", alert=True)
+            else: await event.respond("❌ No matches.")
             return
 
         safe_q = html.escape(query)
         txt = f"<blockquote>🔎 Search results for : <b>{safe_q}</b>\nMatches <b>{cnt}</b></blockquote>"
         btns = []
+        
         for b in res:
-            # === FIX: Safe .get() calls prevents KeyError ===
-            title = b.get('title', 'Unknown Title') or 'Unknown Title'
-            author = b.get('author', 'Unknown') or 'Unknown'
+            # Display: Use title if good, else filename
+            title = b.get('title')
+            if not title or title == "Unknown Title":
+                title = b.get('file_name', 'Book')
             
             lbl = f"📖 {title[:30]}"
             btns.append([Button.inline(lbl, data=f"view:{str(b['_id'])}")])
@@ -519,8 +371,7 @@ async def perform_search(event, query, page):
         else: await event.respond(txt, buttons=btns, parse_mode='html')
         
     except Exception as e:
-        logger.error(f"Display Error: {e}")
-        await event.respond("⚠️ Error displaying results (Database corruption?)")
+        await event.respond(f"⚠️ Error: `{e}`")
 
 @bot.on(events.CallbackQuery)
 async def callback(event):
@@ -540,12 +391,16 @@ async def callback(event):
             b = await collection.find_one({"_id": ObjectId(oid)})
             if not b: return await event.answer("Not found", alert=True)
             
-            # Safe Getters
-            title = html.escape(b.get('title', 'Unknown Title'))
+            title = b.get('title')
+            if not title or title == "Unknown Title":
+                title = b.get('file_name', 'Unknown Book')
+            title = html.escape(title)
+            
             author = html.escape(b.get('author', 'Unknown'))
             syn = html.escape(b.get('synopsis', 'No synopsis.'))
             
             h_html = f"<blockquote><b>{title}</b>\nAuthor: {author}</blockquote>"
+            # Explicit Collapsible Blockquote
             b_html = f"<blockquote expandable><b><u>SYNOPSIS</u></b>\n{syn}</blockquote>"
             btns = [[Button.inline("📥 Download EPUB", data=f"dl:{oid}")]]
             
@@ -570,7 +425,7 @@ async def callback(event):
                     await bot.send_message(event.chat_id, b_html, buttons=btns, parse_mode='html')
                 else:
                     await bot.send_message(event.chat_id, h_html+"\n"+b_html, buttons=btns, parse_mode='html')
-        except: await event.answer("Error displaying book.", alert=True)
+        except: await event.answer("Error displaying.", alert=True)
 
     elif data.startswith("dl:"):
         try:
@@ -578,11 +433,34 @@ async def callback(event):
             from bson.objectid import ObjectId
             b = await collection.find_one({"_id": ObjectId(oid)})
             await event.answer("🚀 Sending...")
-            try: await bot.send_file(event.chat_id, b['file_id'], caption=f"📖 {b.get('title', 'Book')}")
+            
+            t = b.get('title')
+            if not t or t == "Unknown Title": t = b.get('file_name', 'Book')
+            
+            try: await bot.send_file(event.chat_id, b['file_id'], caption=f"📖 {t}")
             except: 
                 try: await bot.forward_messages(event.chat_id, b['msg_id'], CHANNEL_ID)
                 except: await event.answer("❌ File lost.", alert=True)
         except: pass
+
+@bot.on(events.NewMessage(pattern='/index', from_users=[ADMIN_ID]))
+async def start_index_handler(event):
+    global indexing_active
+    if indexing_active: return await event.respond("⚠️ Running.")
+    args = event.text.split()
+    start, end = 1, 0
+    if len(args) == 2: end = int(args[1])
+    elif len(args) == 3: start, end = int(args[1]), int(args[2])
+    else: return await event.respond("Usage: `/index <end>`")
+    indexing_active = True
+    msg = await event.respond(f"🚀 **Indexing** {start}-{end}")
+    asyncio.create_task(indexing_process(bot, start, end, msg))
+
+@bot.on(events.NewMessage(pattern='/stop_index', from_users=[ADMIN_ID]))
+async def stop_index_handler(event):
+    global indexing_active
+    indexing_active = False
+    await event.respond("🛑 Stopping...")
 
 print("Bot Running...")
 bot.loop.run_until_complete(startup_check())

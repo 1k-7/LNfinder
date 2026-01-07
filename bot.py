@@ -76,7 +76,6 @@ total_files_found = 0
 async def ensure_indexes():
     logger.info("⚙️ Verifying Azure Indexes...")
     try:
-        # Cosmos DB requires specific index management usually, but Motor helps.
         await collection.create_index([("title", "text"), ("author", "text"), ("synopsis", "text"), ("tags", "text")])
         await collection.create_index("file_unique_id", unique=True)
         await collection.create_index("msg_id")
@@ -461,9 +460,9 @@ async def search_handler(event):
 async def perform_search(event, query, page):
     skip = page * PAGE_SIZE
     
-    # === FAILSAFE SEARCH LOGIC ===
-    # 1. Try Text Search. If it fails (missing index), catch error and fallback.
+    # 1. Search Logic (Safe)
     try:
+        # Try Text Search
         cnt = await collection.count_documents({"$text": {"$search": query}})
         if cnt > 0:
             cursor = collection.find(
@@ -471,10 +470,10 @@ async def perform_search(event, query, page):
                 {"score": {"$meta": "textScore"}}
             ).sort([("score", {"$meta": "textScore"})])
         else:
-            raise OperationFailure("No results or no index, fallback to regex") # Force fallback
+            raise OperationFailure("Fallback")
             
-    except (OperationFailure, Exception) as e:
-        # Fallback to Regex (Slower but works without Text Index)
+    except (OperationFailure, Exception):
+        # Fallback Regex
         regex_query = {
             "$or": [
                 {"title": {"$regex": query, "$options": "i"}}, 
@@ -485,11 +484,10 @@ async def perform_search(event, query, page):
         try:
             cnt = await collection.count_documents(regex_query)
             cursor = collection.find(regex_query)
-        except Exception as deep_error:
-            await event.respond(f"❌ **Fatal Search Error**:\n`{deep_error}`")
-            return
+        except Exception as e:
+            return await event.respond(f"❌ Search Error: `{e}`")
 
-    # 2. Pagination & Display
+    # 2. Pagination & Display (Safe)
     try:
         res = await cursor.skip(skip).limit(PAGE_SIZE).to_list(length=PAGE_SIZE)
         
@@ -502,7 +500,11 @@ async def perform_search(event, query, page):
         txt = f"<blockquote>🔎 Search results for : <b>{safe_q}</b>\nMatches <b>{cnt}</b></blockquote>"
         btns = []
         for b in res:
-            lbl = f"📖 {b['title'][:35]}"
+            # === FIX: Safe .get() calls prevents KeyError ===
+            title = b.get('title', 'Unknown Title') or 'Unknown Title'
+            author = b.get('author', 'Unknown') or 'Unknown'
+            
+            lbl = f"📖 {title[:30]}"
             btns.append([Button.inline(lbl, data=f"view:{str(b['_id'])}")])
             
         total_p = math.ceil(cnt / PAGE_SIZE)
@@ -517,7 +519,8 @@ async def perform_search(event, query, page):
         else: await event.respond(txt, buttons=btns, parse_mode='html')
         
     except Exception as e:
-        await event.respond(f"⚠️ Search Logic Error: `{e}`")
+        logger.error(f"Display Error: {e}")
+        await event.respond("⚠️ Error displaying results (Database corruption?)")
 
 @bot.on(events.CallbackQuery)
 async def callback(event):
@@ -537,9 +540,10 @@ async def callback(event):
             b = await collection.find_one({"_id": ObjectId(oid)})
             if not b: return await event.answer("Not found", alert=True)
             
-            title = html.escape(b['title'])
+            # Safe Getters
+            title = html.escape(b.get('title', 'Unknown Title'))
             author = html.escape(b.get('author', 'Unknown'))
-            syn = html.escape(b.get('synopsis') or "No synopsis.")
+            syn = html.escape(b.get('synopsis', 'No synopsis.'))
             
             h_html = f"<blockquote><b>{title}</b>\nAuthor: {author}</blockquote>"
             b_html = f"<blockquote expandable><b><u>SYNOPSIS</u></b>\n{syn}</blockquote>"
@@ -574,7 +578,7 @@ async def callback(event):
             from bson.objectid import ObjectId
             b = await collection.find_one({"_id": ObjectId(oid)})
             await event.answer("🚀 Sending...")
-            try: await bot.send_file(event.chat_id, b['file_id'], caption=f"📖 {b['title']}")
+            try: await bot.send_file(event.chat_id, b['file_id'], caption=f"📖 {b.get('title', 'Book')}")
             except: 
                 try: await bot.forward_messages(event.chat_id, b['msg_id'], CHANNEL_ID)
                 except: await event.answer("❌ File lost.", alert=True)

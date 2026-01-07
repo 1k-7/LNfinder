@@ -10,6 +10,7 @@ import xml.etree.ElementTree as ET
 from bs4 import BeautifulSoup
 from telethon import TelegramClient, events, Button
 from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo.errors import DuplicateKeyError
 
 # --- CONFIGURATION ---
 try:
@@ -135,8 +136,8 @@ def parse_epub_direct(file_path):
                                 break
                         except: pass
 
-    except Exception as e:
-        logger.error(f"Error parsing ZIP: {e}")
+    except Exception:
+        pass
     
     return meta
 
@@ -144,13 +145,7 @@ def parse_epub_direct(file_path):
 async def indexing_process(client, start_id, end_id, status_msg=None):
     global indexing_active, files_processed, total_files_found
     
-    existing_ids = set()
-    async for doc in collection.find({}, {"file_unique_id": 1}):
-        existing_ids.add(doc.get('file_unique_id'))
-    
-    logger.info(f"📚 Loaded {len(existing_ids)} existing books.")
-    
-    queue = asyncio.Queue(maxsize=10)
+    queue = asyncio.Queue(maxsize=20)
     
     async def worker(worker_id):
         while indexing_active:
@@ -192,9 +187,10 @@ async def indexing_process(client, start_id, end_id, status_msg=None):
                     files_processed += 1
                     print(f"✅ Saved: {meta['title']}")
                     
+                except DuplicateKeyError:
+                    pass
                 except Exception as e:
-                    if "E11000" not in str(e):
-                        logger.error(f"DB Error: {e}")
+                    logger.error(f"DB Error: {e}")
 
                 queue.task_done()
                 
@@ -202,12 +198,12 @@ async def indexing_process(client, start_id, end_id, status_msg=None):
                 logger.error(f"⚠️ Worker Error: {e}")
                 queue.task_done()
 
-    workers = [asyncio.create_task(worker(i)) for i in range(3)]
+    workers = [asyncio.create_task(worker(i)) for i in range(5)]
     
     try:
         current_id = start_id
         last_update_count = 0
-        BATCH_SIZE = 50 
+        BATCH_SIZE = 20 
 
         while current_id <= end_id and indexing_active:
             batch_end = min(current_id + BATCH_SIZE, end_id + 1)
@@ -222,8 +218,6 @@ async def indexing_process(client, start_id, end_id, status_msg=None):
                         if not message: continue
                         if message.file and message.file.name and message.file.name.endswith('.epub'):
                             total_files_found += 1
-                            if str(message.file.id) in existing_ids:
-                                continue
                             await queue.put(message)
                 
                 if status_msg and (total_files_found - last_update_count >= 20):
@@ -255,17 +249,21 @@ async def indexing_process(client, start_id, end_id, status_msg=None):
 # --- STARTUP ---
 async def startup_sync():
     global indexing_active
-    logger.info("⚙️ Startup Check...")
+    logger.info("⚙️ Bot Starting...")
     
-    last_book = await collection.find_one(sort=[("msg_id", -1)])
-    start_id = (last_book['msg_id'] + 1) if (last_book and 'msg_id' in last_book) else 1
+    # Fire and forget index creation
+    asyncio.create_task(collection.create_index([("title", "text"), ("author", "text"), ("synopsis", "text"), ("tags", "text")]))
+    asyncio.create_task(collection.create_index("file_unique_id", unique=True))
+    asyncio.create_task(collection.create_index("msg_id"))
 
     try:
+        last_book = await collection.find_one(sort=[("msg_id", -1)])
+        start_id = (last_book['msg_id'] + 1) if (last_book and 'msg_id' in last_book) else 1
+        
         latest = await bot.get_messages(CHANNEL_ID, limit=1)
         if latest:
             end_id = latest[0].id
             logger.info(f"📍 Resume ID: {start_id} | Channel End: {end_id}")
-            
             if start_id < end_id:
                 logger.info("🚀 Auto-Resume Started.")
                 indexing_active = True
@@ -296,11 +294,6 @@ async def start_index_handler(event):
     
     indexing_active = True
     msg = await event.respond(f"🚀 **Starting Manual Index**\nRange: {start} - {end}")
-    
-    await collection.create_index([("title", "text"), ("author", "text"), ("synopsis", "text"), ("tags", "text")])
-    await collection.create_index("file_unique_id", unique=True)
-    await collection.create_index("msg_id")
-    
     asyncio.create_task(indexing_process(bot, start, end, msg))
 
 @bot.on(events.NewMessage(pattern='/stop_index', from_users=[ADMIN_ID]))
@@ -313,7 +306,7 @@ async def stop_index_handler(event):
 async def start_handler(event):
     await event.respond("📚 **Welcome to the Novel Library Bot!**\nSend a keyword to search.")
 
-# --- SEARCH LOGIC (HTML Mode) ---
+# --- SEARCH LOGIC ---
 @bot.on(events.NewMessage)
 async def search_handler(event):
     if event.text.startswith('/'): return
@@ -323,17 +316,15 @@ async def search_handler(event):
 async def perform_search(event, query, page):
     skip_count = page * PAGE_SIZE
     
-    # 1. Full Text Search
-    cursor = collection.find(
-        {"$text": {"$search": query}}, 
-        {"score": {"$meta": "textScore"}}
-    ).sort([("score", {"$meta": "textScore"})])
+    ft_count = await collection.count_documents({"$text": {"$search": query}})
     
-    total_count = await collection.count_documents({"$text": {"$search": query}})
-    results = await cursor.skip(skip_count).limit(PAGE_SIZE).to_list(length=PAGE_SIZE)
-    
-    # 2. Regex Fallback
-    if not results and page == 0:
+    if ft_count > 0:
+        cursor = collection.find(
+            {"$text": {"$search": query}}, 
+            {"score": {"$meta": "textScore"}}
+        ).sort([("score", {"$meta": "textScore"})])
+        total_count = ft_count
+    else:
         regex_query = {
             "$or": [
                 {"title": {"$regex": query, "$options": "i"}}, 
@@ -343,7 +334,8 @@ async def perform_search(event, query, page):
         }
         cursor = collection.find(regex_query)
         total_count = await collection.count_documents(regex_query)
-        results = await cursor.skip(skip_count).limit(PAGE_SIZE).to_list(length=PAGE_SIZE)
+    
+    results = await cursor.skip(skip_count).limit(PAGE_SIZE).to_list(length=PAGE_SIZE)
     
     if not results:
         if isinstance(event, events.CallbackQuery.Event):
@@ -352,7 +344,6 @@ async def perform_search(event, query, page):
             await event.respond("❌ No matching novels found.")
         return
 
-    # --- UI HEADER (Requested Format) ---
     safe_query = html.escape(query)
     text = (
         f"<blockquote>🔎 Search results for : <b>{safe_query}</b>\n"
@@ -361,30 +352,28 @@ async def perform_search(event, query, page):
     
     buttons = []
     for b in results:
-        label = f"📖 {b['title'][:35]}" # Slightly longer title
+        label = f"📖 {b['title'][:35]}" 
+        if b.get('author') and b['author'] != "Unknown Author":
+            label += f" — {b['author'][:15]}"
         buttons.append([Button.inline(label, data=f"view:{str(b['_id'])}")])
     
     total_pages = math.ceil(total_count / PAGE_SIZE)
     nav = []
-    cb_query = query[:30] # Keep raw query for callback logic
+    cb_query = query[:30] 
     
     if page > 0:
         nav.append(Button.inline("⬅️ Prev", data=f"nav:{page-1}:{cb_query}"))
-    
     nav.append(Button.inline(f"{page+1}/{total_pages}", data="noop"))
-    
     if page < total_pages - 1:
         nav.append(Button.inline("Next ➡️", data=f"nav:{page+1}:{cb_query}"))
     
     if nav: buttons.append(nav)
     
-    # Force HTML parse mode
     if isinstance(event, events.CallbackQuery.Event):
         await event.edit(text, buttons=buttons, parse_mode='html')
     else:
         await event.respond(text, buttons=buttons, parse_mode='html')
 
-# --- DISPLAY LOGIC (CLASSY + FULL SYNOPSIS) ---
 @bot.on(events.CallbackQuery)
 async def callback(event):
     data = event.data.decode()
@@ -395,10 +384,9 @@ async def callback(event):
 
     if data.startswith("nav:"):
         try:
-            parts = data.split(':')
+            parts = data.split(':', 2)
             page = int(parts[1])
-            # Reconstruct query (in case it contained colons, though simple split limits to 2 splits usually)
-            query = parts[2] 
+            query = parts[2]
             await perform_search(event, query, page)
         except:
             await event.answer("Navigation error.", alert=True)
@@ -408,59 +396,58 @@ async def callback(event):
         b = await collection.find_one({"_id": ObjectId(data.split(':')[1])})
         if not b: return await event.answer("Not found", alert=True)
         
-        # Prepare Data (Escape HTML characters!)
         title = html.escape(b['title'])
         author = html.escape(b.get('author', 'Unknown'))
-        
         raw_synopsis = b.get('synopsis')
-        if not raw_synopsis or raw_synopsis.strip() == "": 
-            raw_synopsis = "No synopsis available."
+        if not raw_synopsis or raw_synopsis.strip() == "": raw_synopsis = "No synopsis available."
         synopsis = html.escape(raw_synopsis)
         
-        # 1. Header Blockquote
+        # UI Structure
         header_html = f"<blockquote><b>{title}</b>\nAuthor: {author}</blockquote>"
         
-        # 2. Body Blockquote (Full Text)
-        body_html = f"<blockquote>{synopsis}</blockquote>"
+        # Added Header: SYNOPSIS in Bold+Underline inside blockquote
+        body_html = f"<blockquote><b><u>SYNOPSIS</u></b>\n{synopsis}</blockquote>"
         
         btns = [[Button.inline("📥 Download EPUB", data=f"dl:{str(b['_id'])}")]]
         
         await event.delete()
         
-        # Send Strategy
         if b.get('cover_image'):
             f = io.BytesIO(b['cover_image'])
             f.name = "cover.jpg"
-            
-            # Combine to check length
             full_html = f"{header_html}\n{body_html}"
             
             if len(full_html) <= 1024:
-                # Send Image with HTML Caption
+                # Fits in caption -> One message with everything
                 await bot.send_file(event.chat_id, f, caption=full_html, buttons=btns, parse_mode='html')
             else:
-                # Split: Cover with Header -> Full Text -> Buttons
+                # Split -> Image with Header
                 await bot.send_file(event.chat_id, f, caption=header_html, parse_mode='html')
                 
-                # Handle extremely long synopsis (>4096 chars)
+                # ... then Synopsis with Buttons attached to the end
                 if len(body_html) > 4096:
-                    for i in range(0, len(body_html), 4096):
-                        await bot.send_message(event.chat_id, body_html[i:i+4096], parse_mode='html')
+                    chunks = [body_html[i:i+4096] for i in range(0, len(body_html), 4096)]
+                    for i, chunk in enumerate(chunks):
+                        if i == len(chunks) - 1:
+                            await bot.send_message(event.chat_id, chunk, buttons=btns, parse_mode='html')
+                        else:
+                            await bot.send_message(event.chat_id, chunk, parse_mode='html')
                 else:
-                    await bot.send_message(event.chat_id, body_html, parse_mode='html')
-                
-                await bot.send_message(event.chat_id, "👇", buttons=btns)
+                    await bot.send_message(event.chat_id, body_html, buttons=btns, parse_mode='html')
         else:
             # Text Only
             full_html = f"{header_html}\n{body_html}"
             if len(full_html) > 4096:
                 await bot.send_message(event.chat_id, header_html, parse_mode='html')
                 if len(body_html) > 4096:
-                    for i in range(0, len(body_html), 4096):
-                        await bot.send_message(event.chat_id, body_html[i:i+4096], parse_mode='html')
+                    chunks = [body_html[i:i+4096] for i in range(0, len(body_html), 4096)]
+                    for i, chunk in enumerate(chunks):
+                        if i == len(chunks) - 1:
+                            await bot.send_message(event.chat_id, chunk, buttons=btns, parse_mode='html')
+                        else:
+                            await bot.send_message(event.chat_id, chunk, parse_mode='html')
                 else:
-                    await bot.send_message(event.chat_id, body_html, parse_mode='html')
-                await bot.send_message(event.chat_id, "👇", buttons=btns)
+                    await bot.send_message(event.chat_id, body_html, buttons=btns, parse_mode='html')
             else:
                 await bot.send_message(event.chat_id, full_html, buttons=btns, parse_mode='html')
 
@@ -471,10 +458,8 @@ async def callback(event):
         try:
             await bot.send_file(event.chat_id, b['file_id'], caption=f"📖 {b['title']}")
         except:
-            try:
-                await bot.forward_messages(event.chat_id, b['msg_id'], CHANNEL_ID)
-            except:
-                await event.answer("❌ File not found in channel.", alert=True)
+            try: await bot.forward_messages(event.chat_id, b['msg_id'], CHANNEL_ID)
+            except: await event.answer("❌ File not found.", alert=True)
 
 print("Bot Running...")
 bot.loop.run_until_complete(startup_sync())

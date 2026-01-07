@@ -51,7 +51,7 @@ except Exception as e:
     logger.error(f"❌ Connection Error: {e}")
     exit(1)
 
-# Legacy DBs
+# Legacy DBs (for migration)
 legacy_collections = []
 for uri in LEGACY_URIS:
     try:
@@ -67,40 +67,29 @@ files_processed = 0
 async def ensure_indexes():
     logger.info("⚙️ Verifying Indexes...")
     try:
-        await collection.create_index([("title", "text"), ("author", "text"), ("synopsis", "text"), ("tags", "text")])
+        # Index file_name heavily since we use it for display/search now
+        await collection.create_index([("file_name", "text"), ("title", "text"), ("author", "text"), ("tags", "text")])
         await collection.create_index("file_unique_id", unique=True)
         await collection.create_index("msg_id")
         logger.info("✅ Indexes Ready.")
     except Exception as e:
         logger.warning(f"⚠️ Index Warning: {e}")
 
-# --- HELPER: Get Display Title ---
-def get_display_title(book_doc):
+# --- HELPER: Get Clean Name (Strict) ---
+def get_clean_name(book_doc):
     """
-    Robust logic to get a human-readable title.
-    Priority:
-    1. DB Title (if valid)
-    2. DB Filename (cleaned)
-    3. Raw Title (even if 'Unknown')
+    Returns the cleaned filename. Falls back to title only if filename is None.
     """
-    title = book_doc.get('title')
-    file_name = book_doc.get('file_name')
-    
-    # Clean filename helper
-    clean_filename = "Unknown File"
-    if file_name:
-        clean_filename = file_name.replace('.epub', '').replace('_', ' ').replace('-', ' ')
-
-    # 1. If we have a good title, use it.
-    if title and title.strip() and title != "Unknown Title":
-        return title
-    
-    # 2. If title is bad/missing, but we have a filename, use the filename.
-    if file_name:
-        return clean_filename
+    try:
+        fname = book_doc.get('file_name')
+        if fname:
+            # Remove extension and replace separators with spaces
+            return fname.replace('.epub', '').replace('_', ' ').replace('-', ' ').strip()
         
-    # 3. Last resort: Return whatever title is (even "Unknown Title") or fallback
-    return title if title else "Untitled Book"
+        # Fallback to title if file_name is missing in DB
+        return book_doc.get('title', 'Unknown Book')
+    except:
+        return "Unknown Book"
 
 # --- METADATA EXTRACTION ---
 def parse_epub_direct(file_path):
@@ -111,7 +100,6 @@ def parse_epub_direct(file_path):
         "tags": "",
         "cover_image": None
     }
-    
     try:
         with zipfile.ZipFile(file_path, 'r') as z:
             opf_path = None
@@ -129,7 +117,6 @@ def parse_epub_direct(file_path):
                     if name.endswith('.opf'):
                         opf_path = name
                         break
-            
             if not opf_path: return meta
 
             opf_data = z.read(opf_path)
@@ -233,8 +220,7 @@ async def indexing_process(client, start_id, end_id, status_msg=None):
                 if os.path.exists(path): os.remove(path)
 
                 if not meta['title']:
-                    # Ensure we save a title even if metadata is missing
-                    meta['title'] = message.file.name.replace('.epub', '').replace('_', ' ')
+                    meta['title'] = message.file.name
 
                 try:
                     await collection.insert_one({
@@ -250,7 +236,7 @@ async def indexing_process(client, start_id, end_id, status_msg=None):
                     })
                     global files_processed
                     files_processed += 1
-                    print(f"✅ Saved: {meta['title']}")
+                    print(f"✅ Saved: {message.file.name}")
                 except DuplicateKeyError: pass
                 except Exception as e: logger.error(f"Write Error: {e}")
                 
@@ -291,7 +277,6 @@ async def indexing_process(client, start_id, end_id, status_msg=None):
 async def startup_check():
     logger.info("⚙️ Bot Starting...")
     asyncio.create_task(ensure_indexes())
-    
     max_id = 0
     try:
         last_book = await collection.find_one(sort=[("msg_id", -1)])
@@ -303,7 +288,60 @@ async def startup_check():
 bot = TelegramClient('bot_session', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 PAGE_SIZE = 8
 
-# --- MIGRATION ---
+# --- EXPORT / IMPORT / MIGRATE ---
+@bot.on(events.NewMessage(pattern='/export', from_users=[ADMIN_ID]))
+async def export_handler(event):
+    status = await event.respond("📦 **Exporting...**")
+    file_path, zip_path = "library_backup.json", "library_backup.zip"
+    try:
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write('[')
+            first, count = True, 0
+            async for doc in collection.find({}):
+                if not first: f.write(',')
+                first = False
+                if doc.get('cover_image'): doc['cover_image'] = base64.b64encode(doc['cover_image']).decode('utf-8')
+                doc['_id'] = str(doc['_id'])
+                json.dump(doc, f)
+                count += 1
+            f.write(']')
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as z: z.write(file_path)
+        await status.edit("🚀 Uploading...")
+        await bot.send_file(event.chat_id, zip_path, caption=f"✅ Backup: {count} books")
+    except Exception as e: await event.respond(f"❌ Error: {e}")
+    finally:
+        if os.path.exists(file_path): os.remove(file_path)
+        if os.path.exists(zip_path): os.remove(zip_path)
+
+@bot.on(events.NewMessage(pattern='/import', from_users=[ADMIN_ID]))
+async def import_handler(event):
+    reply = await event.get_reply_message()
+    if not reply or not reply.file: return await event.respond("Reply to file.")
+    status = await event.respond("📥 **Importing...**")
+    path = await reply.download_media()
+    try:
+        if zipfile.is_zipfile(path):
+            with zipfile.ZipFile(path, 'r') as z: z.extractall(); path = z.namelist()[0]
+        with open(path, 'r') as f: data = json.load(f)
+        total = len(data)
+        imported = 0
+        batch_size = 50
+        for i in range(0, total, batch_size):
+            chunk = data[i:i+batch_size]
+            for item in chunk:
+                if item.get('cover_image'): 
+                    try: item['cover_image'] = base64.b64decode(item['cover_image'])
+                    except: item['cover_image'] = None
+                if '_id' in item: del item['_id']
+                try: await collection.replace_one({"file_unique_id": item['file_unique_id']}, item, upsert=True)
+                except: pass
+            imported += len(chunk)
+            if i % 500 == 0: await status.edit(f"📥 {imported}/{total}")
+        await status.edit("✅ Done")
+    except Exception as e: await event.respond(f"❌ Error: {e}")
+    finally:
+        if os.path.exists(path): os.remove(path)
+
 @bot.on(events.NewMessage(pattern='/migrate', from_users=[ADMIN_ID]))
 async def migrate_handler(event):
     if not legacy_collections: return await event.respond("❌ No legacy DBs.")
@@ -313,105 +351,10 @@ async def migrate_handler(event):
         cursor = col.find({})
         async for doc in cursor:
             if '_id' in doc: del doc['_id']
-            try:
-                await collection.insert_one(doc)
-                total += 1
-                if total % 100 == 0: await status.edit(f"📥 Migrating... {total}")
-            except DuplicateKeyError: pass
+            try: await collection.insert_one(doc); total += 1
             except: pass
-    await status.edit(f"✅ Migrated {total} books.")
-
-# --- EXPORT / IMPORT ---
-@bot.on(events.NewMessage(pattern='/export', from_users=[ADMIN_ID]))
-async def export_handler(event):
-    status = await event.respond("📦 **Exporting from Azure...**")
-    file_path = "library_backup.json"
-    zip_path = "library_backup.zip"
-    
-    try:
-        with open(file_path, 'w', encoding='utf-8') as f:
-            f.write('[')
-            first = True
-            count = 0
-            async for doc in collection.find({}):
-                if not first: f.write(',')
-                first = False
-                if doc.get('cover_image'):
-                    doc['cover_image'] = base64.b64encode(doc['cover_image']).decode('utf-8')
-                doc['_id'] = str(doc['_id'])
-                json.dump(doc, f)
-                count += 1
-                if count % 1000 == 0:
-                    try: await status.edit(f"📦 Exporting... ({count})")
-                    except: pass
-            f.write(']')
-            
-        await status.edit(f"📦 Compressing...")
-        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            zipf.write(file_path)
-            
-        await status.edit("🚀 Uploading...")
-        await bot.send_file(event.chat_id, zip_path, caption=f"✅ **Azure Backup**\nBooks: {count}")
-    except Exception as e:
-        await event.respond(f"❌ Error: {e}")
-    finally:
-        if os.path.exists(file_path): os.remove(file_path)
-        if os.path.exists(zip_path): os.remove(zip_path)
-
-@bot.on(events.NewMessage(pattern='/import', from_users=[ADMIN_ID]))
-async def import_handler(event):
-    args = event.text.split()
-    new_bot = 'nb' in args
-    reply = await event.get_reply_message()
-    if not reply or not reply.file: return await event.respond("Reply to file.")
-    
-    status = await event.respond("📥 **Importing to Azure...**")
-    path = await reply.download_media()
-    
-    try:
-        if zipfile.is_zipfile(path):
-            with zipfile.ZipFile(path, 'r') as z:
-                z.extractall()
-                path = z.namelist()[0]
-        
-        with open(path, 'r') as f: data = json.load(f)
-        
-        total = len(data)
-        await status.edit(f"📥 Importing {total} books...")
-        
-        imported = 0
-        batch_size = 50
-        
-        for i in range(0, total, batch_size):
-            chunk = data[i:i+batch_size]
-            for item in chunk:
-                if item.get('cover_image'):
-                    try: item['cover_image'] = base64.b64decode(item['cover_image'])
-                    except: item['cover_image'] = None
-                if '_id' in item: del item['_id']
-                try:
-                    await collection.replace_one({"file_unique_id": item['file_unique_id']}, item, upsert=True)
-                except: pass
-            
-            imported += len(chunk)
-            if i % 500 == 0:
-                try: await status.edit(f"📥 Importing... {imported}/{total}")
-                except: pass
-                
-        await status.edit(f"✅ **Done!**")
-    except Exception as e:
-        await event.respond(f"❌ Error: {e}")
-    finally:
-        if os.path.exists(path): os.remove(path)
-
-# --- COMMANDS ---
-@bot.on(events.NewMessage(pattern='/stats'))
-async def stats_handler(event):
-    try:
-        docs = await collection.count_documents({})
-        covers = await collection.count_documents({"cover_image": {"$ne": None}})
-        await event.respond(f"📊 **Azure Stats**\n📚 Books: `{docs}`\n🖼️ Covers: `{covers}`\n🔄 Running: `{indexing_active}`")
-    except Exception as e: await event.respond(f"⚠️ Error: {e}")
+            if total % 100 == 0: await status.edit(f"📥 {total}")
+    await status.edit(f"✅ Migrated {total}")
 
 # --- SEARCH ---
 @bot.on(events.NewMessage)
@@ -421,23 +364,19 @@ async def search_handler(event):
 
 async def perform_search(event, query, page):
     skip = page * PAGE_SIZE
-    
     try:
+        # Failsafe Search: Text -> Regex
         try:
             cnt = await collection.count_documents({"$text": {"$search": query}})
             if cnt > 0:
-                cursor = collection.find({"$text": {"$search": query}}, {"score": {"$meta": "textScore"}}).sort([("score", {"$meta": "textScore"})])
-            else:
-                raise OperationFailure("Fallback")
-        except (OperationFailure, Exception):
-            regex_query = {
-                "$or": [
-                    {"title": {"$regex": query, "$options": "i"}}, 
-                    {"file_name": {"$regex": query, "$options": "i"}},
-                    {"author": {"$regex": query, "$options": "i"}},
-                    {"tags": {"$regex": query, "$options": "i"}}
-                ]
-            }
+                cursor = collection.find({"$text": {"$search": query}}).sort([("score", {"$meta": "textScore"})])
+            else: raise Exception("Fallback")
+        except:
+            regex_query = {"$or": [
+                {"file_name": {"$regex": query, "$options": "i"}},
+                {"title": {"$regex": query, "$options": "i"}},
+                {"author": {"$regex": query, "$options": "i"}}
+            ]}
             cnt = await collection.count_documents(regex_query)
             cursor = collection.find(regex_query)
             
@@ -453,15 +392,15 @@ async def perform_search(event, query, page):
         btns = []
         
         for b in res:
-            # FIX: Use Helper
-            display_title = get_display_title(b)
-            # Truncate for button
-            lbl = f"📖 {display_title[:40]}"
+            # === STRICT FILE NAME USAGE ===
+            display_name = get_clean_name(b)
+            # Truncate
+            lbl = f"📖 {display_name[:40]}"
             btns.append([Button.inline(lbl, data=f"view:{str(b['_id'])}")])
             
         total_p = math.ceil(cnt / PAGE_SIZE)
         nav = []
-        cb_q = query[:30]
+        cb_q = query[:30] # Limit query length
         if page > 0: nav.append(Button.inline("⬅️ Prev", data=f"nav:{page-1}:{cb_q}"))
         nav.append(Button.inline(f"{page+1}/{total_p}", data="noop"))
         if page < total_p - 1: nav.append(Button.inline("Next ➡️", data=f"nav:{page+1}:{cb_q}"))
@@ -471,7 +410,8 @@ async def perform_search(event, query, page):
         else: await event.respond(txt, buttons=btns, parse_mode='html')
         
     except Exception as e:
-        await event.respond(f"⚠️ Error: `{e}`")
+        logger.error(f"Search Crash: {e}")
+        await event.respond(f"❌ Error: `{e}`")
 
 @bot.on(events.CallbackQuery)
 async def callback(event):
@@ -491,13 +431,13 @@ async def callback(event):
             b = await collection.find_one({"_id": ObjectId(oid)})
             if not b: return await event.answer("Not found", alert=True)
             
-            # Use Helper for Title
-            display_title = html.escape(get_display_title(b))
+            # === STRICT FILE NAME USAGE ===
+            display_name = html.escape(get_clean_name(b))
             author = html.escape(b.get('author', 'Unknown'))
             syn = html.escape(b.get('synopsis', 'No synopsis.'))
             
-            h_html = f"<blockquote><b>{display_title}</b>\nAuthor: {author}</blockquote>"
-            # COLLAPSIBLE BLOCKQUOTE
+            h_html = f"<blockquote><b>{display_name}</b>\nAuthor: {author}</blockquote>"
+            # === EXPANDABLE BLOCKQUOTE ===
             b_html = f"<blockquote expandable><b><u>SYNOPSIS</u></b>\n{syn}</blockquote>"
             btns = [[Button.inline("📥 Download EPUB", data=f"dl:{oid}")]]
             
@@ -509,20 +449,13 @@ async def callback(event):
                     await bot.send_file(event.chat_id, f, caption=h_html+"\n"+b_html, buttons=btns, parse_mode='html')
                 else:
                     await bot.send_file(event.chat_id, f, caption=h_html, parse_mode='html')
-                    if len(b_html) > 4096:
-                        chunks = [b_html[i:i+4096] for i in range(0, len(b_html), 4096)]
-                        for i, c in enumerate(chunks):
-                            if i == len(chunks)-1: await bot.send_message(event.chat_id, c, buttons=btns, parse_mode='html')
-                            else: await bot.send_message(event.chat_id, c, parse_mode='html')
-                    else:
-                        await bot.send_message(event.chat_id, b_html, buttons=btns, parse_mode='html')
-            else:
-                if len(h_html + b_html) > 4096:
-                    await bot.send_message(event.chat_id, h_html, parse_mode='html')
+                    # Send synopsis
                     await bot.send_message(event.chat_id, b_html, buttons=btns, parse_mode='html')
-                else:
-                    await bot.send_message(event.chat_id, h_html+"\n"+b_html, buttons=btns, parse_mode='html')
-        except: await event.answer("Error displaying.", alert=True)
+            else:
+                await bot.send_message(event.chat_id, h_html + "\n" + b_html, buttons=btns, parse_mode='html')
+        except Exception as e: 
+            logger.error(f"View Crash: {e}")
+            await event.answer("Error displaying.", alert=True)
 
     elif data.startswith("dl:"):
         try:
@@ -531,9 +464,8 @@ async def callback(event):
             b = await collection.find_one({"_id": ObjectId(oid)})
             await event.answer("🚀 Sending...")
             
-            # Use Helper
-            display_title = get_display_title(b)
-            try: await bot.send_file(event.chat_id, b['file_id'], caption=f"📖 {display_title}")
+            display_name = get_clean_name(b)
+            try: await bot.send_file(event.chat_id, b['file_id'], caption=f"📖 {display_name}")
             except: 
                 try: await bot.forward_messages(event.chat_id, b['msg_id'], CHANNEL_ID)
                 except: await event.answer("❌ File lost.", alert=True)
@@ -557,6 +489,18 @@ async def stop_index_handler(event):
     global indexing_active
     indexing_active = False
     await event.respond("🛑 Stopping...")
+
+@bot.on(events.NewMessage(pattern='/stats'))
+async def stats_handler(event):
+    try:
+        docs = await collection.count_documents({})
+        covers = await collection.count_documents({"cover_image": {"$ne": None}})
+        await event.respond(f"📊 **Stats**\n📚 Books: `{docs}`\n🖼️ Covers: `{covers}`")
+    except: pass
+
+@bot.on(events.NewMessage(pattern='/start'))
+async def start_handler(event):
+    await event.respond("📚 **Novel Bot**")
 
 print("Bot Running...")
 bot.loop.run_until_complete(startup_check())

@@ -18,9 +18,10 @@ from pyrogram import Client, filters, idle
 from pyrogram.types import (
     InlineKeyboardMarkup, 
     InlineKeyboardButton, 
-    Message
+    Message,
+    MessageEntity
 )
-from pyrogram.enums import ParseMode
+from pyrogram.enums import ParseMode, MessageEntityType
 
 # --- CONFIGURATION ---
 try:
@@ -77,25 +78,24 @@ async def ensure_indexes():
     except: pass
 
 def get_display_title(book_doc):
-    """
-    Returns the Title from DB. 
-    Only falls back to File Name if Title is explicitly None/Empty.
-    """
+    """Priority: DB Title -> Filename"""
     db_title = book_doc.get('title')
     if db_title and db_title.strip() and db_title != "Unknown Title":
         return db_title.strip()
-        
+    
     fname = book_doc.get('file_name')
     if fname:
         return fname.replace('.epub', '').replace('_', ' ').replace('-', ' ').strip()
-        
     return "Unknown Book"
 
 def get_button_label(book_doc):
     """Strips chapter info for buttons."""
-    full_title = get_display_title(book_doc)
-    clean_label = re.sub(r'\s+(c|ch|chap|vol|v)\.?\s*\d+(?:[-–]\d+)?.*$', '', full_title, flags=re.IGNORECASE)
-    return clean_label.strip()
+    full = get_display_title(book_doc)
+    return re.sub(r'\s+(c|ch|chap|vol|v)\.?\s*\d+(?:[-–]\d+)?.*$', '', full, flags=re.IGNORECASE).strip()
+
+def len_utf16(text):
+    """Telegram requires UTF-16 code unit offsets."""
+    return len(text.encode('utf-16-le')) // 2
 
 # --- METADATA PARSER ---
 def parse_epub_direct(file_path):
@@ -108,7 +108,6 @@ def parse_epub_direct(file_path):
                 for child in root.iter():
                     if child.get('full-path'): opf_path = child.get('full-path'); break
             except: pass
-            
             if not opf_path:
                 for n in z.namelist():
                     if n.endswith('.opf'): opf_path = n; break
@@ -194,7 +193,6 @@ async def indexing_process(client, start_id, end_id, status_msg):
                 meta = await asyncio.to_thread(parse_epub_direct, path)
                 if os.path.exists(path): os.remove(path)
 
-                # Prioritize DB Title logic even during index
                 if not meta['title']: 
                     meta['title'] = message.document.file_name.replace('.epub', '').replace('_', ' ')
 
@@ -210,14 +208,11 @@ async def indexing_process(client, start_id, end_id, status_msg):
                         "cover_image": meta['cover_image'],
                         "msg_id": message.id
                     })
-                    global files_processed
-                    files_processed += 1
+                    global files_processed; files_processed += 1
                     print(f"✅ Saved: {meta['title']}")
                 except DuplicateKeyError: pass
-                except Exception as e: logger.error(f"DB Error: {e}")
-                
                 queue.task_done()
-            except Exception as e: logger.error(f"Worker Error: {e}"); queue.task_done()
+            except: queue.task_done()
 
     workers = [asyncio.create_task(worker()) for _ in range(5)]
     
@@ -237,16 +232,15 @@ async def indexing_process(client, start_id, end_id, status_msg):
                 if status_msg and (files_processed % 20 == 0):
                     try: await status_msg.edit(f"🔄 **Syncing...**\nScanning: `{current_id}`\nSaved: `{files_processed}`")
                     except: pass
-            except Exception as e: logger.error(f"Batch Error: {e}")
+            except: pass
             current_id += 50
             await asyncio.sleep(0.5) 
         await queue.join()
     finally:
         for w in workers: w.cancel()
         indexing_active = False
-        if status_msg: 
-            try: await status_msg.edit(f"✅ **Done!**\nAdded: `{files_processed}`")
-            except: pass
+        if status_msg: try: await status_msg.edit(f"✅ **Done!**\nAdded: `{files_processed}`")
+        except: pass
 
 # --- COMMANDS ---
 
@@ -257,30 +251,25 @@ async def start_handler(client, message):
 @app.on_message(filters.command("stats"))
 async def stats_handler(client, message):
     try:
-        docs = await collection.count_documents({})
-        covers = await collection.count_documents({"cover_image": {"$ne": None}})
-        await message.reply(f"📊 **Stats**\n📚 Books: `{docs}`\n🖼️ Covers: `{covers}`\n🔄 Running: `{indexing_active}`")
+        c = await collection.count_documents({})
+        cv = await collection.count_documents({"cover_image": {"$ne": None}})
+        await message.reply(f"📊 **Stats**\n📚 Books: `{c}`\n🖼️ Covers: `{cv}`")
     except: pass
 
 @app.on_message(filters.command("index") & filters.user(ADMIN_ID))
 async def index_cmd(client, message):
     global indexing_active
     if indexing_active: return await message.reply("⚠️ Running.")
-    
     args = message.text.split()
-    start, end = 1, 0
-    if len(args) == 2: end = int(args[1])
-    elif len(args) == 3: start, end = int(args[1]), int(args[2])
-    else: return await message.reply("Usage: /index [start] end")
-    
+    s, en = 1, int(args[1]) if len(args)==2 else int(args[2])
+    if len(args)==3: s = int(args[1])
     indexing_active = True
-    msg = await message.reply(f"🚀 **Indexing** {start}-{end}")
-    asyncio.create_task(indexing_process(client, start, end, msg))
+    m = await message.reply(f"🚀 Index {s}-{en}")
+    asyncio.create_task(indexing_process(client, s, en, m))
 
 @app.on_message(filters.command("stop_index") & filters.user(ADMIN_ID))
 async def stop_cmd(client, message):
-    global indexing_active
-    indexing_active = False
+    global indexing_active; indexing_active = False
     await message.reply("🛑 Stopping...")
 
 @app.on_message(filters.command("export") & filters.user(ADMIN_ID))
@@ -306,8 +295,7 @@ async def export_cmd(client, message):
 
 @app.on_message(filters.command("import") & filters.user(ADMIN_ID))
 async def import_cmd(client, message):
-    if not message.reply_to_message or not message.reply_to_message.document:
-        return await message.reply("Reply to file.")
+    if not message.reply_to_message or not message.reply_to_message.document: return await message.reply("Reply file.")
     s = await message.reply("📥 Importing...")
     path = await message.reply_to_message.download()
     try:
@@ -329,7 +317,7 @@ async def import_cmd(client, message):
 
 @app.on_message(filters.command("migrate") & filters.user(ADMIN_ID))
 async def migrate_cmd(client, message):
-    if not legacy_collections: return await message.reply("❌ No Legacy DBs")
+    if not legacy_collections: return await message.reply("❌ No Legacy")
     s = await message.reply("🚀 Migrating...")
     t=0
     for c in legacy_collections:
@@ -418,16 +406,40 @@ async def callback_handler(client, callback_query):
             b = await collection.find_one({"_id": ObjectId(bid)})
             if not b: return await callback_query.answer("Not found", show_alert=True)
             
-            title = html.escape(get_display_title(b))
-            auth = html.escape(b.get('author', 'Unknown'))
-            syn = html.escape(b.get('synopsis') or "No synopsis.")
+            # --- TITLE & CONTENT ---
+            title = get_display_title(b)
+            auth = b.get('author', 'Unknown')
+            syn = b.get('synopsis', 'No synopsis.')
             
-            # --- EXPANDABLE BLOCKQUOTE (PYROGRAM HTML) ---
-            text = (
-                f"<b>{title}</b>\n"
-                f"Author: {auth}\n\n"
-                f"<blockquote expandable><b><u>SYNOPSIS</u></b>\n{syn}</blockquote>"
-            )
+            # --- MANUAL ENTITIES (UTF-16 OFFSETS) ---
+            # 1. Header
+            header = f"{title}\nAuthor: {auth}\n\n"
+            syn_label = "SYNOPSIS\n"
+            full_text = header + syn_label + syn
+            
+            # 2. Offsets
+            off_title = 0
+            len_title = len_utf16(title)
+            
+            off_syn_block = len_utf16(header)
+            len_syn_block = len_utf16(syn_label + syn)
+            
+            off_syn_label = off_syn_block
+            len_syn_label = len_utf16("SYNOPSIS")
+            
+            # 3. Entity Types (Safe Fallback)
+            # Try to use Expandable Blockquote if supported by library version
+            try:
+                qt_type = MessageEntityType.EXPANDABLE_BLOCKQUOTE
+            except AttributeError:
+                qt_type = MessageEntityType.BLOCKQUOTE # Fallback for old libs
+            
+            entities = [
+                MessageEntity(type=MessageEntityType.BOLD, offset=off_title, length=len_title),
+                MessageEntity(type=qt_type, offset=off_syn_block, length=len_syn_block),
+                MessageEntity(type=MessageEntityType.BOLD, offset=off_syn_label, length=len_syn_label),
+                MessageEntity(type=MessageEntityType.UNDERLINE, offset=off_syn_label, length=len_syn_label)
+            ]
             
             kb = [[InlineKeyboardButton("📥 Download", callback_data=f"d:{bid}")]]
             
@@ -437,16 +449,16 @@ async def callback_handler(client, callback_query):
                 await client.send_photo(
                     callback_query.message.chat.id, 
                     f, 
-                    caption=text, 
-                    reply_markup=InlineKeyboardMarkup(kb),
-                    parse_mode=ParseMode.HTML
+                    caption=full_text, 
+                    caption_entities=entities, # Use entities
+                    reply_markup=InlineKeyboardMarkup(kb)
                 )
             else:
                 await client.send_message(
                     callback_query.message.chat.id, 
-                    text, 
-                    reply_markup=InlineKeyboardMarkup(kb),
-                    parse_mode=ParseMode.HTML
+                    full_text, 
+                    entities=entities, # Use entities
+                    reply_markup=InlineKeyboardMarkup(kb)
                 )
         except Exception as e: 
             logger.error(f"View Error: {e}")
@@ -464,23 +476,19 @@ async def callback_handler(client, callback_query):
                 caption=f"📖 {get_display_title(b)}"
             )
             except: 
-                # Fallback: Forward if file_id is stale
                 try: await client.copy_message(callback_query.message.chat.id, CHANNEL_ID, b['msg_id'])
                 except: await callback_query.answer("File lost.", show_alert=True)
         except: pass
 
-# --- RUN ---
 async def main():
     await ensure_indexes()
-    logger.info("Bot Started (Pyrogram)")
+    logger.info("Bot Started")
     await app.start()
     
-    # Resume Index Logic (Simplified)
     global indexing_active
     try:
         last = await collection.find_one(sort=[("msg_id", -1)])
-        if last: 
-            logger.info(f"Resume ID: {last.get('msg_id', 0) + 1}")
+        if last: logger.info(f"Resume ID: {last.get('msg_id', 0) + 1}")
     except: pass
     
     await idle()

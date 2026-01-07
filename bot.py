@@ -12,7 +12,6 @@ import base64
 import xml.etree.ElementTree as ET
 from bs4 import BeautifulSoup
 from telethon import TelegramClient, events, Button
-from telethon.errors import MessageNotModifiedError
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.errors import DuplicateKeyError, BulkWriteError, OperationFailure
 
@@ -24,12 +23,9 @@ try:
     CHANNEL_ID = int(os.environ.get("CHANNEL_ID")) 
     ADMIN_ID = int(os.environ.get("ADMIN_ID"))
     
-    # Primary Database (Azure)
     AZURE_URL = os.environ.get("AZURE_URL")
-    if not AZURE_URL:
-        raise ValueError("❌ Missing AZURE_URL! Please set your Cosmos DB connection string.")
+    if not AZURE_URL: raise ValueError("Missing AZURE_URL")
         
-    # Legacy Databases (For Migration Only)
     LEGACY_STR = os.environ.get("MONGO_URI") or os.environ.get("MONGO_URL") or ""
     LEGACY_URIS = LEGACY_STR.split() if LEGACY_STR else []
     
@@ -46,44 +42,39 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # --- DATABASE SETUP ---
-
-# 1. Primary (Azure)
 try:
     azure_client = AsyncIOMotorClient(AZURE_URL)
     db = azure_client[DB_NAME]
     collection = db[COLLECTION_NAME]
     logger.info("✅ Connected to Azure Cosmos DB.")
 except Exception as e:
-    logger.error(f"❌ Failed to connect to Azure: {e}")
+    logger.error(f"❌ Connection Error: {e}")
     exit(1)
 
-# 2. Legacy (Old MongoDBs)
+# Legacy DBs
 legacy_collections = []
-if LEGACY_URIS:
-    for uri in LEGACY_URIS:
-        try:
-            cli = AsyncIOMotorClient(uri)
-            legacy_collections.append(cli[DB_NAME][COLLECTION_NAME])
-        except: pass
-    logger.info(f"🔗 Detected {len(legacy_collections)} legacy databases for migration.")
+for uri in LEGACY_URIS:
+    try:
+        cli = AsyncIOMotorClient(uri)
+        legacy_collections.append(cli[DB_NAME][COLLECTION_NAME])
+    except: pass
 
 # --- GLOBAL STATE ---
 indexing_active = False
 files_processed = 0
-total_files_found = 0
 
-# --- HELPER: Ensure Indexes (Azure) ---
+# --- HELPER: Ensure Indexes ---
 async def ensure_indexes():
-    logger.info("⚙️ Verifying Azure Indexes...")
+    logger.info("⚙️ Verifying Indexes...")
     try:
         await collection.create_index([("title", "text"), ("author", "text"), ("synopsis", "text"), ("tags", "text")])
         await collection.create_index("file_unique_id", unique=True)
         await collection.create_index("msg_id")
         logger.info("✅ Indexes Ready.")
     except Exception as e:
-        logger.warning(f"⚠️ Index check failed (Ignore if using Cosmos Free Tier): {e}")
+        logger.warning(f"⚠️ Index Warning: {e}")
 
-# --- METADATA EXTRACTION (ROBUST) ---
+# --- METADATA EXTRACTION ---
 def parse_epub_direct(file_path):
     meta = {
         "title": None,
@@ -95,7 +86,6 @@ def parse_epub_direct(file_path):
     
     try:
         with zipfile.ZipFile(file_path, 'r') as z:
-            # 1. Locate OPF File
             opf_path = None
             try:
                 container = z.read('META-INF/container.xml')
@@ -114,11 +104,9 @@ def parse_epub_direct(file_path):
             
             if not opf_path: return meta
 
-            # 2. Parse OPF (Deep Scan)
             opf_data = z.read(opf_path)
             try:
                 root = ET.fromstring(opf_data)
-                
                 for elem in root.iter():
                     tag = elem.tag.split('}')[-1].lower() if '}' in elem.tag else elem.tag.lower()
                     if not elem.text: continue
@@ -129,15 +117,10 @@ def parse_epub_direct(file_path):
                     elif tag == 'creator': meta['author'] = text
                     elif tag == 'description': meta['synopsis'] = text
                     elif tag == 'subject': meta['tags'] += text + ", "
+            except: pass
 
-            except Exception as e:
-                logger.error(f"XML Parse Error: {e}")
-
-            # 3. Extract Cover
             cover_href = None
             manifest = None
-            
-            # Find Manifest Block
             for elem in root.iter():
                 tag = elem.tag.split('}')[-1].lower()
                 if tag == 'manifest':
@@ -182,7 +165,6 @@ def parse_epub_direct(file_path):
                         meta['cover_image'] = z.read(full_path)
                 except: pass
 
-            # 4. Fallback Synopsis
             if meta['synopsis'] == "No synopsis available.":
                 for name in z.namelist():
                     if 'intro' in name.lower() or 'desc' in name.lower():
@@ -195,7 +177,6 @@ def parse_epub_direct(file_path):
                                     meta['synopsis'] = "\n".join([p.get_text() for p in ps[:6]])
                                     break
                             except: pass
-
     except Exception: pass
     
     if meta['tags'].endswith(", "): meta['tags'] = meta['tags'][:-2]
@@ -223,8 +204,7 @@ async def indexing_process(client, start_id, end_id, status_msg=None):
                 meta = await asyncio.to_thread(parse_epub_direct, path)
                 if os.path.exists(path): os.remove(path)
 
-                # Fallback Title
-                if not meta['title'] or meta['title'] == "Unknown Title":
+                if not meta['title']:
                     meta['title'] = message.file.name.replace('.epub', '').replace('_', ' ')
 
                 try:
@@ -294,7 +274,7 @@ async def startup_check():
 bot = TelegramClient('bot_session', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 PAGE_SIZE = 8
 
-# --- MIGRATION (Legacy -> Azure) ---
+# --- MIGRATION ---
 @bot.on(events.NewMessage(pattern='/migrate', from_users=[ADMIN_ID]))
 async def migrate_handler(event):
     if not legacy_collections: return await event.respond("❌ No legacy DBs.")
@@ -395,7 +375,7 @@ async def import_handler(event):
     finally:
         if os.path.exists(path): os.remove(path)
 
-# --- STATS ---
+# --- COMMANDS ---
 @bot.on(events.NewMessage(pattern='/stats'))
 async def stats_handler(event):
     try:
@@ -445,9 +425,12 @@ async def perform_search(event, query, page):
         btns = []
         
         for b in res:
+            # === TITLE FIX ===
+            # Priority: DB Title -> Filename -> "Unknown"
+            # Ensure we don't display "Unknown Title" if it's stored in DB that way
             title = b.get('title')
             if not title or title == "Unknown Title":
-                title = b.get('file_name', 'Book')
+                title = b.get('file_name', 'Unknown Book')
             
             lbl = f"📖 {title[:30]}"
             btns.append([Button.inline(lbl, data=f"view:{str(b['_id'])}")])
@@ -484,6 +467,7 @@ async def callback(event):
             b = await collection.find_one({"_id": ObjectId(oid)})
             if not b: return await event.answer("Not found", alert=True)
             
+            # === SMART TITLE DISPLAY ===
             title = b.get('title')
             if not title or title == "Unknown Title":
                 title = b.get('file_name', 'Unknown Book')
@@ -493,6 +477,7 @@ async def callback(event):
             syn = html.escape(b.get('synopsis', 'No synopsis.'))
             
             h_html = f"<blockquote><b>{title}</b>\nAuthor: {author}</blockquote>"
+            # === COLLAPSIBLE BLOCKQUOTE ===
             b_html = f"<blockquote expandable><b><u>SYNOPSIS</u></b>\n{syn}</blockquote>"
             btns = [[Button.inline("📥 Download EPUB", data=f"dl:{oid}")]]
             
@@ -525,7 +510,13 @@ async def callback(event):
             from bson.objectid import ObjectId
             b = await collection.find_one({"_id": ObjectId(oid)})
             await event.answer("🚀 Sending...")
-            try: await bot.send_file(event.chat_id, b['file_id'], caption=f"📖 {b.get('title', 'Book')}")
+            
+            # === BUTTON CAPTION FIX ===
+            # Explicitly fallback to filename if title is missing
+            t = b.get('title')
+            if not t or t == "Unknown Title": t = b.get('file_name', 'Book')
+            
+            try: await bot.send_file(event.chat_id, b['file_id'], caption=f"📖 {t}")
             except: 
                 try: await bot.forward_messages(event.chat_id, b['msg_id'], CHANNEL_ID)
                 except: await event.answer("❌ File lost.", alert=True)

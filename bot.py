@@ -177,7 +177,6 @@ def parse_epub_direct(file_path):
     return meta
 
 # --- PYROGRAM CLIENT ---
-# sleep_threshold=60 prevents the bot from freezing for too long on FloodWait
 app = Client(
     "novel_bot_session",
     api_id=API_ID,
@@ -188,9 +187,9 @@ app = Client(
 
 # --- INDEXING PROCESS ---
 async def indexing_process(client, start_id, end_id, status_msg):
+    # Only declare global ONCE at top
     global indexing_active, files_found, files_saved
     
-    # Reset counters on new run
     files_found = 0
     files_saved = 0
     
@@ -201,6 +200,7 @@ async def indexing_process(client, start_id, end_id, status_msg):
         except: pass
 
     async def worker():
+        # Inner function needs global access to modify the counters
         global files_saved
         while indexing_active:
             try:
@@ -248,7 +248,6 @@ async def indexing_process(client, start_id, end_id, status_msg):
                 logger.error(f"Worker Error: {e}")
                 queue.task_done()
 
-    # Start 3 workers
     workers = [asyncio.create_task(worker()) for _ in range(3)]
     
     try:
@@ -259,7 +258,7 @@ async def indexing_process(client, start_id, end_id, status_msg):
             batch_end = min(current_id + BATCH_SIZE, end_id + 1)
             ids_to_fetch = list(range(current_id, batch_end))
             
-            # Update status
+            # Status Update
             if status_msg and (current_id % 100 == 0):
                 try:
                     await status_msg.edit(
@@ -279,9 +278,8 @@ async def indexing_process(client, start_id, end_id, status_msg):
                 
                 if messages:
                     for message in messages:
-                        # Filter EPUBs
                         if message and message.document and message.document.file_name and message.document.file_name.endswith('.epub'):
-                            global files_found
+                            # Removed redundant global declaration here
                             files_found += 1
                             await queue.put(message)
                 
@@ -482,7 +480,7 @@ async def callback_handler(client, callback_query):
             auth = b.get('author', 'Unknown')
             syn = b.get('synopsis', 'No synopsis.')
             
-            # --- HEADER ENTITIES (Offset 0 relative to Message 1) ---
+            # --- HEADER (Title + Author) in BLOCKQUOTE ---
             header_text = f"{title}\nAuthor: {auth}"
             header_len = len_utf16(header_text)
             title_len = len_utf16(title)
@@ -492,7 +490,7 @@ async def callback_handler(client, callback_query):
                 MessageEntity(type=MessageEntityType.BOLD, offset=0, length=title_len)
             ]
 
-            # --- SYNOPSIS ENTITIES (Offset 0 relative to Message 2) ---
+            # --- SYNOPSIS in EXPANDABLE BLOCKQUOTE ---
             syn_label = "SYNOPSIS"
             syn_full_text = f"{syn_label}\n{syn}"
             syn_total_len = len_utf16(syn_full_text)
@@ -504,9 +502,7 @@ async def callback_handler(client, callback_query):
                 qt_type = MessageEntityType.BLOCKQUOTE
             
             syn_entities = [
-                # 1. Expandable Quote around EVERYTHING
                 MessageEntity(type=qt_type, offset=0, length=syn_total_len),
-                # 2. Bold + Underline for the label
                 MessageEntity(type=MessageEntityType.BOLD, offset=0, length=label_len),
                 MessageEntity(type=MessageEntityType.UNDERLINE, offset=0, length=label_len)
             ]
@@ -515,7 +511,7 @@ async def callback_handler(client, callback_query):
             
             await callback_query.message.delete()
             
-            # 1. Header Message
+            # 1. HEADER (Photo/Text)
             if b.get('cover_image'):
                 try:
                     f = io.BytesIO(b['cover_image']); f.name="c.jpg"
@@ -541,7 +537,7 @@ async def callback_handler(client, callback_query):
                     parse_mode=None
                 )
             
-            # 2. Synopsis Message (With Expandable Blockquote)
+            # 2. SYNOPSIS (Always Text)
             await client.send_message(
                 callback_query.message.chat.id, 
                 syn_full_text, 

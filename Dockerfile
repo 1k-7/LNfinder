@@ -2,22 +2,12 @@ FROM python:3.10-slim
 
 WORKDIR /app
 
-# Dependencies for ebooklib (lxml) and compilation
-RUN apt-get update && apt-get install -y \
-gcc \
-libxml2-dev \
-libxslt-dev \
-zlib1g-dev \
-&& rm -rf /var/lib/apt/lists/*
+# Install system dependencies if needed (e.g. for lxml/pillow)
+# RUN apt-get update && apt-get install -y git
 
-RUN pip install --no-cache-dir \
-telethon \
-motor \
-ebooklib \
-beautifulsoup4 \
-lxml
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy all scripts
 COPY . .
 
 CMD ["python", "bot.py"]

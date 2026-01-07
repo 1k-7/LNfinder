@@ -1,4 +1,4 @@
-telethon
+python-telegram-bot
 motor
 ebooklib
 beautifulsoup4

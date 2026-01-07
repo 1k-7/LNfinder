@@ -106,11 +106,16 @@ def parse_epub_direct(file_path):
             try:
                 root = ET.fromstring(z.read('META-INF/container.xml'))
                 for child in root.iter():
-                    if child.get('full-path'): opf_path = child.get('full-path'); break
+                    if child.get('full-path'): 
+                        opf_path = child.get('full-path')
+                        break
             except: pass
+            
             if not opf_path:
                 for n in z.namelist():
-                    if n.endswith('.opf'): opf_path = n; break
+                    if n.endswith('.opf'): 
+                        opf_path = n
+                        break
             if not opf_path: return meta
 
             try:
@@ -131,17 +136,25 @@ def parse_epub_direct(file_path):
             if manifest:
                 for item in manifest:
                     props = item.get('properties', '').lower()
-                    if 'cover-image' in props: cover_href = item.get('href'); break
+                    if 'cover-image' in props: 
+                        cover_href = item.get('href')
+                        break
+            
             if not cover_href:
                 for elem in root.iter():
                     if elem.tag.split('}')[-1].lower() == 'meta' and elem.get('name') == 'cover':
                         cid = elem.get('content')
                         if manifest:
                             for item in manifest:
-                                if item.get('id') == cid: cover_href = item.get('href'); break
+                                if item.get('id') == cid: 
+                                    cover_href = item.get('href')
+                                    break
             if not cover_href:
                 for n in z.namelist():
-                    if 'cover' in n.lower() and n.endswith(('.jpg','.png')): cover_href = n; break
+                    if 'cover' in n.lower() and n.endswith(('.jpg','.png')): 
+                        cover_href = n
+                        break
+            
             if cover_href:
                 try:
                     if '/' in opf_path and '/' not in cover_href:
@@ -155,7 +168,9 @@ def parse_epub_direct(file_path):
                         try:
                             soup = BeautifulSoup(z.read(n), 'html.parser')
                             ps = soup.find_all('p')
-                            if ps: meta['synopsis'] = "\n".join([p.text for p in ps[:6]]); break
+                            if ps: 
+                                meta['synopsis'] = "\n".join([p.text for p in ps[:6]])
+                                break
                         except: pass
     except: pass
     if meta['tags'].endswith(", "): meta['tags'] = meta['tags'][:-2]
@@ -177,18 +192,27 @@ async def indexing_process(client, start_id, end_id, status_msg):
     queue = asyncio.Queue(maxsize=30)
     
     if status_msg: 
-        try: await status_msg.edit("🚀 **Starting Scan...**")
-        except: pass
+        try:
+            await status_msg.edit("🚀 **Starting Scan...**")
+        except:
+            pass
 
     async def worker():
         while indexing_active:
             try:
                 message = await queue.get()
                 temp_filename = f"temp_{message.id}.epub"
-                try: path = await client.download_media(message, file_name=temp_filename)
-                except: queue.task_done(); continue
                 
-                if not path: queue.task_done(); continue
+                path = None
+                try:
+                    path = await client.download_media(message, file_name=temp_filename)
+                except:
+                    queue.task_done()
+                    continue
+                
+                if not path:
+                    queue.task_done()
+                    continue
 
                 meta = await asyncio.to_thread(parse_epub_direct, path)
                 if os.path.exists(path): os.remove(path)
@@ -208,11 +232,18 @@ async def indexing_process(client, start_id, end_id, status_msg):
                         "cover_image": meta['cover_image'],
                         "msg_id": message.id
                     })
-                    global files_processed; files_processed += 1
+                    global files_processed
+                    files_processed += 1
                     print(f"✅ Saved: {meta['title']}")
-                except DuplicateKeyError: pass
+                except DuplicateKeyError:
+                    pass
+                except Exception as e:
+                    logger.error(f"DB Error: {e}")
+                
                 queue.task_done()
-            except: queue.task_done()
+            except Exception as e:
+                logger.error(f"Worker Error: {e}")
+                queue.task_done()
 
     workers = [asyncio.create_task(worker()) for _ in range(5)]
     
@@ -230,17 +261,24 @@ async def indexing_process(client, start_id, end_id, status_msg):
                         await queue.put(message)
                 
                 if status_msg and (files_processed % 20 == 0):
-                    try: await status_msg.edit(f"🔄 **Syncing...**\nScanning: `{current_id}`\nSaved: `{files_processed}`")
-                    except: pass
-            except: pass
+                    try:
+                        await status_msg.edit(f"🔄 **Syncing...**\nScanning: `{current_id}`\nSaved: `{files_processed}`")
+                    except:
+                        pass
+            except Exception as e:
+                logger.error(f"Batch Error: {e}")
+            
             current_id += 50
             await asyncio.sleep(0.5) 
         await queue.join()
     finally:
         for w in workers: w.cancel()
         indexing_active = False
-        if status_msg: try: await status_msg.edit(f"✅ **Done!**\nAdded: `{files_processed}`")
-        except: pass
+        if status_msg:
+            try:
+                await status_msg.edit(f"✅ **Done!**\nAdded: `{files_processed}`")
+            except:
+                pass
 
 # --- COMMANDS ---
 
@@ -288,7 +326,8 @@ async def export_cmd(client, message):
             f.write(']')
         with zipfile.ZipFile("lib.zip", 'w', zipfile.ZIP_DEFLATED) as z: z.write("lib.json")
         await client.send_document(message.chat.id, "lib.zip", caption="✅ Backup")
-    except Exception as e: await s.edit(f"❌ {e}")
+    except Exception as e:
+        await s.edit(f"❌ {e}")
     finally:
         if os.path.exists("lib.json"): os.remove("lib.json")
         if os.path.exists("lib.zip"): os.remove("lib.zip")
@@ -311,7 +350,8 @@ async def import_cmd(client, message):
                 try: await collection.replace_one({"file_unique_id":x['file_unique_id']},x,upsert=True)
                 except: pass
         await s.edit("✅ Done")
-    except Exception as e: await s.edit(f"❌ {e}")
+    except Exception as e:
+        await s.edit(f"❌ {e}")
     finally:
         if os.path.exists(path): os.remove(path)
 
@@ -325,7 +365,9 @@ async def migrate_cmd(client, message):
             if '_id' in d: del d['_id']
             try: await collection.insert_one(d); t+=1
             except: pass
-            if t%100==0: await s.edit(f"📥 {t}")
+            if t%100==0:
+                try: await s.edit(f"📥 {t}")
+                except: pass
     await s.edit(f"✅ {t} Done")
 
 # --- SEARCH & VIEW ---
@@ -406,33 +448,28 @@ async def callback_handler(client, callback_query):
             b = await collection.find_one({"_id": ObjectId(bid)})
             if not b: return await callback_query.answer("Not found", show_alert=True)
             
-            # --- TITLE & CONTENT ---
             title = get_display_title(b)
             auth = b.get('author', 'Unknown')
             syn = b.get('synopsis', 'No synopsis.')
             
-            # --- MANUAL ENTITIES (UTF-16 OFFSETS) ---
-            # 1. Header
+            # --- MANUAL ENTITIES (Safe Fallback) ---
             header = f"{title}\nAuthor: {auth}\n\n"
             syn_label = "SYNOPSIS\n"
             full_text = header + syn_label + syn
             
-            # 2. Offsets
             off_title = 0
             len_title = len_utf16(title)
-            
             off_syn_block = len_utf16(header)
             len_syn_block = len_utf16(syn_label + syn)
-            
             off_syn_label = off_syn_block
             len_syn_label = len_utf16("SYNOPSIS")
             
-            # 3. Entity Types (Safe Fallback)
-            # Try to use Expandable Blockquote if supported by library version
             try:
+                # Try new Expandable Blockquote
                 qt_type = MessageEntityType.EXPANDABLE_BLOCKQUOTE
             except AttributeError:
-                qt_type = MessageEntityType.BLOCKQUOTE # Fallback for old libs
+                # Fallback for old libs
+                qt_type = MessageEntityType.BLOCKQUOTE
             
             entities = [
                 MessageEntity(type=MessageEntityType.BOLD, offset=off_title, length=len_title),
@@ -450,14 +487,14 @@ async def callback_handler(client, callback_query):
                     callback_query.message.chat.id, 
                     f, 
                     caption=full_text, 
-                    caption_entities=entities, # Use entities
+                    caption_entities=entities, 
                     reply_markup=InlineKeyboardMarkup(kb)
                 )
             else:
                 await client.send_message(
                     callback_query.message.chat.id, 
                     full_text, 
-                    entities=entities, # Use entities
+                    entities=entities, 
                     reply_markup=InlineKeyboardMarkup(kb)
                 )
         except Exception as e: 

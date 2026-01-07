@@ -1,33 +1,33 @@
+import asyncio
+import math
 import os
 import logging
+import warnings
+import io
 import zipfile
+import html
+import re
+import random
 import json
 import base64
-import re
-import io
-import html
-import asyncio
 import xml.etree.ElementTree as ET
 from bs4 import BeautifulSoup
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.errors import DuplicateKeyError
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    ApplicationBuilder,
-    ContextTypes,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    filters,
+from pyrogram import Client, filters, idle
+from pyrogram.types import (
+    InlineKeyboardMarkup, 
+    InlineKeyboardButton, 
+    Message
 )
-from telegram.constants import ParseMode
+from pyrogram.enums import ParseMode
 
 # --- CONFIGURATION ---
 try:
-    # PTB uses just the TOKEN
+    API_ID = int(os.environ.get("API_ID"))
+    API_HASH = os.environ.get("API_HASH")
     BOT_TOKEN = os.environ.get("BOT_TOKEN")
-    # API_ID/HASH are not needed for PTB, but we keep them if you use them elsewhere
-    CHANNEL_ID = int(os.environ.get("CHANNEL_ID"))
+    CHANNEL_ID = int(os.environ.get("CHANNEL_ID")) 
     ADMIN_ID = int(os.environ.get("ADMIN_ID"))
     
     AZURE_URL = os.environ.get("AZURE_URL")
@@ -38,15 +38,14 @@ try:
     
     DB_NAME = os.environ.get("DB_NAME", "novel_library")
     COLLECTION_NAME = os.environ.get("COLLECTION_NAME", "books")
+
 except Exception as e:
     print(f"❌ CONFIG ERROR: {e}")
     exit(1)
 
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+warnings.filterwarnings("ignore")
 
 # --- DATABASE SETUP ---
 try:
@@ -65,6 +64,10 @@ for uri in LEGACY_URIS:
         legacy_collections.append(cli[DB_NAME][COLLECTION_NAME])
     except: pass
 
+# --- GLOBAL STATE ---
+indexing_active = False
+files_processed = 0
+
 # --- HELPERS ---
 async def ensure_indexes():
     try:
@@ -74,37 +77,43 @@ async def ensure_indexes():
     except: pass
 
 def get_display_title(book_doc):
-    """Priority: DB Title -> Filename -> Unknown"""
-    if book_doc.get('title') and book_doc['title'] != "Unknown Title":
-        return book_doc['title'].strip()
+    """
+    Returns the Title from DB. 
+    Only falls back to File Name if Title is explicitly None/Empty.
+    """
+    db_title = book_doc.get('title')
+    if db_title and db_title.strip() and db_title != "Unknown Title":
+        return db_title.strip()
+        
     fname = book_doc.get('file_name')
     if fname:
-        return fname.replace('.epub', '').replace('_', ' ').strip()
+        return fname.replace('.epub', '').replace('_', ' ').replace('-', ' ').strip()
+        
     return "Unknown Book"
 
 def get_button_label(book_doc):
-    """Strips c1-23 ranges for buttons."""
-    title = get_display_title(book_doc)
-    return re.sub(r'\s+(c|ch|chap|vol|v)\.?\s*\d+(?:[-–]\d+)?.*$', '', title, flags=re.IGNORECASE).strip()
+    """Strips chapter info for buttons."""
+    full_title = get_display_title(book_doc)
+    clean_label = re.sub(r'\s+(c|ch|chap|vol|v)\.?\s*\d+(?:[-–]\d+)?.*$', '', full_title, flags=re.IGNORECASE)
+    return clean_label.strip()
 
+# --- METADATA PARSER ---
 def parse_epub_direct(file_path):
     meta = {"title": None, "author": "Unknown", "synopsis": "No synopsis.", "tags": "", "cover_image": None}
     try:
         with zipfile.ZipFile(file_path, 'r') as z:
-            # Locate OPF
             opf_path = None
             try:
                 root = ET.fromstring(z.read('META-INF/container.xml'))
                 for child in root.iter():
                     if child.get('full-path'): opf_path = child.get('full-path'); break
             except: pass
+            
             if not opf_path:
                 for n in z.namelist():
                     if n.endswith('.opf'): opf_path = n; break
-            
             if not opf_path: return meta
 
-            # Parse Metadata
             try:
                 root = ET.fromstring(z.read(opf_path))
                 for elem in root.iter():
@@ -118,7 +127,6 @@ def parse_epub_direct(file_path):
                     elif tag == 'subject': meta['tags'] += text + ", "
             except: pass
 
-            # Extract Cover
             cover_href = None
             manifest = next((e for e in root.iter() if e.tag.split('}')[-1].lower() == 'manifest'), None)
             if manifest:
@@ -135,7 +143,6 @@ def parse_epub_direct(file_path):
             if not cover_href:
                 for n in z.namelist():
                     if 'cover' in n.lower() and n.endswith(('.jpg','.png')): cover_href = n; break
-            
             if cover_href:
                 try:
                     if '/' in opf_path and '/' not in cover_href:
@@ -143,7 +150,6 @@ def parse_epub_direct(file_path):
                     if cover_href in z.namelist(): meta['cover_image'] = z.read(cover_href)
                 except: pass
 
-            # Fallback Synopsis
             if meta['synopsis'] == "No synopsis.":
                 for n in z.namelist():
                     if 'intro' in n.lower() and n.endswith(('html','xhtml')):
@@ -156,252 +162,329 @@ def parse_epub_direct(file_path):
     if meta['tags'].endswith(", "): meta['tags'] = meta['tags'][:-2]
     return meta
 
-# --- HANDLERS ---
+# --- PYROGRAM CLIENT ---
+app = Client(
+    "novel_bot_session",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN
+)
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📚 **Novel Library Bot**\nSend a keyword to search.", parse_mode=ParseMode.MARKDOWN)
+PAGE_SIZE = 8
 
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        c = await collection.count_documents({})
-        cv = await collection.count_documents({"cover_image": {"$ne": None}})
-        active = "Yes" if context.job_queue.get_jobs_by_name("indexer") else "No"
-        await update.message.reply_text(f"📊 **Stats**\n📚 Books: `{c}`\n🖼️ Covers: `{cv}`\n🔄 Indexing: `{active}`", parse_mode=ParseMode.MARKDOWN)
-    except: await update.message.reply_text("Stats error.")
-
-# --- INDEXING JOB ---
-async def index_job(context: ContextTypes.DEFAULT_TYPE):
-    job = context.job
-    start_id = job.data['start']
-    end_id = job.data['end']
-    current_id = start_id
-    files_processed = 0
+# --- INDEXING PROCESS ---
+async def indexing_process(client, start_id, end_id, status_msg):
+    global indexing_active, files_processed
+    queue = asyncio.Queue(maxsize=30)
     
-    status_msg = await context.bot.send_message(chat_id=ADMIN_ID, text=f"🚀 **Indexing Started**\nRange: {start_id}-{end_id}", parse_mode=ParseMode.MARKDOWN)
+    if status_msg: 
+        try: await status_msg.edit("🚀 **Starting Scan...**")
+        except: pass
 
-    while current_id <= end_id:
-        # Check if job was stopped
-        if not context.job_queue.get_jobs_by_name("indexer"): break
-        
-        try:
-            # PTB doesn't have bulk get_messages easily for channels without being admin in a specific way
-            # We fetch one by one or small batches if possible. 
-            # For simplicity and stability in PTB, we often iterate.
-            # However, `context.bot.get_message` isn't standard for channels.
-            # We assume the bot is admin or use forward approach? 
-            # Actually, `copy_message` is expensive.
-            # We will use the 'forward' trick to a dump chat or just try to copy.
-            # OPTIMIZATION: PTB is harder for "history scraping" than Telethon.
-            # NOTE: If you strictly need history scraping, Telethon is better.
-            # BUT, since you asked for PTB, we assume the bot is an Admin in the channel.
-            
-            # Since PTB can't easily iterate history like Telethon, we will skip the "history fetch" 
-            # logic here and assume you forward files TO the bot or use the Import command.
-            # If you NEED channel scraping, Telethon is mandatory.
-            # I will implement the "Import from Reply" logic which is safer for PTB.
-            
-            pass 
-            # (Indexing logic removed because PTB cannot scrape channel history easily without user interaction)
-            # To fix this in PTB, you'd usually use a UserBot (Telethon/Pyrogram).
-            # Since we switched to PTB, we focus on /import.
-            
-        except Exception as e:
-            logger.error(f"Index Error: {e}")
-        
-        current_id += 1
-        await asyncio.sleep(1)
+    async def worker():
+        while indexing_active:
+            try:
+                message = await queue.get()
+                temp_filename = f"temp_{message.id}.epub"
+                try: path = await client.download_media(message, file_name=temp_filename)
+                except: queue.task_done(); continue
+                
+                if not path: queue.task_done(); continue
 
-    await context.bot.edit_message_text(chat_id=ADMIN_ID, message_id=status_msg.message_id, text=f"✅ **Indexing Finished** (PTB Mode)")
+                meta = await asyncio.to_thread(parse_epub_direct, path)
+                if os.path.exists(path): os.remove(path)
 
-# Since PTB cannot scrape history, we replace /index with a note or rely on /import.
-# However, if you really need scraping, Pyrogram is the best alternative to Telethon.
-# But I will provide the /import logic which works perfectly.
+                # Prioritize DB Title logic even during index
+                if not meta['title']: 
+                    meta['title'] = message.document.file_name.replace('.epub', '').replace('_', ' ')
 
-async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID: return
-    status = await update.message.reply_text("📦 Exporting...")
+                try:
+                    await collection.insert_one({
+                        "file_id": message.document.file_id,
+                        "file_unique_id": message.document.file_unique_id,
+                        "file_name": message.document.file_name,
+                        "title": meta['title'],
+                        "author": meta['author'],
+                        "synopsis": meta['synopsis'],
+                        "tags": meta['tags'],
+                        "cover_image": meta['cover_image'],
+                        "msg_id": message.id
+                    })
+                    global files_processed
+                    files_processed += 1
+                    print(f"✅ Saved: {meta['title']}")
+                except DuplicateKeyError: pass
+                except Exception as e: logger.error(f"DB Error: {e}")
+                
+                queue.task_done()
+            except Exception as e: logger.error(f"Worker Error: {e}"); queue.task_done()
+
+    workers = [asyncio.create_task(worker()) for _ in range(5)]
+    
     try:
-        file_path, zip_path = "lib.json", "lib.zip"
-        with open(file_path, 'w', encoding='utf-8') as f:
+        current_id = start_id
+        while current_id <= end_id and indexing_active:
+            batch_end = min(current_id + 50, end_id + 1)
+            ids_to_fetch = list(range(current_id, batch_end))
+            if not ids_to_fetch: break
+
+            try:
+                messages = await client.get_messages(CHANNEL_ID, ids_to_fetch)
+                for message in messages:
+                    if message and message.document and message.document.file_name and message.document.file_name.endswith('.epub'):
+                        await queue.put(message)
+                
+                if status_msg and (files_processed % 20 == 0):
+                    try: await status_msg.edit(f"🔄 **Syncing...**\nScanning: `{current_id}`\nSaved: `{files_processed}`")
+                    except: pass
+            except Exception as e: logger.error(f"Batch Error: {e}")
+            current_id += 50
+            await asyncio.sleep(0.5) 
+        await queue.join()
+    finally:
+        for w in workers: w.cancel()
+        indexing_active = False
+        if status_msg: 
+            try: await status_msg.edit(f"✅ **Done!**\nAdded: `{files_processed}`")
+            except: pass
+
+# --- COMMANDS ---
+
+@app.on_message(filters.command("start"))
+async def start_handler(client, message):
+    await message.reply("📚 **Novel Bot (Pyrogram)**")
+
+@app.on_message(filters.command("stats"))
+async def stats_handler(client, message):
+    try:
+        docs = await collection.count_documents({})
+        covers = await collection.count_documents({"cover_image": {"$ne": None}})
+        await message.reply(f"📊 **Stats**\n📚 Books: `{docs}`\n🖼️ Covers: `{covers}`\n🔄 Running: `{indexing_active}`")
+    except: pass
+
+@app.on_message(filters.command("index") & filters.user(ADMIN_ID))
+async def index_cmd(client, message):
+    global indexing_active
+    if indexing_active: return await message.reply("⚠️ Running.")
+    
+    args = message.text.split()
+    start, end = 1, 0
+    if len(args) == 2: end = int(args[1])
+    elif len(args) == 3: start, end = int(args[1]), int(args[2])
+    else: return await message.reply("Usage: /index [start] end")
+    
+    indexing_active = True
+    msg = await message.reply(f"🚀 **Indexing** {start}-{end}")
+    asyncio.create_task(indexing_process(client, start, end, msg))
+
+@app.on_message(filters.command("stop_index") & filters.user(ADMIN_ID))
+async def stop_cmd(client, message):
+    global indexing_active
+    indexing_active = False
+    await message.reply("🛑 Stopping...")
+
+@app.on_message(filters.command("export") & filters.user(ADMIN_ID))
+async def export_cmd(client, message):
+    s = await message.reply("📦 Exporting...")
+    try:
+        with open("lib.json", 'w') as f:
             f.write('[')
             first = True
-            async for doc in collection.find({}):
+            async for d in collection.find({}):
                 if not first: f.write(',')
                 first = False
-                if doc.get('cover_image'): doc['cover_image'] = base64.b64encode(doc['cover_image']).decode()
-                doc['_id'] = str(doc['_id'])
-                json.dump(doc, f)
+                if d.get('cover_image'): d['cover_image'] = base64.b64encode(d['cover_image']).decode()
+                d['_id'] = str(d['_id'])
+                json.dump(d, f)
             f.write(']')
-        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as z: z.write(file_path)
-        await update.message.reply_document(document=open(zip_path, 'rb'), caption="✅ Backup")
-        os.remove(file_path); os.remove(zip_path)
-        await status.delete()
-    except Exception as e: await status.edit_text(f"❌ Error: {e}")
+        with zipfile.ZipFile("lib.zip", 'w', zipfile.ZIP_DEFLATED) as z: z.write("lib.json")
+        await client.send_document(message.chat.id, "lib.zip", caption="✅ Backup")
+    except Exception as e: await s.edit(f"❌ {e}")
+    finally:
+        if os.path.exists("lib.json"): os.remove("lib.json")
+        if os.path.exists("lib.zip"): os.remove("lib.zip")
 
-async def import_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID: return
-    msg = update.message.reply_to_message
-    if not msg or not msg.document: return await update.message.reply_text("Reply to a JSON/ZIP file.")
-    
-    status = await update.message.reply_text("📥 Importing...")
+@app.on_message(filters.command("import") & filters.user(ADMIN_ID))
+async def import_cmd(client, message):
+    if not message.reply_to_message or not message.reply_to_message.document:
+        return await message.reply("Reply to file.")
+    s = await message.reply("📥 Importing...")
+    path = await message.reply_to_message.download()
     try:
-        f_obj = await msg.document.get_file()
-        f_path = await f_obj.download_to_drive("import_temp")
-        
-        if zipfile.is_zipfile(f_path):
-            with zipfile.ZipFile(f_path, 'r') as z: 
-                z.extractall()
-                f_path = z.namelist()[0]
-        
-        with open(f_path, 'r', encoding='utf-8') as f: data = json.load(f)
-        
-        count = 0
-        for item in data:
-            if item.get('cover_image'):
-                try: item['cover_image'] = base64.b64decode(item['cover_image'])
-                except: item['cover_image'] = None
-            if '_id' in item: del item['_id']
-            try: await collection.replace_one({"file_unique_id": item['file_unique_id']}, item, upsert=True); count += 1
+        if zipfile.is_zipfile(path):
+            with zipfile.ZipFile(path, 'r') as z: z.extractall(); path = z.namelist()[0]
+        with open(path, 'r') as f: data = json.load(f)
+        for c in [data[i:i+50] for i in range(0,len(data),50)]:
+            for x in c:
+                if x.get('cover_image'): 
+                    try: x['cover_image'] = base64.b64decode(x['cover_image'])
+                    except: x['cover_image'] = None
+                if '_id' in x: del x['_id']
+                try: await collection.replace_one({"file_unique_id":x['file_unique_id']},x,upsert=True)
+                except: pass
+        await s.edit("✅ Done")
+    except Exception as e: await s.edit(f"❌ {e}")
+    finally:
+        if os.path.exists(path): os.remove(path)
+
+@app.on_message(filters.command("migrate") & filters.user(ADMIN_ID))
+async def migrate_cmd(client, message):
+    if not legacy_collections: return await message.reply("❌ No Legacy DBs")
+    s = await message.reply("🚀 Migrating...")
+    t=0
+    for c in legacy_collections:
+        async for d in c.find({}):
+            if '_id' in d: del d['_id']
+            try: await collection.insert_one(d); t+=1
             except: pass
-            
-        await status.edit_text(f"✅ Imported {count} books.")
-        if os.path.exists(f_path): os.remove(f_path)
-        if os.path.exists("import_temp"): os.remove("import_temp")
-    except Exception as e: await status.edit_text(f"❌ Error: {e}")
+            if t%100==0: await s.edit(f"📥 {t}")
+    await s.edit(f"✅ {t} Done")
 
-async def search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.message.text.strip()
+# --- SEARCH & VIEW ---
+
+@app.on_message(filters.text & ~filters.command(["start", "stats", "index", "stop_index", "export", "import", "migrate"]))
+async def search_handler(client, message):
+    q = message.text.strip()
     try:
-        # Failsafe Search
         try:
             cnt = await collection.count_documents({"$text": {"$search": q}})
-            if cnt > 0: cursor = collection.find({"$text": {"$search": q}}).sort([("score", {"$meta": "textScore"})])
+            if cnt>0: cur = collection.find({"$text": {"$search": q}}).sort([("score", {"$meta": "textScore"})])
             else: raise Exception
         except:
-            reg = {"$or": [{"title": {"$regex": q, "$options": "i"}}, {"file_name": {"$regex": q, "$options": "i"}}]}
+            reg = {"$or": [
+                {"title": {"$regex": q, "$options": "i"}},
+                {"author": {"$regex": q, "$options": "i"}},
+                {"file_name": {"$regex": q, "$options": "i"}}
+            ]}
             cnt = await collection.count_documents(reg)
-            cursor = collection.find(reg)
+            cur = collection.find(reg)
         
-        results = await cursor.limit(8).to_list(length=8)
-        if not results: return await update.message.reply_text("❌ No matches.")
+        res = await cur.limit(8).to_list(length=8)
+        if not res: return await message.reply("❌ No matches.")
 
-        # Build Response
-        txt = f"<blockquote>🔎 Search: <b>{html.escape(q)}</b>\nMatches: <b>{cnt}</b></blockquote>"
-        keyboard = []
-        for b in results:
-            label = get_button_label(b)[:40]
-            keyboard.append([InlineKeyboardButton(f"📖 {label}", callback_data=f"v:{str(b['_id'])}")])
+        sq = html.escape(q)
+        txt = f"<blockquote>🔎 Search: <b>{sq}</b>\nMatches: <b>{cnt}</b></blockquote>"
+        btns = []
+        for b in res:
+            label = get_button_label(b)[:40] 
+            btns.append([InlineKeyboardButton(f"📖 {label}", callback_data=f"v:{str(b['_id'])}")])
         
-        keyboard.append([InlineKeyboardButton("➡️ Next", callback_data=f"n:1:{q[:20]}")])
-        await update.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML)
-    except Exception as e: await update.message.reply_text(f"⚠️ Error: {e}")
+        btns.append([InlineKeyboardButton("➡️ Next", callback_data=f"n:1:{q[:20]}")])
+        await message.reply(txt, reply_markup=InlineKeyboardMarkup(btns), parse_mode=ParseMode.HTML)
+    except Exception as e: await message.reply(f"⚠️ {e}")
 
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
+@app.on_callback_query()
+async def callback_handler(client, callback_query):
+    d = callback_query.data
     
-    if data.startswith("n:"): # Next Page
-        _, p, q = data.split(':', 2)
-        p = int(p)
-        # Re-run search logic (simplified for brevity)
+    if d.startswith("n:"):
         try:
-            cnt = await collection.count_documents({"$text": {"$search": q}})
-            cursor = collection.find({"$text": {"$search": q}}).sort([("score", {"$meta": "textScore"})])
-        except:
-            reg = {"$or": [{"title": {"$regex": q, "$options": "i"}}]} # Regex fallback
-            cnt = await collection.count_documents(reg)
-            cursor = collection.find(reg)
+            _, p, q = d.split(':', 2)
+            p = int(p)
+            try:
+                cnt = await collection.count_documents({"$text": {"$search": q}})
+                if cnt>0: cur = collection.find({"$text": {"$search": q}}).sort([("score", {"$meta": "textScore"})])
+                else: raise Exception
+            except:
+                reg = {"$or": [{"title": {"$regex": q, "$options": "i"}}, {"file_name": {"$regex": q, "$options": "i"}}]}
+                cnt = await collection.count_documents(reg)
+                cur = collection.find(reg)
             
-        results = await cursor.skip(p*8).limit(8).to_list(length=8)
-        if not results: return await query.answer("End of results.", show_alert=True)
-        
-        keyboard = []
-        for b in results:
-            label = get_button_label(b)[:40]
-            keyboard.append([InlineKeyboardButton(f"📖 {label}", callback_data=f"v:{str(b['_id'])}")])
-        
-        nav = []
-        if p > 0: nav.append(InlineKeyboardButton("⬅️", callback_data=f"n:{p-1}:{q}"))
-        nav.append(InlineKeyboardButton(f"{p+1}", callback_data="noop"))
-        if p < math.ceil(cnt/8)-1: nav.append(InlineKeyboardButton("➡️", callback_data=f"n:{p+1}:{q}"))
-        keyboard.append(nav)
-        
-        await query.edit_message_text(
-            f"<blockquote>🔎 Search: <b>{html.escape(q)}</b>\nMatches: <b>{cnt}</b></blockquote>",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode=ParseMode.HTML
-        )
-
-    elif data.startswith("v:"): # View Book
-        bid = data.split(':')[1]
-        from bson.objectid import ObjectId
-        b = await collection.find_one({"_id": ObjectId(bid)})
-        if not b: return await query.answer("Not found", show_alert=True)
-        
-        title = html.escape(get_display_title(b))
-        auth = html.escape(b.get('author', 'Unknown'))
-        syn = html.escape(b.get('synopsis', 'No synopsis.'))
-        
-        # NATIVE EXPANDABLE BLOCKQUOTE
-        text = (
-            f"<b>{title}</b>\n"
-            f"Author: {auth}\n\n"
-            f"<blockquote expandable><b><u>SYNOPSIS</u></b>\n{syn}</blockquote>"
-        )
-        
-        kb = [[InlineKeyboardButton("📥 Download", callback_data=f"d:{bid}")]]
-        
-        if b.get('cover_image'):
-            await context.bot.send_photo(
-                chat_id=query.message.chat_id,
-                photo=io.BytesIO(b['cover_image']),
-                caption=text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup(kb)
+            res = await cur.skip(p*8).limit(8).to_list(length=8)
+            if not res: return await callback_query.answer("End.", show_alert=True)
+            
+            btns = []
+            for b in res:
+                label = get_button_label(b)[:40]
+                btns.append([InlineKeyboardButton(f"📖 {label}", callback_data=f"v:{str(b['_id'])}")])
+            
+            nav = []
+            if p>0: nav.append(InlineKeyboardButton("⬅️", callback_data=f"n:{p-1}:{q}"))
+            nav.append(InlineKeyboardButton(f"{p+1}/{math.ceil(cnt/8)}", callback_data="nop"))
+            if p < math.ceil(cnt/8)-1: nav.append(InlineKeyboardButton("➡️", callback_data=f"n:{p+1}:{q}"))
+            btns.append(nav)
+            
+            await callback_query.edit_message_text(
+                f"<blockquote>🔎 Search: <b>{html.escape(q)}</b>\nMatches: <b>{cnt}</b></blockquote>", 
+                reply_markup=InlineKeyboardMarkup(btns), 
+                parse_mode=ParseMode.HTML
             )
-            await query.message.delete() # Remove search result
-        else:
-            await query.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
+        except: await callback_query.answer("Error", show_alert=True)
 
-    elif data.startswith("d:"): # Download
-        bid = data.split(':')[1]
-        from bson.objectid import ObjectId
-        b = await collection.find_one({"_id": ObjectId(bid)})
-        await query.answer("🚀 Sending...")
+    elif d.startswith("v:"):
         try:
-            # In PTB we typically copy message if possible, or send document via file_id
-            await context.bot.send_document(
-                chat_id=query.message.chat_id,
-                document=b['file_id'],
+            bid = d.split(':')[1]
+            from bson.objectid import ObjectId
+            b = await collection.find_one({"_id": ObjectId(bid)})
+            if not b: return await callback_query.answer("Not found", show_alert=True)
+            
+            title = html.escape(get_display_title(b))
+            auth = html.escape(b.get('author', 'Unknown'))
+            syn = html.escape(b.get('synopsis') or "No synopsis.")
+            
+            # --- EXPANDABLE BLOCKQUOTE (PYROGRAM HTML) ---
+            text = (
+                f"<b>{title}</b>\n"
+                f"Author: {auth}\n\n"
+                f"<blockquote expandable><b><u>SYNOPSIS</u></b>\n{syn}</blockquote>"
+            )
+            
+            kb = [[InlineKeyboardButton("📥 Download", callback_data=f"d:{bid}")]]
+            
+            await callback_query.message.delete()
+            if b.get('cover_image'):
+                f = io.BytesIO(b['cover_image']); f.name="c.jpg"
+                await client.send_photo(
+                    callback_query.message.chat.id, 
+                    f, 
+                    caption=text, 
+                    reply_markup=InlineKeyboardMarkup(kb),
+                    parse_mode=ParseMode.HTML
+                )
+            else:
+                await client.send_message(
+                    callback_query.message.chat.id, 
+                    text, 
+                    reply_markup=InlineKeyboardMarkup(kb),
+                    parse_mode=ParseMode.HTML
+                )
+        except Exception as e: 
+            logger.error(f"View Error: {e}")
+            await callback_query.answer("Error displaying.", show_alert=True)
+
+    elif d.startswith("d:"):
+        try:
+            bid = d.split(':')[1]
+            from bson.objectid import ObjectId
+            b = await collection.find_one({"_id": ObjectId(bid)})
+            await callback_query.answer("🚀 Sending...")
+            try: await client.send_document(
+                callback_query.message.chat.id, 
+                b['file_id'], 
                 caption=f"📖 {get_display_title(b)}"
             )
-        except:
-            # Fallback: Copy from channel if file_id is stale
-            try: await context.bot.copy_message(query.message.chat_id, CHANNEL_ID, b['msg_id'])
-            except: await query.answer("File lost/expired.", show_alert=True)
+            except: 
+                # Fallback: Forward if file_id is stale
+                try: await client.copy_message(callback_query.message.chat.id, CHANNEL_ID, b['msg_id'])
+                except: await callback_query.answer("File lost.", show_alert=True)
+        except: pass
+
+# --- RUN ---
+async def main():
+    await ensure_indexes()
+    logger.info("Bot Started (Pyrogram)")
+    await app.start()
+    
+    # Resume Index Logic (Simplified)
+    global indexing_active
+    try:
+        last = await collection.find_one(sort=[("msg_id", -1)])
+        if last: 
+            logger.info(f"Resume ID: {last.get('msg_id', 0) + 1}")
+    except: pass
+    
+    await idle()
+    await app.stop()
 
 if __name__ == '__main__':
-    # Initialize
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    
-    # Add Handlers
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("stats", stats))
-    app.add_handler(CommandHandler("export", export_cmd))
-    app.add_handler(CommandHandler("import", import_cmd))
-    
-    # Message Handler for Search
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search_handler))
-    
-    # Callback Handler
-    app.add_handler(CallbackQueryHandler(callback_handler))
-    
-    # Run
-    print("Bot Running (PTB)...")
-    
-    # Create indexes on startup
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(ensure_indexes())
-    
-    app.run_polling()
+    app.run(main())

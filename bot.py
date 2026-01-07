@@ -281,7 +281,6 @@ async def indexing_process(client, start_id, end_id, status_msg):
                     for message in messages:
                         # Filter EPUBs
                         if message and message.document and message.document.file_name and message.document.file_name.endswith('.epub'):
-                            global files_found
                             files_found += 1
                             await queue.put(message)
                 
@@ -482,7 +481,7 @@ async def callback_handler(client, callback_query):
             auth = b.get('author', 'Unknown')
             syn = b.get('synopsis', 'No synopsis.')
             
-            # --- HEADER (Title + Author) in BLOCKQUOTE ---
+            # --- MESSAGE 1: HEADER (Title + Author) in BLOCKQUOTE ---
             header_text = f"{title}\nAuthor: {auth}"
             header_len = len_utf16(header_text)
             title_len = len_utf16(title)
@@ -492,7 +491,7 @@ async def callback_handler(client, callback_query):
                 MessageEntity(type=MessageEntityType.BOLD, offset=0, length=title_len)
             ]
 
-            # --- SYNOPSIS in EXPANDABLE BLOCKQUOTE ---
+            # --- MESSAGE 2: SYNOPSIS in EXPANDABLE BLOCKQUOTE ---
             syn_label = "SYNOPSIS"
             syn_full_text = f"{syn_label}\n{syn}"
             syn_total_len = len_utf16(syn_full_text)

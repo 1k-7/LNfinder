@@ -163,13 +163,18 @@ async def indexing_process(client, start_id, end_id, status_msg=None):
     global indexing_active, files_processed, total_files_found
     queue = asyncio.Queue(maxsize=30)
     
-    # Existing IDs Check
-    if status_msg: await status_msg.edit("📚 **Syncing Database State...**")
+    if status_msg: 
+        try: await status_msg.edit("📚 **Syncing Database State...**")
+        except: pass
+
     existing_ids = set()
     for col in collections:
         async for doc in col.find({}, {"file_unique_id": 1}):
             existing_ids.add(doc.get('file_unique_id'))
-    if status_msg: await status_msg.edit(f"✅ State Loaded ({len(existing_ids)} books).\n🚀 **Starting Scan...**")
+            
+    if status_msg: 
+        try: await status_msg.edit(f"✅ State Loaded ({len(existing_ids)} books).\n🚀 **Starting Scan...**")
+        except: pass
 
     async def worker(worker_id):
         while indexing_active:
@@ -240,8 +245,10 @@ async def indexing_process(client, start_id, end_id, status_msg=None):
     finally:
         for w in workers: w.cancel()
         indexing_active = False
-        if status_msg: try: await status_msg.edit(f"✅ **Sync Complete!**\nScanned up to: `{end_id}`\nTotal Added: `{files_processed}`")
-        except: pass
+        if status_msg: 
+            try: 
+                await status_msg.edit(f"✅ **Sync Complete!**\nScanned up to: `{end_id}`\nTotal Added: `{files_processed}`")
+            except: pass
 
 # --- STARTUP ---
 async def startup_sync():
@@ -279,7 +286,6 @@ async def export_handler(event):
     zip_path = "library_backup.zip"
     
     try:
-        # Write streaming JSON manually to avoid huge RAM usage
         with open(file_path, 'w', encoding='utf-8') as f:
             f.write('[')
             first = True
@@ -290,11 +296,9 @@ async def export_handler(event):
                     if not first: f.write(',')
                     first = False
                     
-                    # Convert binary to base64 for JSON
                     if doc.get('cover_image'):
                         doc['cover_image'] = base64.b64encode(doc['cover_image']).decode('utf-8')
                     
-                    # Handle ObjectId
                     doc['_id'] = str(doc['_id'])
                     
                     json.dump(doc, f)
@@ -335,7 +339,6 @@ async def import_handler(event):
     temp_files = [path]
     
     try:
-        # Unzip if needed
         if zipfile.is_zipfile(path):
             with zipfile.ZipFile(path, 'r') as zip_ref:
                 json_filename = zip_ref.namelist()[0]
@@ -353,14 +356,11 @@ async def import_handler(event):
         imported = 0
         batch_size = 50
         
-        # Helper to process a batch
         async def process_batch(batch):
-            # If New Bot Mode, we need to refresh file_ids
             if new_bot_mode:
                 msg_ids = [item.get('msg_id') for item in batch if item.get('msg_id')]
                 if msg_ids:
                     try:
-                        # Batch fetch fresh messages
                         msgs = await bot.get_messages(CHANNEL_ID, ids=msg_ids)
                         msg_map = {m.id: m for m in msgs if m}
                         
@@ -369,27 +369,20 @@ async def import_handler(event):
                             if m_id and m_id in msg_map:
                                 msg = msg_map[m_id]
                                 if msg.file:
-                                    # Update ID
                                     item['file_id'] = msg.file.id
                                     item['file_unique_id'] = str(msg.file.id)
                     except Exception as e:
                         logger.error(f"Batch fetch error: {e}")
 
-            # Insert into DB
             for item in batch:
-                # Fix Base64 Cover
                 if item.get('cover_image'):
-                    try:
-                        item['cover_image'] = base64.b64decode(item['cover_image'])
-                    except:
-                        item['cover_image'] = None
+                    try: item['cover_image'] = base64.b64decode(item['cover_image'])
+                    except: item['cover_image'] = None
                 
-                # Remove _id to allow Mongo to generate new one or upsert
                 if '_id' in item: del item['_id']
                 
                 target = random.choice(collections)
                 try:
-                    # Update if exists, Insert if new
                     await target.replace_one(
                         {"file_unique_id": item['file_unique_id']},
                         item,
@@ -397,7 +390,6 @@ async def import_handler(event):
                     )
                 except: pass
 
-        # Process in chunks
         for i in range(0, total, batch_size):
             chunk = data[i:i+batch_size]
             await process_batch(chunk)
@@ -461,12 +453,10 @@ async def perform_search(event, query, page):
     fetch_limit = (page + 1) * PAGE_SIZE
     
     async def fetch(col, idx):
-        # Text Search
         cnt = await col.count_documents({"$text": {"$search": query}})
         if cnt > 0:
             cur = col.find({"$text": {"$search": query}}, {"score": {"$meta": "textScore"}}).sort([("score", {"$meta": "textScore"})])
         else:
-            # Regex Fallback
             reg = {"$or": [{"title": {"$regex": query, "$options": "i"}}, {"author": {"$regex": query, "$options": "i"}}, {"tags": {"$regex": query, "$options": "i"}}]}
             cnt = await col.count_documents(reg)
             cur = col.find(reg)
@@ -535,7 +525,9 @@ async def callback(event):
             syn = html.escape(b.get('synopsis') or "No synopsis.")
             
             h_html = f"<blockquote><b>{title}</b>\nAuthor: {author}</blockquote>"
-            b_html = f"<blockquote><b><u>SYNOPSIS</u></b>\n{syn}</blockquote>"
+            # COLLAPSIBLE BLOCKQUOTE FOR SYNOPSIS
+            b_html = f"<blockquote expandable><b><u>SYNOPSIS</u></b>\n{syn}</blockquote>"
+            
             btns = [[Button.inline("📥 Download EPUB", data=f"dl:{db_idx}:{oid}")]]
             
             await event.delete()
@@ -546,7 +538,7 @@ async def callback(event):
                     await bot.send_file(event.chat_id, f, caption=h_html+"\n"+b_html, buttons=btns, parse_mode='html')
                 else:
                     await bot.send_file(event.chat_id, f, caption=h_html, parse_mode='html')
-                    # Chunk synopsis
+                    # Send synopsis separately
                     if len(b_html) > 4096:
                         chunks = [b_html[i:i+4096] for i in range(0, len(b_html), 4096)]
                         for i, c in enumerate(chunks):

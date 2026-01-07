@@ -74,6 +74,34 @@ async def ensure_indexes():
     except Exception as e:
         logger.warning(f"⚠️ Index Warning: {e}")
 
+# --- HELPER: Get Display Title ---
+def get_display_title(book_doc):
+    """
+    Robust logic to get a human-readable title.
+    Priority:
+    1. DB Title (if valid)
+    2. DB Filename (cleaned)
+    3. Raw Title (even if 'Unknown')
+    """
+    title = book_doc.get('title')
+    file_name = book_doc.get('file_name')
+    
+    # Clean filename helper
+    clean_filename = "Unknown File"
+    if file_name:
+        clean_filename = file_name.replace('.epub', '').replace('_', ' ').replace('-', ' ')
+
+    # 1. If we have a good title, use it.
+    if title and title.strip() and title != "Unknown Title":
+        return title
+    
+    # 2. If title is bad/missing, but we have a filename, use the filename.
+    if file_name:
+        return clean_filename
+        
+    # 3. Last resort: Return whatever title is (even "Unknown Title") or fallback
+    return title if title else "Untitled Book"
+
 # --- METADATA EXTRACTION ---
 def parse_epub_direct(file_path):
     meta = {
@@ -205,6 +233,7 @@ async def indexing_process(client, start_id, end_id, status_msg=None):
                 if os.path.exists(path): os.remove(path)
 
                 if not meta['title']:
+                    # Ensure we save a title even if metadata is missing
                     meta['title'] = message.file.name.replace('.epub', '').replace('_', ' ')
 
                 try:
@@ -394,7 +423,6 @@ async def perform_search(event, query, page):
     skip = page * PAGE_SIZE
     
     try:
-        # Failsafe Search: Text -> Regex
         try:
             cnt = await collection.count_documents({"$text": {"$search": query}})
             if cnt > 0:
@@ -425,14 +453,10 @@ async def perform_search(event, query, page):
         btns = []
         
         for b in res:
-            # === TITLE FIX ===
-            # Priority: DB Title -> Filename -> "Unknown"
-            # Ensure we don't display "Unknown Title" if it's stored in DB that way
-            title = b.get('title')
-            if not title or title == "Unknown Title":
-                title = b.get('file_name', 'Unknown Book')
-            
-            lbl = f"📖 {title[:30]}"
+            # FIX: Use Helper
+            display_title = get_display_title(b)
+            # Truncate for button
+            lbl = f"📖 {display_title[:40]}"
             btns.append([Button.inline(lbl, data=f"view:{str(b['_id'])}")])
             
         total_p = math.ceil(cnt / PAGE_SIZE)
@@ -467,17 +491,13 @@ async def callback(event):
             b = await collection.find_one({"_id": ObjectId(oid)})
             if not b: return await event.answer("Not found", alert=True)
             
-            # === SMART TITLE DISPLAY ===
-            title = b.get('title')
-            if not title or title == "Unknown Title":
-                title = b.get('file_name', 'Unknown Book')
-            title = html.escape(title)
-            
+            # Use Helper for Title
+            display_title = html.escape(get_display_title(b))
             author = html.escape(b.get('author', 'Unknown'))
             syn = html.escape(b.get('synopsis', 'No synopsis.'))
             
-            h_html = f"<blockquote><b>{title}</b>\nAuthor: {author}</blockquote>"
-            # === COLLAPSIBLE BLOCKQUOTE ===
+            h_html = f"<blockquote><b>{display_title}</b>\nAuthor: {author}</blockquote>"
+            # COLLAPSIBLE BLOCKQUOTE
             b_html = f"<blockquote expandable><b><u>SYNOPSIS</u></b>\n{syn}</blockquote>"
             btns = [[Button.inline("📥 Download EPUB", data=f"dl:{oid}")]]
             
@@ -511,12 +531,9 @@ async def callback(event):
             b = await collection.find_one({"_id": ObjectId(oid)})
             await event.answer("🚀 Sending...")
             
-            # === BUTTON CAPTION FIX ===
-            # Explicitly fallback to filename if title is missing
-            t = b.get('title')
-            if not t or t == "Unknown Title": t = b.get('file_name', 'Book')
-            
-            try: await bot.send_file(event.chat_id, b['file_id'], caption=f"📖 {t}")
+            # Use Helper
+            display_title = get_display_title(b)
+            try: await bot.send_file(event.chat_id, b['file_id'], caption=f"📖 {display_title}")
             except: 
                 try: await bot.forward_messages(event.chat_id, b['msg_id'], CHANNEL_ID)
                 except: await event.answer("❌ File lost.", alert=True)

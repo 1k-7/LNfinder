@@ -18,10 +18,9 @@ from pyrogram import Client, filters, idle
 from pyrogram.types import (
     InlineKeyboardMarkup, 
     InlineKeyboardButton, 
-    Message,
-    MessageEntity
+    Message
 )
-from pyrogram.enums import ParseMode, MessageEntityType
+from pyrogram.enums import ParseMode
 from pyrogram.errors import FloodWait
 
 # --- CONFIGURATION ---
@@ -94,10 +93,6 @@ def get_button_label(book_doc):
     """Strips chapter info for buttons."""
     full = get_display_title(book_doc)
     return re.sub(r'\s+(c|ch|chap|vol|v)\.?\s*\d+(?:[-–]\d+)?.*$', '', full, flags=re.IGNORECASE).strip()
-
-def len_utf16(text):
-    """Telegram requires UTF-16 code unit offsets."""
-    return len(text.encode('utf-16-le')) // 2
 
 # --- METADATA PARSER ---
 def parse_epub_direct(file_path):
@@ -187,9 +182,9 @@ app = Client(
 
 # --- INDEXING PROCESS ---
 async def indexing_process(client, start_id, end_id, status_msg):
-    # Only declare global ONCE at top
     global indexing_active, files_found, files_saved
     
+    # Reset counters
     files_found = 0
     files_saved = 0
     
@@ -200,8 +195,7 @@ async def indexing_process(client, start_id, end_id, status_msg):
         except: pass
 
     async def worker():
-        # Inner function needs global access to modify the counters
-        global files_saved
+        global files_saved, files_found # Access globals
         while indexing_active:
             try:
                 message = await queue.get()
@@ -258,7 +252,6 @@ async def indexing_process(client, start_id, end_id, status_msg):
             batch_end = min(current_id + BATCH_SIZE, end_id + 1)
             ids_to_fetch = list(range(current_id, batch_end))
             
-            # Status Update
             if status_msg and (current_id % 100 == 0):
                 try:
                     await status_msg.edit(
@@ -275,14 +268,11 @@ async def indexing_process(client, start_id, end_id, status_msg):
 
             try:
                 messages = await client.get_messages(CHANNEL_ID, ids_to_fetch)
-                
                 if messages:
                     for message in messages:
                         if message and message.document and message.document.file_name and message.document.file_name.endswith('.epub'):
-                            # Removed redundant global declaration here
                             files_found += 1
                             await queue.put(message)
-                
             except FloodWait as e:
                 logger.warning(f"FloodWait: Sleeping {e.value}s")
                 await asyncio.sleep(e.value + 1)
@@ -476,75 +466,64 @@ async def callback_handler(client, callback_query):
             b = await collection.find_one({"_id": ObjectId(bid)})
             if not b: return await callback_query.answer("Not found", show_alert=True)
             
+            # --- GET DATA ---
             title = get_display_title(b)
             auth = b.get('author', 'Unknown')
             syn = b.get('synopsis', 'No synopsis.')
             
-            # --- HEADER (Title + Author) in BLOCKQUOTE ---
-            header_text = f"{title}\nAuthor: {auth}"
-            header_len = len_utf16(header_text)
-            title_len = len_utf16(title)
+            # --- FORMATTING (PURE HTML) ---
+            # IMPORTANT: We use html.escape to prevent crashes on weird titles
+            header_html = (
+                f"<blockquote>"
+                f"<b>{html.escape(title)}</b>\n"
+                f"Author: {html.escape(auth)}"
+                f"</blockquote>"
+            )
             
-            header_entities = [
-                MessageEntity(type=MessageEntityType.BLOCKQUOTE, offset=0, length=header_len),
-                MessageEntity(type=MessageEntityType.BOLD, offset=0, length=title_len)
-            ]
-
-            # --- SYNOPSIS in EXPANDABLE BLOCKQUOTE ---
-            syn_label = "SYNOPSIS"
-            syn_full_text = f"{syn_label}\n{syn}"
-            syn_total_len = len_utf16(syn_full_text)
-            label_len = len_utf16(syn_label)
-            
-            try:
-                qt_type = MessageEntityType.EXPANDABLE_BLOCKQUOTE
-            except AttributeError:
-                qt_type = MessageEntityType.BLOCKQUOTE
-            
-            syn_entities = [
-                MessageEntity(type=qt_type, offset=0, length=syn_total_len),
-                MessageEntity(type=MessageEntityType.BOLD, offset=0, length=label_len),
-                MessageEntity(type=MessageEntityType.UNDERLINE, offset=0, length=label_len)
-            ]
+            syn_html = (
+                f"<blockquote expandable>"
+                f"<b><u>SYNOPSIS</u></b>\n\n"
+                f"{html.escape(syn)}"
+                f"</blockquote>"
+            )
             
             kb = [[InlineKeyboardButton("📥 Download", callback_data=f"d:{bid}")]]
             
+            # Cleanup previous
             await callback_query.message.delete()
             
-            # 1. HEADER (Photo/Text)
+            # 1. SEND HEADER (Photo or Text)
             if b.get('cover_image'):
                 try:
                     f = io.BytesIO(b['cover_image']); f.name="c.jpg"
                     await client.send_photo(
                         callback_query.message.chat.id, 
                         f, 
-                        caption=header_text, 
-                        caption_entities=header_entities, 
-                        parse_mode=None
+                        caption=header_html, 
+                        parse_mode=ParseMode.HTML
                     )
-                except:
+                except Exception as img_e:
+                    # Fallback to text if photo fails
                     await client.send_message(
                         callback_query.message.chat.id, 
-                        header_text, 
-                        entities=header_entities, 
-                        parse_mode=None
+                        header_html, 
+                        parse_mode=ParseMode.HTML
                     )
             else:
                 await client.send_message(
                     callback_query.message.chat.id, 
-                    header_text, 
-                    entities=header_entities, 
-                    parse_mode=None
+                    header_html, 
+                    parse_mode=ParseMode.HTML
                 )
             
-            # 2. SYNOPSIS (Always Text)
+            # 2. SEND SYNOPSIS (Always Text)
             await client.send_message(
                 callback_query.message.chat.id, 
-                syn_full_text, 
-                entities=syn_entities, 
+                syn_html, 
                 reply_markup=InlineKeyboardMarkup(kb),
-                parse_mode=None
+                parse_mode=ParseMode.HTML
             )
+                
         except Exception as e: 
             logger.error(f"View Error: {e}")
             await callback_query.answer("Error displaying.", show_alert=True)

@@ -1,10 +1,13 @@
 import asyncio
+import math
 import os
 import logging
 import warnings
 import io
 import zipfile
+import html
 import re
+import random
 import json
 import base64
 import xml.etree.ElementTree as ET
@@ -15,6 +18,7 @@ from pyrogram import Client, filters, idle
 from pyrogram.types import (
     InlineKeyboardMarkup, 
     InlineKeyboardButton, 
+    Message,
     MessageEntity
 )
 from pyrogram.enums import ParseMode, MessageEntityType
@@ -64,7 +68,8 @@ for uri in LEGACY_URIS:
 
 # --- GLOBAL STATE ---
 indexing_active = False
-files_processed = 0
+files_found = 0
+files_saved = 0
 
 # --- HELPERS ---
 async def ensure_indexes():
@@ -149,6 +154,7 @@ def parse_epub_direct(file_path):
                     if 'cover' in n.lower() and n.endswith(('.jpg','.png')): 
                         cover_href = n
                         break
+            
             if cover_href:
                 try:
                     if '/' in opf_path and '/' not in cover_href:
@@ -182,7 +188,12 @@ app = Client(
 
 # --- INDEXING PROCESS ---
 async def indexing_process(client, start_id, end_id, status_msg):
-    global indexing_active, files_processed
+    global indexing_active, files_found, files_saved
+    
+    # Reset counters on new run
+    files_found = 0
+    files_saved = 0
+    
     queue = asyncio.Queue(maxsize=30)
     
     if status_msg: 
@@ -190,6 +201,7 @@ async def indexing_process(client, start_id, end_id, status_msg):
         except: pass
 
     async def worker():
+        global files_saved
         while indexing_active:
             try:
                 message = await queue.get()
@@ -224,8 +236,7 @@ async def indexing_process(client, start_id, end_id, status_msg):
                         "cover_image": meta['cover_image'],
                         "msg_id": message.id
                     })
-                    global files_processed
-                    files_processed += 1
+                    files_saved += 1
                     print(f"✅ Saved: {meta['title']}")
                 except DuplicateKeyError:
                     pass
@@ -237,7 +248,7 @@ async def indexing_process(client, start_id, end_id, status_msg):
                 logger.error(f"Worker Error: {e}")
                 queue.task_done()
 
-    # Start 3 workers (5 might trigger flood wait on download)
+    # Start 3 workers
     workers = [asyncio.create_task(worker()) for _ in range(3)]
     
     try:
@@ -248,10 +259,15 @@ async def indexing_process(client, start_id, end_id, status_msg):
             batch_end = min(current_id + BATCH_SIZE, end_id + 1)
             ids_to_fetch = list(range(current_id, batch_end))
             
-            # Update status continuously so we know it's not stuck
+            # Update status
             if status_msg and (current_id % 100 == 0):
                 try:
-                    await status_msg.edit(f"🔄 **Scanning...**\nID: `{current_id}`\nFound: `{files_processed}`")
+                    await status_msg.edit(
+                        f"🔄 **Scanning...**\n"
+                        f"ID: `{current_id}`\n"
+                        f"Found: `{files_found}`\n"
+                        f"Saved: `{files_saved}`"
+                    )
                 except FloodWait as fw:
                     await asyncio.sleep(fw.value)
                 except: pass
@@ -259,24 +275,25 @@ async def indexing_process(client, start_id, end_id, status_msg):
             if not ids_to_fetch: break
 
             try:
-                # Fetch batch
                 messages = await client.get_messages(CHANNEL_ID, ids_to_fetch)
                 
-                # Iterate safeley
                 if messages:
                     for message in messages:
+                        # Filter EPUBs
                         if message and message.document and message.document.file_name and message.document.file_name.endswith('.epub'):
+                            global files_found
+                            files_found += 1
                             await queue.put(message)
                 
             except FloodWait as e:
                 logger.warning(f"FloodWait: Sleeping {e.value}s")
                 await asyncio.sleep(e.value + 1)
-                continue # Retry same batch? Or skip? Here we skip to avoid infinite loops
+                continue 
             except Exception as e:
                 logger.error(f"Batch Error: {e}")
             
             current_id += BATCH_SIZE
-            await asyncio.sleep(2) # Politeness delay to prevent "Stuck" freeze
+            await asyncio.sleep(2) 
             
         await queue.join()
         
@@ -285,7 +302,12 @@ async def indexing_process(client, start_id, end_id, status_msg):
         indexing_active = False
         if status_msg:
             try:
-                await status_msg.edit(f"✅ **Done!**\nScanned: `{end_id}`\nAdded: `{files_processed}`")
+                await status_msg.edit(
+                    f"✅ **Done!**\n"
+                    f"Scanned: `{end_id}`\n"
+                    f"Found: `{files_found}`\n"
+                    f"Saved: `{files_saved}`"
+                )
             except: pass
 
 # --- COMMANDS ---
@@ -460,35 +482,29 @@ async def callback_handler(client, callback_query):
             auth = b.get('author', 'Unknown')
             syn = b.get('synopsis', 'No synopsis.')
             
-            # --- MESSAGE 1: HEADER (Title/Author) in BLOCKQUOTE ---
+            # --- HEADER (Title + Author) in BLOCKQUOTE ---
             header_text = f"{title}\nAuthor: {auth}"
             header_len = len_utf16(header_text)
             title_len = len_utf16(title)
             
             header_entities = [
-                # 1. Blockquote entire header
                 MessageEntity(type=MessageEntityType.BLOCKQUOTE, offset=0, length=header_len),
-                # 2. Bold Title
                 MessageEntity(type=MessageEntityType.BOLD, offset=0, length=title_len)
             ]
 
-            # --- MESSAGE 2: SYNOPSIS in EXPANDABLE BLOCKQUOTE ---
+            # --- SYNOPSIS in EXPANDABLE BLOCKQUOTE ---
             syn_label = "SYNOPSIS"
             syn_full_text = f"{syn_label}\n{syn}"
-            
             syn_total_len = len_utf16(syn_full_text)
             label_len = len_utf16(syn_label)
             
-            # Determine Entity (Safe Fallback)
             try:
                 qt_type = MessageEntityType.EXPANDABLE_BLOCKQUOTE
             except AttributeError:
                 qt_type = MessageEntityType.BLOCKQUOTE
             
             syn_entities = [
-                # 1. Expandable Quote
                 MessageEntity(type=qt_type, offset=0, length=syn_total_len),
-                # 2. Bold + Underline Label
                 MessageEntity(type=MessageEntityType.BOLD, offset=0, length=label_len),
                 MessageEntity(type=MessageEntityType.UNDERLINE, offset=0, length=label_len)
             ]
@@ -497,7 +513,7 @@ async def callback_handler(client, callback_query):
             
             await callback_query.message.delete()
             
-            # 1. Send Header (Photo or Text)
+            # 1. HEADER (Photo/Text)
             if b.get('cover_image'):
                 try:
                     f = io.BytesIO(b['cover_image']); f.name="c.jpg"
@@ -509,7 +525,6 @@ async def callback_handler(client, callback_query):
                         parse_mode=None
                     )
                 except:
-                    # Fallback
                     await client.send_message(
                         callback_query.message.chat.id, 
                         header_text, 
@@ -524,7 +539,7 @@ async def callback_handler(client, callback_query):
                     parse_mode=None
                 )
             
-            # 2. Send Synopsis
+            # 2. SYNOPSIS (Always Text)
             await client.send_message(
                 callback_query.message.chat.id, 
                 syn_full_text, 
@@ -532,7 +547,6 @@ async def callback_handler(client, callback_query):
                 reply_markup=InlineKeyboardMarkup(kb),
                 parse_mode=None
             )
-                
         except Exception as e: 
             logger.error(f"View Error: {e}")
             await callback_query.answer("Error displaying.", show_alert=True)

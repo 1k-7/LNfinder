@@ -18,10 +18,9 @@ from pyrogram import Client, filters, idle
 from pyrogram.types import (
     InlineKeyboardMarkup, 
     InlineKeyboardButton, 
-    Message,
-    MessageEntity
+    Message
 )
-from pyrogram.enums import ParseMode, MessageEntityType
+from pyrogram.enums import ParseMode
 from pyrogram.errors import FloodWait
 
 # --- CONFIGURATION ---
@@ -252,7 +251,6 @@ async def indexing_process(client, start_id, end_id, status_msg):
             batch_end = min(current_id + BATCH_SIZE, end_id + 1)
             ids_to_fetch = list(range(current_id, batch_end))
             
-            # Update status
             if status_msg and (current_id % 100 == 0):
                 try:
                     await status_msg.edit(
@@ -303,7 +301,7 @@ async def indexing_process(client, start_id, end_id, status_msg):
 
 @app.on_message(filters.command("start"))
 async def start_handler(client, message):
-    await message.reply("📚 **Novel Bot (Pyrogram)**")
+    await message.reply("MTL Novels Search Engine [send query to search]")
 
 @app.on_message(filters.command("stats"))
 async def stats_handler(client, message):
@@ -374,39 +372,32 @@ async def import_cmd(client, message):
     finally:
         if os.path.exists(path): os.remove(path)
 
-@app.on_message(filters.command("migrate") & filters.user(ADMIN_ID))
-async def migrate_cmd(client, message):
-    if not legacy_collections: return await message.reply("❌ No Legacy")
-    s = await message.reply("🚀 Migrating...")
-    t=0
-    for c in legacy_collections:
-        async for d in c.find({}):
-            if '_id' in d: del d['_id']
-            try: await collection.insert_one(d); t+=1
-            except: pass
-            if t%100==0:
-                try: await s.edit(f"📥 {t}")
-                except: pass
-    await s.edit(f"✅ {t} Done")
-
 # --- SEARCH & VIEW ---
 
-# Filter incoming messages & length check to avoid loops
 @app.on_message(filters.text & filters.incoming & ~filters.command(["start", "stats", "index", "stop_index", "export", "import", "migrate"]))
 async def search_handler(client, message):
     q = message.text.strip()
     if len(q) > 100: return
     
+    # Handle Persistent Search Flag
+    keep_result = False
+    real_q = q
+    if q.startswith("!!"):
+        keep_result = True
+        real_q = q[2:].strip()
+    
+    if not real_q: return
+    
     try:
         try:
-            cnt = await collection.count_documents({"$text": {"$search": q}})
-            if cnt>0: cur = collection.find({"$text": {"$search": q}}).sort([("score", {"$meta": "textScore"})])
+            cnt = await collection.count_documents({"$text": {"$search": real_q}})
+            if cnt>0: cur = collection.find({"$text": {"$search": real_q}}).sort([("score", {"$meta": "textScore"})])
             else: raise Exception
         except:
             reg = {"$or": [
-                {"title": {"$regex": q, "$options": "i"}},
-                {"author": {"$regex": q, "$options": "i"}},
-                {"file_name": {"$regex": q, "$options": "i"}}
+                {"title": {"$regex": real_q, "$options": "i"}},
+                {"author": {"$regex": real_q, "$options": "i"}},
+                {"file_name": {"$regex": real_q, "$options": "i"}}
             ]}
             cnt = await collection.count_documents(reg)
             cur = collection.find(reg)
@@ -414,14 +405,31 @@ async def search_handler(client, message):
         res = await cur.limit(8).to_list(length=8)
         if not res: return await message.reply("❌ No matches.")
 
-        sq = html.escape(q)
-        txt = f"<blockquote>🔎 Search: <b>{sq}</b>\nMatches: <b>{cnt}</b></blockquote>"
+        sq = html.escape(real_q)
+        line_sep = "-" * 101 # Exactly 101 dashes as requested
+        txt = (
+            f"🔎 Results fetched for your search : {sq}\n"
+            f"Total Matches: {cnt}\n"
+            f"{line_sep}"
+        )
+        
         btns = []
         for b in res:
-            label = get_button_label(b)[:40] 
-            btns.append([InlineKeyboardButton(f"📖 {label}", callback_data=f"v:{str(b['_id'])}")])
+            label = get_button_label(b)[:40]
+            # Encode 'k' flag in callback if persistence is requested
+            cb_data = f"v:{str(b['_id'])}:k" if keep_result else f"v:{str(b['_id'])}"
+            btns.append([InlineKeyboardButton(f"{label}", callback_data=cb_data)])
         
-        btns.append([InlineKeyboardButton("➡️ Next", callback_data=f"n:1:{q[:20]}")])
+        # Navigation
+        nav = []
+        # Page 0 has no prev, but needs Counter
+        # Page 1+ logic handled in callback
+        nav.append(InlineKeyboardButton(f"1/{math.ceil(cnt/8)}", callback_data="nop"))
+        if cnt > 8:
+            # Pass original 'q' to next button so pagination knows about '!!'
+            nav.append(InlineKeyboardButton("➡️", callback_data=f"n:1:{q[:20]}"))
+        btns.append(nav)
+
         await message.reply(txt, reply_markup=InlineKeyboardMarkup(btns), parse_mode=ParseMode.HTML)
     except Exception as e: await message.reply(f"⚠️ {e}")
 
@@ -433,12 +441,20 @@ async def callback_handler(client, callback_query):
         try:
             _, p, q = d.split(':', 2)
             p = int(p)
+            
+            # Check for persistence flag in query
+            real_q = q
+            keep_result = False
+            if q.startswith("!!"):
+                keep_result = True
+                real_q = q[2:].strip()
+
             try:
-                cnt = await collection.count_documents({"$text": {"$search": q}})
-                if cnt>0: cur = collection.find({"$text": {"$search": q}}).sort([("score", {"$meta": "textScore"})])
+                cnt = await collection.count_documents({"$text": {"$search": real_q}})
+                if cnt>0: cur = collection.find({"$text": {"$search": real_q}}).sort([("score", {"$meta": "textScore"})])
                 else: raise Exception
             except:
-                reg = {"$or": [{"title": {"$regex": q, "$options": "i"}}, {"file_name": {"$regex": q, "$options": "i"}}]}
+                reg = {"$or": [{"title": {"$regex": real_q, "$options": "i"}}, {"file_name": {"$regex": real_q, "$options": "i"}}]}
                 cnt = await collection.count_documents(reg)
                 cur = collection.find(reg)
             
@@ -448,16 +464,25 @@ async def callback_handler(client, callback_query):
             btns = []
             for b in res:
                 label = get_button_label(b)[:40]
-                btns.append([InlineKeyboardButton(f"📖 {label}", callback_data=f"v:{str(b['_id'])}")])
+                cb_data = f"v:{str(b['_id'])}:k" if keep_result else f"v:{str(b['_id'])}"
+                btns.append([InlineKeyboardButton(f"{label}", callback_data=cb_data)])
             
             nav = []
-            if p>0: nav.append(InlineKeyboardButton("⬅️", callback_data=f"n:{p-1}:{q}"))
+            if p > 0: nav.append(InlineKeyboardButton("⬅️", callback_data=f"n:{p-1}:{q}"))
             nav.append(InlineKeyboardButton(f"{p+1}/{math.ceil(cnt/8)}", callback_data="nop"))
             if p < math.ceil(cnt/8)-1: nav.append(InlineKeyboardButton("➡️", callback_data=f"n:{p+1}:{q}"))
             btns.append(nav)
             
+            sq = html.escape(real_q)
+            line_sep = "-" * 101
+            txt = (
+                f"🔎 Results fetched for your search : {sq}\n"
+                f"Total Matches: {cnt}\n"
+                f"{line_sep}"
+            )
+            
             await callback_query.edit_message_text(
-                f"<blockquote>🔎 Search: <b>{html.escape(q)}</b>\nMatches: <b>{cnt}</b></blockquote>", 
+                txt, 
                 reply_markup=InlineKeyboardMarkup(btns), 
                 parse_mode=ParseMode.HTML
             )
@@ -465,7 +490,10 @@ async def callback_handler(client, callback_query):
 
     elif d.startswith("v:"):
         try:
-            bid = d.split(':')[1]
+            parts = d.split(':')
+            bid = parts[1]
+            keep_msg = len(parts) > 2 and parts[2] == 'k'
+
             from bson.objectid import ObjectId
             b = await collection.find_one({"_id": ObjectId(bid)})
             if not b: return await callback_query.answer("Not found", show_alert=True)
@@ -474,7 +502,6 @@ async def callback_handler(client, callback_query):
             auth = b.get('author', 'Unknown')
             syn = b.get('synopsis', 'No synopsis.')
             
-            # --- HTML FORMATTING ---
             header_html = (
                 f"<blockquote>"
                 f"<b>{html.escape(title)}</b>\n"
@@ -491,9 +518,17 @@ async def callback_handler(client, callback_query):
             
             kb = [[InlineKeyboardButton("📥 Download", callback_data=f"d:{bid}")]]
             
-            await callback_query.message.delete()
-            
-            # 1. HEADER (Photo or Text)
+            # --- PERSISTENCE LOGIC ---
+            if not keep_msg:
+                await callback_query.message.delete()
+            else:
+                # If keeping, we assume this is a new "spawned" message view
+                # Actually, Pyrogram usually edits or sends new.
+                # Since we are NOT deleting the search menu, we must SEND A NEW message
+                # Otherwise if we just 'send', the search menu stays there.
+                await callback_query.answer("Opening...") # Ack the click so loading spinner stops
+
+            # 1. SEND HEADER
             if b.get('cover_image'):
                 try:
                     f = io.BytesIO(b['cover_image']); f.name="c.jpg"
@@ -503,7 +538,7 @@ async def callback_handler(client, callback_query):
                         caption=header_html, 
                         parse_mode=ParseMode.HTML
                     )
-                except Exception as img_e:
+                except:
                     await client.send_message(
                         callback_query.message.chat.id, 
                         header_html, 
@@ -516,7 +551,7 @@ async def callback_handler(client, callback_query):
                     parse_mode=ParseMode.HTML
                 )
             
-            # 2. SYNOPSIS (Text)
+            # 2. SEND SYNOPSIS
             await client.send_message(
                 callback_query.message.chat.id, 
                 syn_html, 

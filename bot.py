@@ -252,6 +252,7 @@ async def indexing_process(client, start_id, end_id, status_msg):
             batch_end = min(current_id + BATCH_SIZE, end_id + 1)
             ids_to_fetch = list(range(current_id, batch_end))
             
+            # Update status
             if status_msg and (current_id % 100 == 0):
                 try:
                     await status_msg.edit(
@@ -271,7 +272,6 @@ async def indexing_process(client, start_id, end_id, status_msg):
                 if messages:
                     for message in messages:
                         if message and message.document and message.document.file_name and message.document.file_name.endswith('.epub'):
-                            global files_found
                             files_found += 1
                             await queue.put(message)
             except FloodWait as e:
@@ -391,13 +391,11 @@ async def migrate_cmd(client, message):
 
 # --- SEARCH & VIEW ---
 
-# FIX: Added filters.incoming to ignore bot's own messages
+# Filter incoming messages & length check to avoid loops
 @app.on_message(filters.text & filters.incoming & ~filters.command(["start", "stats", "index", "stop_index", "export", "import", "migrate"]))
 async def search_handler(client, message):
     q = message.text.strip()
-    
-    # FIX: Prevent searching for long paragraphs (pastes/responses)
-    if len(q) > 100: return 
+    if len(q) > 100: return
     
     try:
         try:
@@ -476,8 +474,7 @@ async def callback_handler(client, callback_query):
             auth = b.get('author', 'Unknown')
             syn = b.get('synopsis', 'No synopsis.')
             
-            # --- FORMATTING (PURE HTML) ---
-            # Message 1: Blockquote for Title/Author
+            # --- HTML FORMATTING ---
             header_html = (
                 f"<blockquote>"
                 f"<b>{html.escape(title)}</b>\n"
@@ -485,7 +482,6 @@ async def callback_handler(client, callback_query):
                 f"</blockquote>"
             )
             
-            # Message 2: Expandable Blockquote for Synopsis
             syn_html = (
                 f"<blockquote expandable>"
                 f"<b><u>SYNOPSIS</u></b>\n\n"
@@ -495,10 +491,9 @@ async def callback_handler(client, callback_query):
             
             kb = [[InlineKeyboardButton("📥 Download", callback_data=f"d:{bid}")]]
             
-            # Cleanup previous menu
             await callback_query.message.delete()
             
-            # 1. SEND HEADER (Photo or Text)
+            # 1. HEADER (Photo or Text)
             if b.get('cover_image'):
                 try:
                     f = io.BytesIO(b['cover_image']); f.name="c.jpg"
@@ -509,7 +504,6 @@ async def callback_handler(client, callback_query):
                         parse_mode=ParseMode.HTML
                     )
                 except Exception as img_e:
-                    # Fallback to text if photo fails
                     await client.send_message(
                         callback_query.message.chat.id, 
                         header_html, 
@@ -522,7 +516,7 @@ async def callback_handler(client, callback_query):
                     parse_mode=ParseMode.HTML
                 )
             
-            # 2. SEND SYNOPSIS (Always Text)
+            # 2. SYNOPSIS (Text)
             await client.send_message(
                 callback_query.message.chat.id, 
                 syn_html, 

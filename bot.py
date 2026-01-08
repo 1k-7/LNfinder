@@ -18,9 +18,10 @@ from pyrogram import Client, filters, idle
 from pyrogram.types import (
     InlineKeyboardMarkup, 
     InlineKeyboardButton, 
-    Message
+    Message,
+    MessageEntity
 )
-from pyrogram.enums import ParseMode
+from pyrogram.enums import ParseMode, MessageEntityType
 from pyrogram.errors import FloodWait
 
 # --- CONFIGURATION ---
@@ -184,7 +185,6 @@ app = Client(
 async def indexing_process(client, start_id, end_id, status_msg):
     global indexing_active, files_found, files_saved
     
-    # Reset counters
     files_found = 0
     files_saved = 0
     
@@ -195,7 +195,7 @@ async def indexing_process(client, start_id, end_id, status_msg):
         except: pass
 
     async def worker():
-        global files_saved, files_found # Access globals
+        global files_saved
         while indexing_active:
             try:
                 message = await queue.get()
@@ -271,6 +271,7 @@ async def indexing_process(client, start_id, end_id, status_msg):
                 if messages:
                     for message in messages:
                         if message and message.document and message.document.file_name and message.document.file_name.endswith('.epub'):
+                            global files_found
                             files_found += 1
                             await queue.put(message)
             except FloodWait as e:
@@ -390,9 +391,14 @@ async def migrate_cmd(client, message):
 
 # --- SEARCH & VIEW ---
 
-@app.on_message(filters.text & ~filters.command(["start", "stats", "index", "stop_index", "export", "import", "migrate"]))
+# FIX: Added filters.incoming to ignore bot's own messages
+@app.on_message(filters.text & filters.incoming & ~filters.command(["start", "stats", "index", "stop_index", "export", "import", "migrate"]))
 async def search_handler(client, message):
     q = message.text.strip()
+    
+    # FIX: Prevent searching for long paragraphs (pastes/responses)
+    if len(q) > 100: return 
+    
     try:
         try:
             cnt = await collection.count_documents({"$text": {"$search": q}})
@@ -466,13 +472,12 @@ async def callback_handler(client, callback_query):
             b = await collection.find_one({"_id": ObjectId(bid)})
             if not b: return await callback_query.answer("Not found", show_alert=True)
             
-            # --- GET DATA ---
             title = get_display_title(b)
             auth = b.get('author', 'Unknown')
             syn = b.get('synopsis', 'No synopsis.')
             
             # --- FORMATTING (PURE HTML) ---
-            # IMPORTANT: We use html.escape to prevent crashes on weird titles
+            # Message 1: Blockquote for Title/Author
             header_html = (
                 f"<blockquote>"
                 f"<b>{html.escape(title)}</b>\n"
@@ -480,6 +485,7 @@ async def callback_handler(client, callback_query):
                 f"</blockquote>"
             )
             
+            # Message 2: Expandable Blockquote for Synopsis
             syn_html = (
                 f"<blockquote expandable>"
                 f"<b><u>SYNOPSIS</u></b>\n\n"
@@ -489,7 +495,7 @@ async def callback_handler(client, callback_query):
             
             kb = [[InlineKeyboardButton("📥 Download", callback_data=f"d:{bid}")]]
             
-            # Cleanup previous
+            # Cleanup previous menu
             await callback_query.message.delete()
             
             # 1. SEND HEADER (Photo or Text)

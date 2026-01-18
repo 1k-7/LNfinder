@@ -17,7 +17,7 @@ from pymongo.errors import DuplicateKeyError
 # --- PYROGRAM IMPORTS ---
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from pyrogram.enums import ParseMode
+from pyrogram.enums import ParseMode, MessageEntityType
 from pyrogram.errors import FloodWait
 
 # --- WEB SERVER IMPORTS ---
@@ -67,11 +67,13 @@ web_app = Quart(__name__, template_folder='template')
 serializer = URLSafeTimedSerializer(SECRET_KEY)
 
 # --- TELEGRAM APP ---
+# in_memory=True prevents file corruption in containers
 app = Client(
     "novel_bot_session",
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
+    in_memory=True,
     sleep_threshold=60 
 )
 
@@ -92,6 +94,10 @@ def get_user_from_cookie():
         return None
 
 # --- WEB ROUTES ---
+
+@web_app.route('/health')
+async def health():
+    return "OK", 200
 
 @web_app.route('/login')
 async def login():
@@ -351,7 +357,7 @@ async def indexing_process(client, start_id, end_id, status_msg):
                 if messages:
                     for message in messages:
                         if message and message.document and message.document.file_name and message.document.file_name.endswith('.epub'):
-                            # Removed redundant global declaration here
+                            global files_found
                             files_found += 1
                             await queue.put(message)
             except FloodWait as e:
@@ -622,20 +628,29 @@ async def callback_handler(client, callback_query):
                 except: await callback_query.answer("File lost.", show_alert=True)
         except: pass
 
-async def main():
-    await ensure_indexes()
-    await app.start()
-    
-    global BOT_USERNAME
-    if not BOT_USERNAME:
+async def bot_startup_task():
+    """Background task to ensure Bot connects without blocking web server."""
+    try:
+        await app.start()
+        global BOT_USERNAME
         me = await app.get_me()
         BOT_USERNAME = me.username
-        logger.info(f"Detected Bot Username: {BOT_USERNAME}")
+        logger.info(f"✅ Bot Started: {BOT_USERNAME}")
+    except Exception as e:
+        logger.error(f"❌ Bot Failed to Start: {e}")
+
+async def main():
+    await ensure_indexes()
     
-    logger.info("Bot & Web Server Starting...")
+    # Start Bot in Background (Non-blocking) so Web Server opens port immediately
+    asyncio.create_task(bot_startup_task())
+    
+    logger.info("✅ Starting Web Server...")
     hypercorn_config = Config()
     hypercorn_config.bind = [f"0.0.0.0:{PORT}"]
     await serve(web_app, hypercorn_config)
+    
+    # If serve exits, cleanup
     await app.stop()
 
 if __name__ == '__main__':

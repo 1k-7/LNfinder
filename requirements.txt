@@ -2,3 +2,6 @@ pyroblack
 tgcrypto
 motor
 beautifulsoup4
+quart
+hypercorn
+jinja2

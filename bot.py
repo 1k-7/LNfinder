@@ -7,21 +7,23 @@ import io
 import zipfile
 import html
 import re
-import random
-import json
 import base64
 import xml.etree.ElementTree as ET
 from bs4 import BeautifulSoup
+from bson.objectid import ObjectId
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.errors import DuplicateKeyError
-from pyrogram import Client, filters, idle
-from pyrogram.types import (
-    InlineKeyboardMarkup, 
-    InlineKeyboardButton, 
-    Message
-)
+
+# --- PYROGRAM IMPORTS ---
+from pyrogram import Client, filters
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.enums import ParseMode
 from pyrogram.errors import FloodWait
+
+# --- WEB SERVER IMPORTS ---
+from quart import Quart, request, render_template
+from hypercorn.config import Config
+from hypercorn.asyncio import serve
 
 # --- CONFIGURATION ---
 try:
@@ -34,9 +36,9 @@ try:
     AZURE_URL = os.environ.get("AZURE_URL")
     if not AZURE_URL: raise ValueError("Missing AZURE_URL")
     
-    LEGACY_STR = os.environ.get("MONGO_URI") or os.environ.get("MONGO_URL") or ""
-    LEGACY_URIS = LEGACY_STR.split() if LEGACY_STR else []
-    
+    PORT = int(os.environ.get("PORT", 8080))
+    BOT_USERNAME = os.environ.get("BOT_USERNAME") 
+
     DB_NAME = os.environ.get("DB_NAME", "novel_library")
     COLLECTION_NAME = os.environ.get("COLLECTION_NAME", "books")
 
@@ -58,19 +60,71 @@ except Exception as e:
     logger.error(f"❌ DB Connection Error: {e}")
     exit(1)
 
-legacy_collections = []
-for uri in LEGACY_URIS:
-    try:
-        cli = AsyncIOMotorClient(uri)
-        legacy_collections.append(cli[DB_NAME][COLLECTION_NAME])
-    except: pass
+# --- WEB APP ---
+# Explicitly set template_folder to 'template'
+web_app = Quart(__name__, template_folder='template')
+
+# --- TELEGRAM APP ---
+app = Client(
+    "novel_bot_session",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN,
+    sleep_threshold=60 
+)
 
 # --- GLOBAL STATE ---
 indexing_active = False
 files_found = 0
 files_saved = 0
 
+# --- WEB ROUTES ---
+
+@web_app.route('/')
+async def index():
+    return await render_template('index.html', query="", results=[], count=0)
+
+@web_app.route('/search')
+async def search():
+    query = request.args.get('q', '').strip()
+    if not query:
+        return await render_template('index.html', query="", results=[], count=0)
+    
+    try:
+        cnt = await collection.count_documents({"$text": {"$search": query}})
+        cursor = collection.find({"$text": {"$search": query}}).sort([("score", {"$meta": "textScore"})])
+        books_cursor = await cursor.limit(50).to_list(length=50)
+        
+        results = []
+        for b in books_cursor:
+            cover_b64 = None
+            if b.get('cover_image'):
+                cover_b64 = base64.b64encode(b['cover_image']).decode('utf-8')
+            
+            syn = b.get('synopsis', 'No synopsis available.').strip()
+            has_more = len(syn) > 300
+            
+            results.append({
+                "_id": str(b['_id']),
+                "title": get_display_title(b),
+                "author": b.get('author', 'Unknown'),
+                "synopsis": syn,
+                "has_more": has_more,
+                "cover_image": cover_b64
+            })
+            
+        return await render_template(
+            'index.html', 
+            query=query, 
+            results=results, 
+            count=cnt, 
+            bot_username=BOT_USERNAME
+        )
+    except Exception as e:
+        return f"Error: {e}"
+
 # --- HELPERS ---
+
 async def ensure_indexes():
     try:
         await collection.create_index([("title", "text"), ("author", "text"), ("synopsis", "text"), ("tags", "text"), ("file_name", "text")])
@@ -79,22 +133,22 @@ async def ensure_indexes():
     except: pass
 
 def get_display_title(book_doc):
-    """Priority: DB Title -> Filename"""
     db_title = book_doc.get('title')
     if db_title and db_title.strip() and db_title != "Unknown Title":
         return db_title.strip()
-    
     fname = book_doc.get('file_name')
     if fname:
         return fname.replace('.epub', '').replace('_', ' ').replace('-', ' ').strip()
     return "Unknown Book"
 
 def get_button_label(book_doc):
-    """Strips chapter info for buttons."""
     full = get_display_title(book_doc)
     return re.sub(r'\s+(c|ch|chap|vol|v)\.?\s*\d+(?:[-–]\d+)?.*$', '', full, flags=re.IGNORECASE).strip()
 
-# --- METADATA PARSER ---
+def len_utf16(text):
+    return len(text.encode('utf-16-le')) // 2
+
+# --- EPUB PARSER ---
 def parse_epub_direct(file_path):
     meta = {"title": None, "author": "Unknown", "synopsis": "No synopsis.", "tags": "", "cover_image": None}
     try:
@@ -109,9 +163,7 @@ def parse_epub_direct(file_path):
             except: pass
             if not opf_path:
                 for n in z.namelist():
-                    if n.endswith('.opf'): 
-                        opf_path = n
-                        break
+                    if n.endswith('.opf'): opf_path = n; break
             if not opf_path: return meta
 
             try:
@@ -132,23 +184,17 @@ def parse_epub_direct(file_path):
             if manifest:
                 for item in manifest:
                     props = item.get('properties', '').lower()
-                    if 'cover-image' in props: 
-                        cover_href = item.get('href')
-                        break
+                    if 'cover-image' in props: cover_href = item.get('href'); break
             if not cover_href:
                 for elem in root.iter():
                     if elem.tag.split('}')[-1].lower() == 'meta' and elem.get('name') == 'cover':
                         cid = elem.get('content')
                         if manifest:
                             for item in manifest:
-                                if item.get('id') == cid: 
-                                    cover_href = item.get('href')
-                                    break
+                                if item.get('id') == cid: cover_href = item.get('href'); break
             if not cover_href:
                 for n in z.namelist():
-                    if 'cover' in n.lower() and n.endswith(('.jpg','.png')): 
-                        cover_href = n
-                        break
+                    if 'cover' in n.lower() and n.endswith(('.jpg','.png')): cover_href = n; break
             
             if cover_href:
                 try:
@@ -163,30 +209,17 @@ def parse_epub_direct(file_path):
                         try:
                             soup = BeautifulSoup(z.read(n), 'html.parser')
                             ps = soup.find_all('p')
-                            if ps: 
-                                meta['synopsis'] = "\n".join([p.text for p in ps[:6]])
-                                break
+                            if ps: meta['synopsis'] = "\n".join([p.text for p in ps[:6]]); break
                         except: pass
     except: pass
     if meta['tags'].endswith(", "): meta['tags'] = meta['tags'][:-2]
     return meta
 
-# --- PYROGRAM CLIENT ---
-app = Client(
-    "novel_bot_session",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    bot_token=BOT_TOKEN,
-    sleep_threshold=60 
-)
-
 # --- INDEXING PROCESS ---
 async def indexing_process(client, start_id, end_id, status_msg):
     global indexing_active, files_found, files_saved
-    
     files_found = 0
     files_saved = 0
-    
     queue = asyncio.Queue(maxsize=30)
     
     if status_msg: 
@@ -199,23 +232,15 @@ async def indexing_process(client, start_id, end_id, status_msg):
             try:
                 message = await queue.get()
                 temp_filename = f"temp_{message.id}.epub"
-                
                 path = None
-                try:
-                    path = await client.download_media(message, file_name=temp_filename)
-                except:
-                    queue.task_done()
-                    continue
-                
-                if not path:
-                    queue.task_done()
-                    continue
+                try: path = await client.download_media(message, file_name=temp_filename)
+                except: queue.task_done(); continue
+                if not path: queue.task_done(); continue
 
                 meta = await asyncio.to_thread(parse_epub_direct, path)
                 if os.path.exists(path): os.remove(path)
 
-                if not meta['title']: 
-                    meta['title'] = message.document.file_name.replace('.epub', '').replace('_', ' ')
+                if not meta['title']: meta['title'] = message.document.file_name.replace('.epub', '').replace('_', ' ')
 
                 try:
                     await collection.insert_one({
@@ -231,76 +256,65 @@ async def indexing_process(client, start_id, end_id, status_msg):
                     })
                     files_saved += 1
                     print(f"✅ Saved: {meta['title']}")
-                except DuplicateKeyError:
-                    pass
-                except Exception as e:
-                    logger.error(f"DB Error: {e}")
-                
+                except DuplicateKeyError: pass
+                except Exception as e: logger.error(f"DB Error: {e}")
                 queue.task_done()
-            except Exception as e:
-                logger.error(f"Worker Error: {e}")
-                queue.task_done()
+            except: queue.task_done()
 
     workers = [asyncio.create_task(worker()) for _ in range(3)]
     
     try:
         current_id = start_id
         BATCH_SIZE = 50 
-        
         while current_id <= end_id and indexing_active:
             batch_end = min(current_id + BATCH_SIZE, end_id + 1)
             ids_to_fetch = list(range(current_id, batch_end))
             
             if status_msg and (current_id % 100 == 0):
-                try:
-                    await status_msg.edit(
-                        f"🔄 **Scanning...**\n"
-                        f"ID: `{current_id}`\n"
-                        f"Found: `{files_found}`\n"
-                        f"Saved: `{files_saved}`"
-                    )
-                except FloodWait as fw:
-                    await asyncio.sleep(fw.value)
+                try: await status_msg.edit(f"🔄 **Scanning...**\nID: `{current_id}`\nFound: `{files_found}`\nSaved: `{files_saved}`")
                 except: pass
 
             if not ids_to_fetch: break
-
             try:
                 messages = await client.get_messages(CHANNEL_ID, ids_to_fetch)
                 if messages:
                     for message in messages:
                         if message and message.document and message.document.file_name and message.document.file_name.endswith('.epub'):
+                            global files_found
                             files_found += 1
                             await queue.put(message)
-            except FloodWait as e:
-                logger.warning(f"FloodWait: Sleeping {e.value}s")
-                await asyncio.sleep(e.value + 1)
-                continue 
-            except Exception as e:
-                logger.error(f"Batch Error: {e}")
-            
+            except FloodWait as e: await asyncio.sleep(e.value + 1); continue 
+            except: pass
             current_id += BATCH_SIZE
             await asyncio.sleep(2) 
-            
         await queue.join()
-        
     finally:
         for w in workers: w.cancel()
         indexing_active = False
-        if status_msg:
-            try:
-                await status_msg.edit(
-                    f"✅ **Done!**\n"
-                    f"Scanned: `{end_id}`\n"
-                    f"Found: `{files_found}`\n"
-                    f"Saved: `{files_saved}`"
-                )
-            except: pass
+        if status_msg: try: await status_msg.edit(f"✅ **Done!**\nScanned: `{end_id}`\nFound: `{files_found}`\nSaved: `{files_saved}`")
+        except: pass
 
-# --- COMMANDS ---
+# --- TELEGRAM HANDLERS ---
 
 @app.on_message(filters.command("start"))
 async def start_handler(client, message):
+    if len(message.command) > 1:
+        param = message.command[1]
+        if param.startswith("d_"):
+            try:
+                book_id = param.split("_", 1)[1]
+                b = await collection.find_one({"_id": ObjectId(book_id)})
+                if b:
+                    await client.send_document(
+                        chat_id=message.chat.id,
+                        document=b['file_id'],
+                        caption=f"📖 {get_display_title(b)}"
+                    )
+                    return 
+            except Exception as e:
+                await message.reply(f"❌ Error fetching file: {e}")
+                return
+
     await message.reply("MTL Novels Search Engine [send query to search]")
 
 @app.on_message(filters.command("stats"))
@@ -327,59 +341,11 @@ async def stop_cmd(client, message):
     global indexing_active; indexing_active = False
     await message.reply("🛑 Stopping...")
 
-@app.on_message(filters.command("export") & filters.user(ADMIN_ID))
-async def export_cmd(client, message):
-    s = await message.reply("📦 Exporting...")
-    try:
-        with open("lib.json", 'w') as f:
-            f.write('[')
-            first = True
-            async for d in collection.find({}):
-                if not first: f.write(',')
-                first = False
-                if d.get('cover_image'): d['cover_image'] = base64.b64encode(d['cover_image']).decode()
-                d['_id'] = str(d['_id'])
-                json.dump(d, f)
-            f.write(']')
-        with zipfile.ZipFile("lib.zip", 'w', zipfile.ZIP_DEFLATED) as z: z.write("lib.json")
-        await client.send_document(message.chat.id, "lib.zip", caption="✅ Backup")
-    except Exception as e:
-        await s.edit(f"❌ {e}")
-    finally:
-        if os.path.exists("lib.json"): os.remove("lib.json")
-        if os.path.exists("lib.zip"): os.remove("lib.zip")
-
-@app.on_message(filters.command("import") & filters.user(ADMIN_ID))
-async def import_cmd(client, message):
-    if not message.reply_to_message or not message.reply_to_message.document: return await message.reply("Reply file.")
-    s = await message.reply("📥 Importing...")
-    path = await message.reply_to_message.download()
-    try:
-        if zipfile.is_zipfile(path):
-            with zipfile.ZipFile(path, 'r') as z: z.extractall(); path = z.namelist()[0]
-        with open(path, 'r') as f: data = json.load(f)
-        for c in [data[i:i+50] for i in range(0,len(data),50)]:
-            for x in c:
-                if x.get('cover_image'): 
-                    try: x['cover_image'] = base64.b64decode(x['cover_image'])
-                    except: x['cover_image'] = None
-                if '_id' in x: del x['_id']
-                try: await collection.replace_one({"file_unique_id":x['file_unique_id']},x,upsert=True)
-                except: pass
-        await s.edit("✅ Done")
-    except Exception as e:
-        await s.edit(f"❌ {e}")
-    finally:
-        if os.path.exists(path): os.remove(path)
-
-# --- SEARCH & VIEW ---
-
 @app.on_message(filters.text & filters.incoming & ~filters.command(["start", "stats", "index", "stop_index", "export", "import", "migrate"]))
 async def search_handler(client, message):
     q = message.text.strip()
     if len(q) > 100: return
     
-    # Handle Persistent Search Flag
     keep_result = False
     real_q = q
     if q.startswith("!!"):
@@ -394,11 +360,7 @@ async def search_handler(client, message):
             if cnt>0: cur = collection.find({"$text": {"$search": real_q}}).sort([("score", {"$meta": "textScore"})])
             else: raise Exception
         except:
-            reg = {"$or": [
-                {"title": {"$regex": real_q, "$options": "i"}},
-                {"author": {"$regex": real_q, "$options": "i"}},
-                {"file_name": {"$regex": real_q, "$options": "i"}}
-            ]}
+            reg = {"$or": [{"title": {"$regex": real_q, "$options": "i"}}, {"file_name": {"$regex": real_q, "$options": "i"}}]}
             cnt = await collection.count_documents(reg)
             cur = collection.find(reg)
         
@@ -406,28 +368,18 @@ async def search_handler(client, message):
         if not res: return await message.reply("❌ No matches.")
 
         sq = html.escape(real_q)
-        line_sep = "-" * 101 # Exactly 101 dashes as requested
-        txt = (
-            f"🔎 Results fetched for your search : {sq}\n"
-            f"Total Matches: {cnt}\n"
-            f"{line_sep}"
-        )
+        line_sep = "-" * 101
+        txt = (f"🔎 Results fetched for your search : {sq}\nTotal Matches: {cnt}\n{line_sep}")
         
         btns = []
         for b in res:
             label = get_button_label(b)[:40]
-            # Encode 'k' flag in callback if persistence is requested
             cb_data = f"v:{str(b['_id'])}:k" if keep_result else f"v:{str(b['_id'])}"
             btns.append([InlineKeyboardButton(f"{label}", callback_data=cb_data)])
         
-        # Navigation
         nav = []
-        # Page 0 has no prev, but needs Counter
-        # Page 1+ logic handled in callback
         nav.append(InlineKeyboardButton(f"1/{math.ceil(cnt/8)}", callback_data="nop"))
-        if cnt > 8:
-            # Pass original 'q' to next button so pagination knows about '!!'
-            nav.append(InlineKeyboardButton("➡️", callback_data=f"n:1:{q[:20]}"))
+        if cnt > 8: nav.append(InlineKeyboardButton("➡️", callback_data=f"n:1:{q[:20]}"))
         btns.append(nav)
 
         await message.reply(txt, reply_markup=InlineKeyboardMarkup(btns), parse_mode=ParseMode.HTML)
@@ -441,13 +393,9 @@ async def callback_handler(client, callback_query):
         try:
             _, p, q = d.split(':', 2)
             p = int(p)
-            
-            # Check for persistence flag in query
             real_q = q
             keep_result = False
-            if q.startswith("!!"):
-                keep_result = True
-                real_q = q[2:].strip()
+            if q.startswith("!!"): keep_result=True; real_q=q[2:].strip()
 
             try:
                 cnt = await collection.count_documents({"$text": {"$search": real_q}})
@@ -475,17 +423,9 @@ async def callback_handler(client, callback_query):
             
             sq = html.escape(real_q)
             line_sep = "-" * 101
-            txt = (
-                f"🔎 Results fetched for your search : {sq}\n"
-                f"Total Matches: {cnt}\n"
-                f"{line_sep}"
-            )
+            txt = (f"🔎 Results fetched for your search : {sq}\nTotal Matches: {cnt}\n{line_sep}")
             
-            await callback_query.edit_message_text(
-                txt, 
-                reply_markup=InlineKeyboardMarkup(btns), 
-                parse_mode=ParseMode.HTML
-            )
+            await callback_query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(btns), parse_mode=ParseMode.HTML)
         except: await callback_query.answer("Error", show_alert=True)
 
     elif d.startswith("v:"):
@@ -494,7 +434,6 @@ async def callback_handler(client, callback_query):
             bid = parts[1]
             keep_msg = len(parts) > 2 and parts[2] == 'k'
 
-            from bson.objectid import ObjectId
             b = await collection.find_one({"_id": ObjectId(bid)})
             if not b: return await callback_query.answer("Not found", show_alert=True)
             
@@ -502,62 +441,22 @@ async def callback_handler(client, callback_query):
             auth = b.get('author', 'Unknown')
             syn = b.get('synopsis', 'No synopsis.')
             
-            header_html = (
-                f"<blockquote>"
-                f"<b>{html.escape(title)}</b>\n"
-                f"Author: {html.escape(auth)}"
-                f"</blockquote>"
-            )
-            
-            syn_html = (
-                f"<blockquote expandable>"
-                f"<b><u>SYNOPSIS</u></b>\n\n"
-                f"{html.escape(syn)}"
-                f"</blockquote>"
-            )
-            
+            header_html = (f"<blockquote><b>{html.escape(title)}</b>\nAuthor: {html.escape(auth)}</blockquote>")
+            syn_html = (f"<blockquote expandable><b><u>SYNOPSIS</u></b>\n\n{html.escape(syn)}</blockquote>")
             kb = [[InlineKeyboardButton("📥 Download", callback_data=f"d:{bid}")]]
             
-            # --- PERSISTENCE LOGIC ---
-            if not keep_msg:
-                await callback_query.message.delete()
-            else:
-                # If keeping, we assume this is a new "spawned" message view
-                # Actually, Pyrogram usually edits or sends new.
-                # Since we are NOT deleting the search menu, we must SEND A NEW message
-                # Otherwise if we just 'send', the search menu stays there.
-                await callback_query.answer("Opening...") # Ack the click so loading spinner stops
+            if not keep_msg: await callback_query.message.delete()
+            else: await callback_query.answer("Opening...")
 
-            # 1. SEND HEADER
             if b.get('cover_image'):
                 try:
                     f = io.BytesIO(b['cover_image']); f.name="c.jpg"
-                    await client.send_photo(
-                        callback_query.message.chat.id, 
-                        f, 
-                        caption=header_html, 
-                        parse_mode=ParseMode.HTML
-                    )
-                except:
-                    await client.send_message(
-                        callback_query.message.chat.id, 
-                        header_html, 
-                        parse_mode=ParseMode.HTML
-                    )
+                    await client.send_photo(callback_query.message.chat.id, f, caption=header_html, parse_mode=ParseMode.HTML)
+                except: await client.send_message(callback_query.message.chat.id, header_html, parse_mode=ParseMode.HTML)
             else:
-                await client.send_message(
-                    callback_query.message.chat.id, 
-                    header_html, 
-                    parse_mode=ParseMode.HTML
-                )
+                await client.send_message(callback_query.message.chat.id, header_html, parse_mode=ParseMode.HTML)
             
-            # 2. SEND SYNOPSIS
-            await client.send_message(
-                callback_query.message.chat.id, 
-                syn_html, 
-                reply_markup=InlineKeyboardMarkup(kb),
-                parse_mode=ParseMode.HTML
-            )
+            await client.send_message(callback_query.message.chat.id, syn_html, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
                 
         except Exception as e: 
             logger.error(f"View Error: {e}")
@@ -566,14 +465,9 @@ async def callback_handler(client, callback_query):
     elif d.startswith("d:"):
         try:
             bid = d.split(':')[1]
-            from bson.objectid import ObjectId
             b = await collection.find_one({"_id": ObjectId(bid)})
             await callback_query.answer("🚀 Sending...")
-            try: await client.send_document(
-                callback_query.message.chat.id, 
-                b['file_id'], 
-                caption=f"📖 {get_display_title(b)}"
-            )
+            try: await client.send_document(callback_query.message.chat.id, b['file_id'], caption=f"📖 {get_display_title(b)}")
             except: 
                 try: await client.copy_message(callback_query.message.chat.id, CHANNEL_ID, b['msg_id'])
                 except: await callback_query.answer("File lost.", show_alert=True)
@@ -581,17 +475,19 @@ async def callback_handler(client, callback_query):
 
 async def main():
     await ensure_indexes()
-    logger.info("Bot Started")
     await app.start()
     
-    global indexing_active
-    try:
-        last = await collection.find_one(sort=[("msg_id", -1)])
-        if last: logger.info(f"Resume ID: {last.get('msg_id', 0) + 1}")
-    except: pass
+    global BOT_USERNAME
+    if not BOT_USERNAME:
+        me = await app.get_me()
+        BOT_USERNAME = me.username
+        logger.info(f"Detected Bot Username: {BOT_USERNAME}")
     
-    await idle()
+    logger.info("Bot & Web Server Starting...")
+    hypercorn_config = Config()
+    hypercorn_config.bind = [f"0.0.0.0:{PORT}"]
+    await serve(web_app, hypercorn_config)
     await app.stop()
 
 if __name__ == '__main__':
-    app.run(main())
+    asyncio.run(main())

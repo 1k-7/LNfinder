@@ -17,7 +17,7 @@ from pymongo.errors import DuplicateKeyError
 # --- PYROGRAM IMPORTS ---
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from pyrogram.enums import ParseMode
+from pyrogram.enums import ParseMode, MessageEntityType
 from pyrogram.errors import FloodWait
 
 # --- WEB SERVER IMPORTS ---
@@ -38,12 +38,7 @@ try:
     if not AZURE_URL: raise ValueError("Missing AZURE_URL")
     
     PORT = int(os.environ.get("PORT", 8080))
-    # This URL is needed to generate the clickable link for the user
-    # e.g. "https://my-novel-bot.northflank.app"
-    # Northflank provides this in env vars usually, or set it manually
     PUBLIC_URL = os.environ.get("PUBLIC_URL") or f"http://localhost:{PORT}"
-    
-    # Secret key for signing login tokens
     SECRET_KEY = os.environ.get("SECRET_KEY", "CHANGE_THIS_TO_RANDOM_STRING")
 
     DB_NAME = os.environ.get("DB_NAME", "novel_library")
@@ -91,7 +86,6 @@ def get_user_from_cookie():
     token = request.cookies.get('auth_token')
     if not token: return None
     try:
-        # Token valid for 30 days
         user_id = serializer.loads(token, max_age=86400*30)
         return user_id
     except:
@@ -106,9 +100,9 @@ async def login():
         return "❌ No token provided. Use /url in the bot.", 400
     
     try:
-        user_id = serializer.loads(token, max_age=3600) # Link valid for 1 hour
+        user_id = serializer.loads(token, max_age=3600)
         resp = await make_response(redirect(url_for('index')))
-        resp.set_cookie('auth_token', serializer.dumps(user_id), max_age=86400*30) # Cookie lasts 30 days
+        resp.set_cookie('auth_token', serializer.dumps(user_id), max_age=86400*30)
         return resp
     except Exception:
         return "❌ Invalid or expired link. Generate a new one with /url.", 400
@@ -170,7 +164,6 @@ async def api_download(book_id):
         if not b:
             return jsonify({"status": "error", "message": "Book not found"}), 404
         
-        # Send file via Pyrogram
         try:
             await app.send_document(
                 chat_id=int(user_id),
@@ -181,7 +174,6 @@ async def api_download(book_id):
             return jsonify({"status": "ok"})
         except Exception as telegram_err:
             logger.error(f"Telegram Send Error: {telegram_err}")
-            # Try fallback copy
             try:
                 await app.copy_message(int(user_id), CHANNEL_ID, b['msg_id'])
                 return jsonify({"status": "ok"})
@@ -214,7 +206,6 @@ def get_button_label(book_doc):
     full = get_display_title(book_doc)
     return re.sub(r'\s+(c|ch|chap|vol|v)\.?\s*\d+(?:[-–]\d+)?.*$', '', full, flags=re.IGNORECASE).strip()
 
-# --- EPUB PARSER ---
 def parse_epub_direct(file_path):
     meta = {"title": None, "author": "Unknown", "synopsis": "No synopsis.", "tags": "", "cover_image": None}
     try:
@@ -289,8 +280,10 @@ async def indexing_process(client, start_id, end_id, status_msg):
     queue = asyncio.Queue(maxsize=30)
     
     if status_msg: 
-        try: await status_msg.edit(f"🚀 **Starting Scan...**\nRange: {start_id} - {end_id}")
-        except: pass
+        try:
+            await status_msg.edit(f"🚀 **Starting Scan...**\nRange: {start_id} - {end_id}")
+        except:
+            pass
 
     async def worker():
         global files_saved
@@ -299,9 +292,15 @@ async def indexing_process(client, start_id, end_id, status_msg):
                 message = await queue.get()
                 temp_filename = f"temp_{message.id}.epub"
                 path = None
-                try: path = await client.download_media(message, file_name=temp_filename)
-                except: queue.task_done(); continue
-                if not path: queue.task_done(); continue
+                try:
+                    path = await client.download_media(message, file_name=temp_filename)
+                except:
+                    queue.task_done()
+                    continue
+                
+                if not path:
+                    queue.task_done()
+                    continue
 
                 meta = await asyncio.to_thread(parse_epub_direct, path)
                 if os.path.exists(path): os.remove(path)
@@ -322,10 +321,14 @@ async def indexing_process(client, start_id, end_id, status_msg):
                     })
                     files_saved += 1
                     print(f"✅ Saved: {meta['title']}")
-                except DuplicateKeyError: pass
-                except Exception as e: logger.error(f"DB Error: {e}")
+                except DuplicateKeyError:
+                    pass
+                except Exception as e:
+                    logger.error(f"DB Error: {e}")
+                
                 queue.task_done()
-            except: queue.task_done()
+            except:
+                queue.task_done()
 
     workers = [asyncio.create_task(worker()) for _ in range(3)]
     
@@ -337,8 +340,10 @@ async def indexing_process(client, start_id, end_id, status_msg):
             ids_to_fetch = list(range(current_id, batch_end))
             
             if status_msg and (current_id % 100 == 0):
-                try: await status_msg.edit(f"🔄 **Scanning...**\nID: `{current_id}`\nFound: `{files_found}`\nSaved: `{files_saved}`")
-                except: pass
+                try:
+                    await status_msg.edit(f"🔄 **Scanning...**\nID: `{current_id}`\nFound: `{files_found}`\nSaved: `{files_saved}`")
+                except:
+                    pass
 
             if not ids_to_fetch: break
             try:
@@ -349,26 +354,30 @@ async def indexing_process(client, start_id, end_id, status_msg):
                             global files_found
                             files_found += 1
                             await queue.put(message)
-            except FloodWait as e: await asyncio.sleep(e.value + 1); continue 
-            except: pass
+            except FloodWait as e:
+                await asyncio.sleep(e.value + 1)
+                continue 
+            except:
+                pass
+            
             current_id += BATCH_SIZE
             await asyncio.sleep(2) 
         await queue.join()
     finally:
         for w in workers: w.cancel()
         indexing_active = False
-        if status_msg: try: await status_msg.edit(f"✅ **Done!**\nScanned: `{end_id}`\nFound: `{files_found}`\nSaved: `{files_saved}`")
-        except: pass
+        if status_msg:
+            try:
+                await status_msg.edit(f"✅ **Done!**\nScanned: `{end_id}`\nFound: `{files_found}`\nSaved: `{files_saved}`")
+            except:
+                pass
 
 # --- TELEGRAM HANDLERS ---
 
 @app.on_message(filters.command("url"))
 async def url_command(client, message):
-    # Generate secure token for this specific user
     token = serializer.dumps(message.from_user.id)
-    # Construct the login URL
     login_url = f"{PUBLIC_URL}/login?token={token}"
-    
     await message.reply(
         f"🔗 **Your Personal Website Link**\n\n"
         f"Click this link to access the library. It will log you in automatically so downloads are sent to this chat.\n\n"

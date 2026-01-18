@@ -17,7 +17,7 @@ from pymongo.errors import DuplicateKeyError
 # --- PYROGRAM IMPORTS ---
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from pyrogram.enums import ParseMode, MessageEntityType
+from pyrogram.enums import ParseMode
 from pyrogram.errors import FloodWait
 
 # --- WEB SERVER IMPORTS ---
@@ -351,7 +351,7 @@ async def indexing_process(client, start_id, end_id, status_msg):
                 if messages:
                     for message in messages:
                         if message and message.document and message.document.file_name and message.document.file_name.endswith('.epub'):
-                            global files_found
+                            # Removed redundant global declaration here
                             files_found += 1
                             await queue.put(message)
             except FloodWait as e:

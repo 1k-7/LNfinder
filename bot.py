@@ -17,7 +17,7 @@ from pymongo.errors import DuplicateKeyError
 # --- PYROGRAM IMPORTS ---
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from pyrogram.enums import ParseMode, MessageEntityType
+from pyrogram.enums import ParseMode
 from pyrogram.errors import FloodWait
 
 # --- WEB SERVER IMPORTS ---
@@ -67,13 +67,11 @@ web_app = Quart(__name__, template_folder='template')
 serializer = URLSafeTimedSerializer(SECRET_KEY)
 
 # --- TELEGRAM APP ---
-# in_memory=True prevents file corruption in containers
 app = Client(
     "novel_bot_session",
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
-    in_memory=True,
     sleep_threshold=60 
 )
 
@@ -280,7 +278,9 @@ def parse_epub_direct(file_path):
 
 # --- INDEXING PROCESS ---
 async def indexing_process(client, start_id, end_id, status_msg):
+    # !!! CRITICAL: Global declaration ONLY here at top !!!
     global indexing_active, files_found, files_saved
+    
     files_found = 0
     files_saved = 0
     queue = asyncio.Queue(maxsize=30)
@@ -292,6 +292,7 @@ async def indexing_process(client, start_id, end_id, status_msg):
             pass
 
     async def worker():
+        # Inner function needs to modify global counter, so we declare it here
         global files_saved
         while indexing_active:
             try:
@@ -357,7 +358,7 @@ async def indexing_process(client, start_id, end_id, status_msg):
                 if messages:
                     for message in messages:
                         if message and message.document and message.document.file_name and message.document.file_name.endswith('.epub'):
-                            global files_found
+                            # DIRECT INCREMENT (No 'global' keyword needed here as it's in local scope via outer func)
                             files_found += 1
                             await queue.put(message)
             except FloodWait as e:
@@ -629,7 +630,6 @@ async def callback_handler(client, callback_query):
         except: pass
 
 async def bot_startup_task():
-    """Background task to ensure Bot connects without blocking web server."""
     try:
         await app.start()
         global BOT_USERNAME
@@ -642,7 +642,6 @@ async def bot_startup_task():
 async def main():
     await ensure_indexes()
     
-    # Start Bot in Background (Non-blocking) so Web Server opens port immediately
     asyncio.create_task(bot_startup_task())
     
     logger.info("✅ Starting Web Server...")
@@ -650,7 +649,6 @@ async def main():
     hypercorn_config.bind = [f"0.0.0.0:{PORT}"]
     await serve(web_app, hypercorn_config)
     
-    # If serve exits, cleanup
     await app.stop()
 
 if __name__ == '__main__':

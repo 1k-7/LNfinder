@@ -1,4 +1,4 @@
-pyroblack
+pyrogram
 tgcrypto
 motor
 beautifulsoup4

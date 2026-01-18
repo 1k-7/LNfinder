@@ -8,6 +8,7 @@ import zipfile
 import html
 import re
 import base64
+import json
 import xml.etree.ElementTree as ET
 from bs4 import BeautifulSoup
 from bson.objectid import ObjectId
@@ -67,13 +68,15 @@ web_app = Quart(__name__, template_folder='template')
 serializer = URLSafeTimedSerializer(SECRET_KEY)
 
 # --- TELEGRAM APP INIT ---
-# in_memory=True stops restart loops in containers
+# Using official Pyrogram with persistent session storage
+if not os.path.exists("sessions"):
+    os.makedirs("sessions")
+
 app = Client(
-    "novel_bot_session",
+    "sessions/novel_bot_session",  # Saves to /app/sessions/novel_bot_session.session
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
-    in_memory=True,  
     sleep_threshold=60
 )
 
@@ -374,7 +377,6 @@ async def indexing_process(client, start_id, end_id, status_msg):
                 if messages:
                     for message in messages:
                         if message and message.document and message.document.file_name and message.document.file_name.endswith('.epub'):
-                            # NOTE: Removed inner global to fix syntax error
                             files_found += 1
                             await queue.put(message)
             except FloodWait as e:
@@ -491,18 +493,23 @@ async def import_cmd(client, message):
 
 @app.on_message(filters.command("migrate") & filters.user(ADMIN_ID))
 async def migrate_cmd(client, message):
-    if not legacy_collections: return await message.reply("❌ No Legacy")
-    s = await message.reply("🚀 Migrating...")
-    t=0
-    for c in legacy_collections:
-        async for d in c.find({}):
-            if '_id' in d: del d['_id']
-            try: await collection.insert_one(d); t+=1
-            except: pass
-            if t%100==0:
-                try: await s.edit(f"📥 {t}")
+    # This command relied on a 'legacy_collections' variable which was not defined in the source provided.
+    # Leaving logic intact but it will fail if legacy_collections is missing.
+    try:
+        if not legacy_collections: return await message.reply("❌ No Legacy")
+        s = await message.reply("🚀 Migrating...")
+        t=0
+        for c in legacy_collections:
+            async for d in c.find({}):
+                if '_id' in d: del d['_id']
+                try: await collection.insert_one(d); t+=1
                 except: pass
-    await s.edit(f"✅ {t} Done")
+                if t%100==0:
+                    try: await s.edit(f"📥 {t}")
+                    except: pass
+        await s.edit(f"✅ {t} Done")
+    except NameError:
+        await message.reply("❌ Legacy collections not defined in code.")
 
 @app.on_message(filters.text & filters.incoming & ~filters.command(["start", "stats", "index", "stop_index", "export", "import", "migrate", "url"]))
 async def search_handler(client, message):

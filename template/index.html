@@ -79,7 +79,7 @@
         
         .cover-container {
             width: 100%;
-            height: 250px; /* Taller covers */
+            height: 350px;
             background: #3a3a3a;
             position: relative;
             overflow: hidden;
@@ -115,10 +115,9 @@
             font-style: italic;
         }
         
-        /* SYNOPSIS LOGIC */
+        /* SYNOPSIS */
         .synopsis-container {
             margin-bottom: 15px;
-            position: relative;
         }
         .synopsis-text {
             font-size: 13px;
@@ -127,13 +126,10 @@
             max-height: 9em; /* Approx 6 lines */
             overflow: hidden;
             transition: max-height 0.3s ease-out;
-            position: relative;
         }
-        /* When expanded, remove the limit */
         .synopsis-text.expanded {
-            max-height: none;
+            max-height: none; /* Remove limit */
         }
-        
         .read-more-btn {
             background: none;
             border: none;
@@ -144,7 +140,6 @@
             padding: 0;
             margin-top: 5px;
             outline: none;
-            display: inline-block;
         }
         .read-more-btn:hover { text-decoration: underline; }
 
@@ -166,33 +161,49 @@
             box-sizing: border-box;
         }
         .dl-btn:hover { background-color: var(--accent-hover); }
-        .dl-btn:disabled { background-color: #555; cursor: wait; opacity: 0.7; }
+        .dl-btn:disabled { background-color: #555; cursor: wait; }
+
+        /* PAGINATION */
+        .pagination {
+            display: flex;
+            justify-content: center;
+            margin-top: 30px;
+            gap: 10px;
+        }
+        .page-btn {
+            background-color: #333;
+            color: white;
+            padding: 8px 15px;
+            text-decoration: none;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        .page-btn:hover { background-color: #444; }
+        .page-btn.active { background-color: var(--accent); }
     </style>
     
     <script>
-        // Toggle Synopsis Text
         function toggleSynopsis(id) {
-            const textDiv = document.getElementById('syn-' + id);
-            const btn = document.getElementById('btn-' + id);
+            var textElement = document.getElementById('syn-' + id);
+            var btnElement = document.getElementById('btn-' + id);
             
-            if (textDiv.classList.contains('expanded')) {
-                textDiv.classList.remove('expanded');
-                btn.innerText = 'Read More...';
+            if (textElement.classList.contains('expanded')) {
+                textElement.classList.remove('expanded');
+                btnElement.innerText = 'Read More...';
             } else {
-                textDiv.classList.add('expanded');
-                btn.innerText = 'Read Less';
+                textElement.classList.add('expanded');
+                btnElement.innerText = 'Read Less';
             }
         }
 
-        // Handle Silent Download
         async function requestDownload(bookId, btn) {
-            const originalText = btn.innerText;
+            var originalText = btn.innerText;
             btn.innerText = "Sending...";
             btn.disabled = true;
             
             try {
-                const response = await fetch(`/api/download/${bookId}`);
-                const data = await response.json();
+                var response = await fetch('/api/download/' + bookId);
+                var data = await response.json();
                 
                 if (data.status === 'ok') {
                     btn.innerText = "Sent to Chat ✅";
@@ -200,16 +211,15 @@
                 } else {
                     btn.innerText = "Error ❌";
                     alert("Failed: " + data.message);
-                    // Reset after 2 seconds on error
-                    setTimeout(() => {
+                    setTimeout(function() {
                         btn.innerText = originalText;
                         btn.disabled = false;
-                        btn.style.backgroundColor = ""; // Reset color
+                        btn.style.backgroundColor = ""; 
                     }, 2000);
                 }
             } catch (e) {
                 console.error(e);
-                btn.innerText = "Network Error ❌";
+                btn.innerText = "Net Error ❌";
             }
         }
     </script>
@@ -230,7 +240,7 @@
         {% endif %}
 
         {% if results %}
-            <p style="color: #888;">Found {{ count }} matches</p>
+            <p style="color: #888;">Found {{ count }} matches (Page {{ page }} of {{ total_pages }})</p>
             <div class="grid">
                 {% for book in results %}
                 <div class="card">
@@ -263,10 +273,22 @@
                 </div>
                 {% endfor %}
             </div>
+
+            <div class="pagination">
+                {% if page > 1 %}
+                    <a href="/search?q={{ query }}&page={{ page - 1 }}" class="page-btn">« Prev</a>
+                {% endif %}
+                
+                <span class="page-btn active">{{ page }}</span>
+                
+                {% if page < total_pages %}
+                    <a href="/search?q={{ query }}&page={{ page + 1 }}" class="page-btn">Next »</a>
+                {% endif %}
+            </div>
+
         {% elif query %}
             <div style="text-align: center; margin-top: 50px; color: #888;">
                 <p>No novels found matching "{{ query }}".</p>
-                <p style="font-size: 12px;">Try searching for a simpler keyword.</p>
             </div>
         {% else %}
             <div style="text-align: center; margin-top: 50px; color: #ccc;">

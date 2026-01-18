@@ -29,6 +29,16 @@
             top: 0;
             z-index: 100;
         }
+        .user-badge {
+            position: absolute;
+            top: 10px;
+            right: 20px;
+            font-size: 12px;
+            color: var(--accent);
+            border: 1px solid var(--accent);
+            padding: 4px 8px;
+            border-radius: 4px;
+        }
         .search-box {
             padding: 12px 20px;
             width: 80%;
@@ -102,17 +112,13 @@
             margin-bottom: 10px;
             font-style: italic;
         }
-        
-        /* SYNOPSIS STYLES */
-        .synopsis-container {
-            margin-bottom: 15px;
-        }
+        .synopsis-container { margin-bottom: 15px; }
         .synopsis-text {
             font-size: 13px;
             color: #ccc;
             line-height: 1.4;
             display: -webkit-box;
-            -webkit-line-clamp: 6; /* CHANGED: Show 6 lines initially */
+            -webkit-line-clamp: 6;
             -webkit-box-orient: vertical;
             overflow: hidden;
             transition: max-height 0.3s;
@@ -146,8 +152,12 @@
             margin-top: auto;
             text-transform: uppercase;
             font-size: 14px;
+            cursor: pointer;
+            border: none;
+            width: 100%;
         }
         .dl-btn:hover { background-color: var(--accent-hover); }
+        .dl-btn:disabled { background-color: #555; cursor: not-allowed; }
     </style>
     <script>
         function toggleSynopsis(btn, id) {
@@ -160,18 +170,43 @@
                 btn.innerText = 'Read Less';
             }
         }
+
+        async def requestDownload(bookId, btn) {
+            btn.innerText = "Sending...";
+            btn.disabled = true;
+            try {
+                const response = await fetch(`/api/download/${bookId}`);
+                const data = await response.json();
+                if (data.status === 'ok') {
+                    btn.innerText = "Sent to Telegram ✅";
+                    btn.style.backgroundColor = "#333";
+                } else {
+                    btn.innerText = "Error ❌";
+                    alert(data.message);
+                }
+            } catch (e) {
+                btn.innerText = "Failed ❌";
+            }
+        }
     </script>
 </head>
 <body>
     <div class="header">
+        {% if user_id %}
+            <div class="user-badge">Logged in as ID: {{ user_id }}</div>
+        {% endif %}
         <form action="/search" method="get">
             <input type="text" name="q" class="search-box" placeholder="Search title or author..." value="{{ query }}">
         </form>
     </div>
 
     <div class="container">
+        {% if error %}
+            <p style="color: #ff6b6b; text-align: center;">{{ error }}</p>
+        {% endif %}
+
         {% if results %}
-            <p style="color: #888;">Found {{ count }} matches for "{{ query }}"</p>
+            <p style="color: #888;">Found {{ count }} matches</p>
             <div class="grid">
                 {% for book in results %}
                 <div class="card">
@@ -195,7 +230,11 @@
                             {% endif %}
                         </div>
 
-                        <a href="https://t.me/{{ bot_username }}?start=d_{{ book._id }}" class="dl-btn">DOWNLOAD</a>
+                        {% if user_id %}
+                            <button onclick="requestDownload('{{ book._id }}', this)" class="dl-btn">DOWNLOAD TO CHAT</button>
+                        {% else %}
+                            <a href="https://t.me/{{ bot_username }}?start=d_{{ book._id }}" class="dl-btn">DOWNLOAD</a>
+                        {% endif %}
                     </div>
                 </div>
                 {% endfor %}
@@ -203,7 +242,12 @@
         {% elif query %}
             <p style="text-align: center; margin-top: 50px;">No novels found.</p>
         {% else %}
-            <p style="text-align: center; margin-top: 50px;">Use the search bar to find novels.</p>
+            <p style="text-align: center; margin-top: 50px;">
+                {% if not user_id %}
+                    <a href="https://t.me/{{ bot_username }}" style="color: var(--accent);">Go to Bot</a> and type <b>/url</b> to login.<br><br>
+                {% endif %}
+                Type above to search the library.
+            </p>
         {% endif %}
     </div>
 </body>

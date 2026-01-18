@@ -5,3 +5,4 @@ beautifulsoup4
 quart
 hypercorn
 jinja2
+itsdangerous

@@ -21,9 +21,10 @@ from pyrogram.enums import ParseMode
 from pyrogram.errors import FloodWait
 
 # --- WEB SERVER IMPORTS ---
-from quart import Quart, request, render_template
+from quart import Quart, request, render_template, redirect, url_for, jsonify, make_response
 from hypercorn.config import Config
 from hypercorn.asyncio import serve
+from itsdangerous import URLSafeTimedSerializer
 
 # --- CONFIGURATION ---
 try:
@@ -37,7 +38,13 @@ try:
     if not AZURE_URL: raise ValueError("Missing AZURE_URL")
     
     PORT = int(os.environ.get("PORT", 8080))
-    BOT_USERNAME = os.environ.get("BOT_USERNAME") 
+    # This URL is needed to generate the clickable link for the user
+    # e.g. "https://my-novel-bot.northflank.app"
+    # Northflank provides this in env vars usually, or set it manually
+    PUBLIC_URL = os.environ.get("PUBLIC_URL") or f"http://localhost:{PORT}"
+    
+    # Secret key for signing login tokens
+    SECRET_KEY = os.environ.get("SECRET_KEY", "CHANGE_THIS_TO_RANDOM_STRING")
 
     DB_NAME = os.environ.get("DB_NAME", "novel_library")
     COLLECTION_NAME = os.environ.get("COLLECTION_NAME", "books")
@@ -61,8 +68,8 @@ except Exception as e:
     exit(1)
 
 # --- WEB APP ---
-# Explicitly set template_folder to 'template'
 web_app = Quart(__name__, template_folder='template')
+serializer = URLSafeTimedSerializer(SECRET_KEY)
 
 # --- TELEGRAM APP ---
 app = Client(
@@ -77,18 +84,46 @@ app = Client(
 indexing_active = False
 files_found = 0
 files_saved = 0
+BOT_USERNAME = None
+
+# --- WEB HELPERS ---
+def get_user_from_cookie():
+    token = request.cookies.get('auth_token')
+    if not token: return None
+    try:
+        # Token valid for 30 days
+        user_id = serializer.loads(token, max_age=86400*30)
+        return user_id
+    except:
+        return None
 
 # --- WEB ROUTES ---
 
+@web_app.route('/login')
+async def login():
+    token = request.args.get('token')
+    if not token:
+        return "❌ No token provided. Use /url in the bot.", 400
+    
+    try:
+        user_id = serializer.loads(token, max_age=3600) # Link valid for 1 hour
+        resp = await make_response(redirect(url_for('index')))
+        resp.set_cookie('auth_token', serializer.dumps(user_id), max_age=86400*30) # Cookie lasts 30 days
+        return resp
+    except Exception:
+        return "❌ Invalid or expired link. Generate a new one with /url.", 400
+
 @web_app.route('/')
 async def index():
-    return await render_template('index.html', query="", results=[], count=0)
+    user_id = get_user_from_cookie()
+    return await render_template('index.html', query="", results=[], count=0, user_id=user_id, bot_username=BOT_USERNAME)
 
 @web_app.route('/search')
 async def search():
+    user_id = get_user_from_cookie()
     query = request.args.get('q', '').strip()
     if not query:
-        return await render_template('index.html', query="", results=[], count=0)
+        return await render_template('index.html', query="", results=[], count=0, user_id=user_id, bot_username=BOT_USERNAME)
     
     try:
         cnt = await collection.count_documents({"$text": {"$search": query}})
@@ -117,11 +152,45 @@ async def search():
             'index.html', 
             query=query, 
             results=results, 
-            count=cnt, 
+            count=cnt,
+            user_id=user_id,
             bot_username=BOT_USERNAME
         )
     except Exception as e:
-        return f"Error: {e}"
+        return await render_template('index.html', query=query, results=[], count=0, error=str(e), user_id=user_id)
+
+@web_app.route('/api/download/<book_id>')
+async def api_download(book_id):
+    user_id = get_user_from_cookie()
+    if not user_id:
+        return jsonify({"status": "error", "message": "Not logged in"}), 401
+    
+    try:
+        b = await collection.find_one({"_id": ObjectId(book_id)})
+        if not b:
+            return jsonify({"status": "error", "message": "Book not found"}), 404
+        
+        # Send file via Pyrogram
+        try:
+            await app.send_document(
+                chat_id=int(user_id),
+                document=b['file_id'],
+                caption=f"📖 {get_display_title(b)}\n\n<i>Sent via Web Interface</i>",
+                parse_mode=ParseMode.HTML
+            )
+            return jsonify({"status": "ok"})
+        except Exception as telegram_err:
+            logger.error(f"Telegram Send Error: {telegram_err}")
+            # Try fallback copy
+            try:
+                await app.copy_message(int(user_id), CHANNEL_ID, b['msg_id'])
+                return jsonify({"status": "ok"})
+            except:
+                return jsonify({"status": "error", "message": "Could not send to Telegram (Bot blocked?)"}), 500
+
+    except Exception as e:
+        logger.error(f"API Error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 # --- HELPERS ---
 
@@ -144,9 +213,6 @@ def get_display_title(book_doc):
 def get_button_label(book_doc):
     full = get_display_title(book_doc)
     return re.sub(r'\s+(c|ch|chap|vol|v)\.?\s*\d+(?:[-–]\d+)?.*$', '', full, flags=re.IGNORECASE).strip()
-
-def len_utf16(text):
-    return len(text.encode('utf-16-le')) // 2
 
 # --- EPUB PARSER ---
 def parse_epub_direct(file_path):
@@ -296,6 +362,20 @@ async def indexing_process(client, start_id, end_id, status_msg):
 
 # --- TELEGRAM HANDLERS ---
 
+@app.on_message(filters.command("url"))
+async def url_command(client, message):
+    # Generate secure token for this specific user
+    token = serializer.dumps(message.from_user.id)
+    # Construct the login URL
+    login_url = f"{PUBLIC_URL}/login?token={token}"
+    
+    await message.reply(
+        f"🔗 **Your Personal Website Link**\n\n"
+        f"Click this link to access the library. It will log you in automatically so downloads are sent to this chat.\n\n"
+        f"{login_url}",
+        disable_web_page_preview=True
+    )
+
 @app.on_message(filters.command("start"))
 async def start_handler(client, message):
     if len(message.command) > 1:
@@ -315,7 +395,7 @@ async def start_handler(client, message):
                 await message.reply(f"❌ Error fetching file: {e}")
                 return
 
-    await message.reply("MTL Novels Search Engine [send query to search]")
+    await message.reply("MTL Novels Search Engine [send query to search]\nType /url to get your website link.")
 
 @app.on_message(filters.command("stats"))
 async def stats_handler(client, message):
@@ -341,7 +421,67 @@ async def stop_cmd(client, message):
     global indexing_active; indexing_active = False
     await message.reply("🛑 Stopping...")
 
-@app.on_message(filters.text & filters.incoming & ~filters.command(["start", "stats", "index", "stop_index", "export", "import", "migrate"]))
+@app.on_message(filters.command("export") & filters.user(ADMIN_ID))
+async def export_cmd(client, message):
+    s = await message.reply("📦 Exporting...")
+    try:
+        with open("lib.json", 'w') as f:
+            f.write('[')
+            first = True
+            async for d in collection.find({}):
+                if not first: f.write(',')
+                first = False
+                if d.get('cover_image'): d['cover_image'] = base64.b64encode(d['cover_image']).decode()
+                d['_id'] = str(d['_id'])
+                json.dump(d, f)
+            f.write(']')
+        with zipfile.ZipFile("lib.zip", 'w', zipfile.ZIP_DEFLATED) as z: z.write("lib.json")
+        await client.send_document(message.chat.id, "lib.zip", caption="✅ Backup")
+    except Exception as e:
+        await s.edit(f"❌ {e}")
+    finally:
+        if os.path.exists("lib.json"): os.remove("lib.json")
+        if os.path.exists("lib.zip"): os.remove("lib.zip")
+
+@app.on_message(filters.command("import") & filters.user(ADMIN_ID))
+async def import_cmd(client, message):
+    if not message.reply_to_message or not message.reply_to_message.document: return await message.reply("Reply file.")
+    s = await message.reply("📥 Importing...")
+    path = await message.reply_to_message.download()
+    try:
+        if zipfile.is_zipfile(path):
+            with zipfile.ZipFile(path, 'r') as z: z.extractall(); path = z.namelist()[0]
+        with open(path, 'r') as f: data = json.load(f)
+        for c in [data[i:i+50] for i in range(0,len(data),50)]:
+            for x in c:
+                if x.get('cover_image'): 
+                    try: x['cover_image'] = base64.b64decode(x['cover_image'])
+                    except: x['cover_image'] = None
+                if '_id' in x: del x['_id']
+                try: await collection.replace_one({"file_unique_id":x['file_unique_id']},x,upsert=True)
+                except: pass
+        await s.edit("✅ Done")
+    except Exception as e:
+        await s.edit(f"❌ {e}")
+    finally:
+        if os.path.exists(path): os.remove(path)
+
+@app.on_message(filters.command("migrate") & filters.user(ADMIN_ID))
+async def migrate_cmd(client, message):
+    if not legacy_collections: return await message.reply("❌ No Legacy")
+    s = await message.reply("🚀 Migrating...")
+    t=0
+    for c in legacy_collections:
+        async for d in c.find({}):
+            if '_id' in d: del d['_id']
+            try: await collection.insert_one(d); t+=1
+            except: pass
+            if t%100==0:
+                try: await s.edit(f"📥 {t}")
+                except: pass
+    await s.edit(f"✅ {t} Done")
+
+@app.on_message(filters.text & filters.incoming & ~filters.command(["start", "stats", "index", "stop_index", "export", "import", "migrate", "url"]))
 async def search_handler(client, message):
     q = message.text.strip()
     if len(q) > 100: return

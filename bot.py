@@ -38,7 +38,8 @@ try:
     if not AZURE_URL: raise ValueError("Missing AZURE_URL")
     
     PORT = int(os.environ.get("PORT", 8080))
-    PUBLIC_URL = os.environ.get("PUBLIC_URL") or f"http://localhost:{PORT}"
+    # Default to localhost if not set, for safety
+    PUBLIC_URL = os.environ.get("PUBLIC_URL") or f"http://0.0.0.0:{PORT}"
     SECRET_KEY = os.environ.get("SECRET_KEY", "CHANGE_THIS_TO_RANDOM_STRING")
 
     DB_NAME = os.environ.get("DB_NAME", "novel_library")
@@ -72,7 +73,7 @@ app = Client(
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
-    sleep_threshold=60 
+    sleep_threshold=60
 )
 
 # --- GLOBAL STATE ---
@@ -90,6 +91,15 @@ def get_user_from_cookie():
         return user_id
     except:
         return None
+
+def get_display_title(book_doc):
+    db_title = book_doc.get('title')
+    if db_title and db_title.strip() and db_title != "Unknown Title":
+        return db_title.strip()
+    fname = book_doc.get('file_name')
+    if fname:
+        return fname.replace('.epub', '').replace('_', ' ').replace('-', ' ').strip()
+    return "Unknown Book"
 
 # --- WEB ROUTES ---
 
@@ -124,8 +134,25 @@ async def search():
         return await render_template('index.html', query="", results=[], count=0, user_id=user_id, bot_username=BOT_USERNAME)
     
     try:
+        # STRATEGY 1: Full Text Search
         cnt = await collection.count_documents({"$text": {"$search": query}})
-        cursor = collection.find({"$text": {"$search": query}}).sort([("score", {"$meta": "textScore"})])
+        
+        if cnt > 0:
+            cursor = collection.find({"$text": {"$search": query}}).sort([("score", {"$meta": "textScore"})])
+        else:
+            # STRATEGY 2: Regex Fallback
+            reg_query = {"$regex": query, "$options": "i"}
+            fallback_filter = {
+                "$or": [
+                    {"title": reg_query},
+                    {"author": reg_query},
+                    {"file_name": reg_query}
+                ]
+            }
+            cnt = await collection.count_documents(fallback_filter)
+            cursor = collection.find(fallback_filter)
+
+        # Limit web results
         books_cursor = await cursor.limit(50).to_list(length=50)
         
         results = []
@@ -135,6 +162,7 @@ async def search():
                 cover_b64 = base64.b64encode(b['cover_image']).decode('utf-8')
             
             syn = b.get('synopsis', 'No synopsis available.').strip()
+            # If > 300 chars, we show the "Read More" button
             has_more = len(syn) > 300
             
             results.append({
@@ -155,13 +183,14 @@ async def search():
             bot_username=BOT_USERNAME
         )
     except Exception as e:
-        return await render_template('index.html', query=query, results=[], count=0, error=str(e), user_id=user_id)
+        logger.error(f"Search Error: {e}")
+        return await render_template('index.html', query=query, results=[], count=0, error="An error occurred during search.", user_id=user_id)
 
 @web_app.route('/api/download/<book_id>')
 async def api_download(book_id):
     user_id = get_user_from_cookie()
     if not user_id:
-        return jsonify({"status": "error", "message": "Not logged in"}), 401
+        return jsonify({"status": "error", "message": "Not logged in. Use /url in bot."}), 401
     
     try:
         b = await collection.find_one({"_id": ObjectId(book_id)})
@@ -169,6 +198,7 @@ async def api_download(book_id):
             return jsonify({"status": "error", "message": "Book not found"}), 404
         
         try:
+            # Send file to the logged-in user ID
             await app.send_document(
                 chat_id=int(user_id),
                 document=b['file_id'],
@@ -178,17 +208,18 @@ async def api_download(book_id):
             return jsonify({"status": "ok"})
         except Exception as telegram_err:
             logger.error(f"Telegram Send Error: {telegram_err}")
+            # If sending failed (e.g. privacy), try forwarding/copying
             try:
                 await app.copy_message(int(user_id), CHANNEL_ID, b['msg_id'])
                 return jsonify({"status": "ok"})
             except:
-                return jsonify({"status": "error", "message": "Could not send to Telegram (Bot blocked?)"}), 500
+                return jsonify({"status": "error", "message": "Could not send file. Is the bot blocked?"}), 500
 
     except Exception as e:
         logger.error(f"API Error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
-# --- HELPERS ---
+# --- BOT HELPERS ---
 
 async def ensure_indexes():
     try:
@@ -196,15 +227,6 @@ async def ensure_indexes():
         await collection.create_index("file_unique_id", unique=True)
         await collection.create_index("msg_id")
     except: pass
-
-def get_display_title(book_doc):
-    db_title = book_doc.get('title')
-    if db_title and db_title.strip() and db_title != "Unknown Title":
-        return db_title.strip()
-    fname = book_doc.get('file_name')
-    if fname:
-        return fname.replace('.epub', '').replace('_', ' ').replace('-', ' ').strip()
-    return "Unknown Book"
 
 def get_button_label(book_doc):
     full = get_display_title(book_doc)
@@ -224,7 +246,9 @@ def parse_epub_direct(file_path):
             except: pass
             if not opf_path:
                 for n in z.namelist():
-                    if n.endswith('.opf'): opf_path = n; break
+                    if n.endswith('.opf'): 
+                        opf_path = n
+                        break
             if not opf_path: return meta
 
             try:
@@ -245,17 +269,23 @@ def parse_epub_direct(file_path):
             if manifest:
                 for item in manifest:
                     props = item.get('properties', '').lower()
-                    if 'cover-image' in props: cover_href = item.get('href'); break
+                    if 'cover-image' in props: 
+                        cover_href = item.get('href')
+                        break
             if not cover_href:
                 for elem in root.iter():
                     if elem.tag.split('}')[-1].lower() == 'meta' and elem.get('name') == 'cover':
                         cid = elem.get('content')
                         if manifest:
                             for item in manifest:
-                                if item.get('id') == cid: cover_href = item.get('href'); break
+                                if item.get('id') == cid: 
+                                    cover_href = item.get('href')
+                                    break
             if not cover_href:
                 for n in z.namelist():
-                    if 'cover' in n.lower() and n.endswith(('.jpg','.png')): cover_href = n; break
+                    if 'cover' in n.lower() and n.endswith(('.jpg','.png')): 
+                        cover_href = n
+                        break
             
             if cover_href:
                 try:
@@ -270,7 +300,9 @@ def parse_epub_direct(file_path):
                         try:
                             soup = BeautifulSoup(z.read(n), 'html.parser')
                             ps = soup.find_all('p')
-                            if ps: meta['synopsis'] = "\n".join([p.text for p in ps[:6]]); break
+                            if ps: 
+                                meta['synopsis'] = "\n".join([p.text for p in ps[:6]])
+                                break
                         except: pass
     except: pass
     if meta['tags'].endswith(", "): meta['tags'] = meta['tags'][:-2]
@@ -278,9 +310,7 @@ def parse_epub_direct(file_path):
 
 # --- INDEXING PROCESS ---
 async def indexing_process(client, start_id, end_id, status_msg):
-    # !!! CRITICAL: Global declaration ONLY here at top !!!
     global indexing_active, files_found, files_saved
-    
     files_found = 0
     files_saved = 0
     queue = asyncio.Queue(maxsize=30)
@@ -292,7 +322,6 @@ async def indexing_process(client, start_id, end_id, status_msg):
             pass
 
     async def worker():
-        # Inner function needs to modify global counter, so we declare it here
         global files_saved
         while indexing_active:
             try:
@@ -358,7 +387,6 @@ async def indexing_process(client, start_id, end_id, status_msg):
                 if messages:
                     for message in messages:
                         if message and message.document and message.document.file_name and message.document.file_name.endswith('.epub'):
-                            # DIRECT INCREMENT (No 'global' keyword needed here as it's in local scope via outer func)
                             files_found += 1
                             await queue.put(message)
             except FloodWait as e:
@@ -383,34 +411,35 @@ async def indexing_process(client, start_id, end_id, status_msg):
 
 @app.on_message(filters.command("url"))
 async def url_command(client, message):
-    token = serializer.dumps(message.from_user.id)
-    login_url = f"{PUBLIC_URL}/login?token={token}"
-    await message.reply(
-        f"🔗 **Your Personal Website Link**\n\n"
-        f"Click this link to access the library. It will log you in automatically so downloads are sent to this chat.\n\n"
-        f"{login_url}",
-        disable_web_page_preview=True
-    )
+    logger.info(f"CMD /url from {message.from_user.id}")
+    try:
+        token = serializer.dumps(message.from_user.id)
+        login_url = f"{PUBLIC_URL}/login?token={token}"
+        await message.reply(
+            f"🔗 **Your Personal Website Link**\n\n"
+            f"Click this link to access the library. It will log you in automatically so downloads are sent to this chat.\n\n"
+            f"{login_url}",
+            disable_web_page_preview=True
+        )
+    except Exception as e:
+        logger.error(f"Error in /url: {e}")
 
 @app.on_message(filters.command("start"))
 async def start_handler(client, message):
-    if len(message.command) > 1:
-        param = message.command[1]
-        if param.startswith("d_"):
-            try:
-                book_id = param.split("_", 1)[1]
-                b = await collection.find_one({"_id": ObjectId(book_id)})
-                if b:
-                    await client.send_document(
-                        chat_id=message.chat.id,
-                        document=b['file_id'],
-                        caption=f"📖 {get_display_title(b)}"
-                    )
-                    return 
-            except Exception as e:
-                await message.reply(f"❌ Error fetching file: {e}")
-                return
-
+    logger.info(f"CMD /start from {message.from_user.id}")
+    if len(message.command) > 1 and message.command[1].startswith("d_"):
+        try:
+            book_id = message.command[1].split("_", 1)[1]
+            b = await collection.find_one({"_id": ObjectId(book_id)})
+            if b:
+                await client.send_document(
+                    message.chat.id, 
+                    b['file_id'], 
+                    caption=f"📖 {get_display_title(b)}"
+                )
+                return 
+        except: pass
+    
     await message.reply("MTL Novels Search Engine [send query to search]\nType /url to get your website link.")
 
 @app.on_message(filters.command("stats"))
@@ -511,16 +540,18 @@ async def search_handler(client, message):
     if not real_q: return
     
     try:
-        try:
-            cnt = await collection.count_documents({"$text": {"$search": real_q}})
-            if cnt>0: cur = collection.find({"$text": {"$search": real_q}}).sort([("score", {"$meta": "textScore"})])
-            else: raise Exception
-        except:
-            reg = {"$or": [{"title": {"$regex": real_q, "$options": "i"}}, {"file_name": {"$regex": real_q, "$options": "i"}}]}
-            cnt = await collection.count_documents(reg)
-            cur = collection.find(reg)
+        # 1. Full Text Search
+        cnt = await collection.count_documents({"$text": {"$search": real_q}})
+        if cnt > 0:
+            cursor = collection.find({"$text": {"$search": real_q}}).sort([("score", {"$meta": "textScore"})])
+        else:
+            # 2. Regex Fallback
+            reg = {"$regex": real_q, "$options": "i"}
+            reg_filter = {"$or": [{"title": reg}, {"file_name": reg}]}
+            cnt = await collection.count_documents(reg_filter)
+            cursor = collection.find(reg_filter)
         
-        res = await cur.limit(8).to_list(length=8)
+        res = await cursor.limit(8).to_list(length=8)
         if not res: return await message.reply("❌ No matches.")
 
         sq = html.escape(real_q)
@@ -555,14 +586,20 @@ async def callback_handler(client, callback_query):
 
             try:
                 cnt = await collection.count_documents({"$text": {"$search": real_q}})
-                if cnt>0: cur = collection.find({"$text": {"$search": real_q}}).sort([("score", {"$meta": "textScore"})])
-                else: raise Exception
+                if cnt > 0:
+                    cursor = collection.find({"$text": {"$search": real_q}}).sort([("score", {"$meta": "textScore"})])
+                else:
+                    reg = {"$regex": real_q, "$options": "i"}
+                    reg_filter = {"$or": [{"title": reg}, {"file_name": reg}]}
+                    cnt = await collection.count_documents(reg_filter)
+                    cursor = collection.find(reg_filter)
             except:
-                reg = {"$or": [{"title": {"$regex": real_q, "$options": "i"}}, {"file_name": {"$regex": real_q, "$options": "i"}}]}
-                cnt = await collection.count_documents(reg)
-                cur = collection.find(reg)
+                reg = {"$regex": real_q, "$options": "i"}
+                reg_filter = {"$or": [{"title": reg}, {"file_name": reg}]}
+                cnt = await collection.count_documents(reg_filter)
+                cursor = collection.find(reg_filter)
             
-            res = await cur.skip(p*8).limit(8).to_list(length=8)
+            res = await cursor.skip(p*8).limit(8).to_list(length=8)
             if not res: return await callback_query.answer("End.", show_alert=True)
             
             btns = []
@@ -629,27 +666,28 @@ async def callback_handler(client, callback_query):
                 except: await callback_query.answer("File lost.", show_alert=True)
         except: pass
 
-async def bot_startup_task():
-    try:
-        await app.start()
-        global BOT_USERNAME
-        me = await app.get_me()
-        BOT_USERNAME = me.username
-        logger.info(f"✅ Bot Started: {BOT_USERNAME}")
-    except Exception as e:
-        logger.error(f"❌ Bot Failed to Start: {e}")
+async def start_bot():
+    logger.info("🤖 Starting Telegram Bot...")
+    await app.start()
+    global BOT_USERNAME
+    me = await app.get_me()
+    BOT_USERNAME = me.username
+    logger.info(f"✅ Bot Started as @{BOT_USERNAME}")
+    # Keep bot running
+    while True:
+        await asyncio.sleep(3600)
 
 async def main():
     await ensure_indexes()
+    logger.info("🚀 Launching Web Server and Bot...")
+    web_config = Config()
+    web_config.bind = [f"0.0.0.0:{PORT}"]
     
-    asyncio.create_task(bot_startup_task())
-    
-    logger.info("✅ Starting Web Server...")
-    hypercorn_config = Config()
-    hypercorn_config.bind = [f"0.0.0.0:{PORT}"]
-    await serve(web_app, hypercorn_config)
-    
-    await app.stop()
+    # Run both simultaneously
+    await asyncio.gather(
+        serve(web_app, web_config),
+        start_bot()
+    )
 
 if __name__ == '__main__':
     asyncio.run(main())

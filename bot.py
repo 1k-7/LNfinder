@@ -49,8 +49,12 @@ except Exception as e:
     print(f"❌ CONFIG ERROR: {e}")
     exit(1)
 
+# --- LOGGING SETUP ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+# Reduce noise from libraries
+logging.getLogger("pyrogram").setLevel(logging.WARNING)
+logging.getLogger("hypercorn").setLevel(logging.INFO)
 warnings.filterwarnings("ignore")
 
 # --- DATABASE SETUP ---
@@ -68,12 +72,14 @@ web_app = Quart(__name__, template_folder='template')
 serializer = URLSafeTimedSerializer(SECRET_KEY)
 
 # --- TELEGRAM APP INIT ---
-# Using official Pyrogram with persistent session storage
+# Ensure session directory exists
 if not os.path.exists("sessions"):
     os.makedirs("sessions")
 
+# FIXED: Removed in_memory=True to prevent Auth Key spam/Shadowban
+# FIXED: Pointed session to the volume path
 app = Client(
-    "sessions/novel_bot_session",  # Saves to /app/sessions/novel_bot_session.session
+    "sessions/novel_bot_session",
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
@@ -85,6 +91,27 @@ indexing_active = False
 files_found = 0
 files_saved = 0
 BOT_USERNAME = None
+
+# --- LIFECYCLE HOOKS (THE PROPER FIX) ---
+
+@web_app.before_serving
+async def startup():
+    """Starts the Telegram Client when the Web Server starts."""
+    logger.info("🤖 Starting Telegram Bot via Lifecycle Hook...")
+    await ensure_indexes()
+    await app.start()
+    
+    global BOT_USERNAME
+    me = await app.get_me()
+    BOT_USERNAME = me.username
+    logger.info(f"✅ Bot Started as @{BOT_USERNAME}")
+
+@web_app.after_serving
+async def cleanup():
+    """Stops the Telegram Client when the Web Server stops."""
+    logger.info("🛑 Stopping Telegram Bot...")
+    if app.is_connected:
+        await app.stop()
 
 # --- WEB HELPERS ---
 def get_user_from_cookie():
@@ -493,10 +520,9 @@ async def import_cmd(client, message):
 
 @app.on_message(filters.command("migrate") & filters.user(ADMIN_ID))
 async def migrate_cmd(client, message):
-    # This command relied on a 'legacy_collections' variable which was not defined in the source provided.
-    # Leaving logic intact but it will fail if legacy_collections is missing.
     try:
-        if not legacy_collections: return await message.reply("❌ No Legacy")
+        # Assuming legacy_collections would be defined globally if used
+        if 'legacy_collections' not in globals() or not legacy_collections: return await message.reply("❌ No Legacy")
         s = await message.reply("🚀 Migrating...")
         t=0
         for c in legacy_collections:
@@ -508,8 +534,8 @@ async def migrate_cmd(client, message):
                     try: await s.edit(f"📥 {t}")
                     except: pass
         await s.edit(f"✅ {t} Done")
-    except NameError:
-        await message.reply("❌ Legacy collections not defined in code.")
+    except Exception as e:
+         await message.reply(f"❌ Error: {e}")
 
 @app.on_message(filters.text & filters.incoming & ~filters.command(["start", "stats", "index", "stop_index", "export", "import", "migrate", "url"]))
 async def search_handler(client, message):
@@ -642,25 +668,12 @@ async def callback_handler(client, callback_query):
                 except: await callback_query.answer("File lost.", show_alert=True)
         except: pass
 
-async def start_bot():
-    logger.info("🤖 Starting Telegram Bot...")
-    await app.start()
-    global BOT_USERNAME
-    me = await app.get_me()
-    BOT_USERNAME = me.username
-    logger.info(f"✅ Bot Started as @{BOT_USERNAME}")
-    while True: await asyncio.sleep(3600)
-
 async def main():
-    await ensure_indexes()
-    logger.info("🚀 Launching Web Server and Bot...")
+    logger.info("🚀 Launching Web Server with Integrated Bot...")
     web_config = Config()
     web_config.bind = [f"0.0.0.0:{PORT}"]
-    
-    await asyncio.gather(
-        serve(web_app, web_config),
-        start_bot()
-    )
+    # Hypercorn now manages the loop and triggers the 'before_serving' hook
+    await serve(web_app, web_config)
 
 if __name__ == '__main__':
     asyncio.run(main())

@@ -1,4 +1,5 @@
 import asyncio
+import math
 import os
 import logging
 import warnings
@@ -66,7 +67,6 @@ web_app = Quart(__name__, template_folder='template')
 serializer = URLSafeTimedSerializer(SECRET_KEY)
 
 # --- TELEGRAM APP INIT ---
-# in_memory=True is CRITICAL for containers to prevent "New Auth Key" loops
 app = Client(
     "novel_bot_session",
     api_id=API_ID,
@@ -101,7 +101,7 @@ def get_display_title(book_doc):
         return fname.replace('.epub', '').replace('_', ' ').replace('-', ' ').strip()
     return "Unknown Book"
 
-# --- LIFECYCLE HOOKS (THE FIX) ---
+# --- LIFECYCLE HOOKS ---
 @web_app.before_serving
 async def start_bot():
     """Starts the bot when the web server starts."""
@@ -159,7 +159,7 @@ async def search():
         if cnt > 0:
             cursor = collection.find({"$text": {"$search": query}}).sort([("score", {"$meta": "textScore"})])
         else:
-            # 2. Regex Fallback (Fuzzy Search)
+            # 2. Regex Fallback
             reg = {"$regex": query, "$options": "i"}
             fallback = {"$or": [{"title": reg}, {"author": reg}, {"file_name": reg}]}
             cnt = await collection.count_documents(fallback)
@@ -220,6 +220,10 @@ async def ensure_indexes():
         await collection.create_index("file_unique_id", unique=True)
         await collection.create_index("msg_id")
     except: pass
+
+def get_button_label(book_doc):
+    full = get_display_title(book_doc)
+    return re.sub(r'\s+(c|ch|chap|vol|v)\.?\s*\d+(?:[-–]\d+)?.*$', '', full, flags=re.IGNORECASE).strip()
 
 def parse_epub_direct(file_path):
     meta = {"title": None, "author": "Unknown", "synopsis": "No synopsis.", "tags": "", "cover_image": None}
@@ -293,7 +297,10 @@ async def indexing_process(client, start_id, end_id, status_msg):
     queue = asyncio.Queue(maxsize=30)
     
     if status_msg: 
-        try: await status_msg.edit(f"🚀 **Starting Scan...**\nRange: {start_id} - {end_id}"); except: pass
+        try: 
+            await status_msg.edit(f"🚀 **Starting Scan...**\nRange: {start_id} - {end_id}")
+        except: 
+            pass
 
     async def worker():
         global files_saved
@@ -302,9 +309,14 @@ async def indexing_process(client, start_id, end_id, status_msg):
                 message = await queue.get()
                 temp_filename = f"temp_{message.id}.epub"
                 path = None
-                try: path = await client.download_media(message, file_name=temp_filename)
-                except: queue.task_done(); continue
-                if not path: queue.task_done(); continue
+                try: 
+                    path = await client.download_media(message, file_name=temp_filename)
+                except: 
+                    queue.task_done()
+                    continue
+                if not path: 
+                    queue.task_done()
+                    continue
 
                 meta = await asyncio.to_thread(parse_epub_direct, path)
                 if os.path.exists(path): os.remove(path)
@@ -340,7 +352,10 @@ async def indexing_process(client, start_id, end_id, status_msg):
             ids_to_fetch = list(range(current_id, batch_end))
             
             if status_msg and (current_id % 100 == 0):
-                try: await status_msg.edit(f"🔄 **Scanning...**\nID: `{current_id}`\nFound: `{files_found}`\nSaved: `{files_saved}`"); except: pass
+                try: 
+                    await status_msg.edit(f"🔄 **Scanning...**\nID: `{current_id}`\nFound: `{files_found}`\nSaved: `{files_saved}`")
+                except: 
+                    pass
 
             if not ids_to_fetch: break
             try:
@@ -348,18 +363,24 @@ async def indexing_process(client, start_id, end_id, status_msg):
                 if messages:
                     for message in messages:
                         if message and message.document and message.document.file_name and message.document.file_name.endswith('.epub'):
-                            # REMOVED DUPLICATE GLOBAL HERE - Corrected
                             files_found += 1
                             await queue.put(message)
-            except FloodWait as e: await asyncio.sleep(e.value + 1); continue 
-            except: pass
+            except FloodWait as e: 
+                await asyncio.sleep(e.value + 1)
+                continue 
+            except: 
+                pass
             current_id += BATCH_SIZE
             await asyncio.sleep(2) 
         await queue.join()
     finally:
         for w in workers: w.cancel()
         indexing_active = False
-        if status_msg: try: await status_msg.edit(f"✅ **Done!**\nScanned: `{end_id}`\nFound: `{files_found}`\nSaved: `{files_saved}`"); except: pass
+        if status_msg: 
+            try: 
+                await status_msg.edit(f"✅ **Done!**\nScanned: `{end_id}`\nFound: `{files_found}`\nSaved: `{files_saved}`")
+            except: 
+                pass
 
 # --- TELEGRAM HANDLERS ---
 
@@ -387,7 +408,6 @@ async def start_handler(client, message):
 
 @app.on_message(filters.command("stats"))
 async def stats_handler(client, message):
-    logger.info("CMD /stats")
     try:
         c = await collection.count_documents({})
         cv = await collection.count_documents({"cover_image": {"$ne": None}})

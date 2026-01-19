@@ -279,7 +279,7 @@ async def indexing_process(client, start_id, end_id, status_msg):
     files_found = 0; files_saved = 0
     queue = asyncio.Queue(maxsize=30)
     
-    if status_msg: 
+    if status_msg:
         try:
             await status_msg.edit(f"🚀 **Starting Scan...**\nRange: {start_id} - {end_id}")
         except:
@@ -580,7 +580,4 @@ async def main():
     await app.stop()
 
 if __name__ == '__main__':
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+    app.run(main())

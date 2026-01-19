@@ -13,7 +13,7 @@ import base64
 import urllib.request 
 import xml.etree.ElementTree as ET
 from bs4 import BeautifulSoup
-# --- ADDED MISSING IMPORT BELOW ---
+# --- IMPORT RESTORED ---
 from bson.objectid import ObjectId 
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.errors import DuplicateKeyError
@@ -41,7 +41,6 @@ try:
     AZURE_URL = os.environ.get("AZURE_URL")
     if not AZURE_URL: raise ValueError("Missing AZURE_URL")
     
-    # Support Legacy URI splitting if needed
     LEGACY_STR = os.environ.get("MONGO_URI") or os.environ.get("MONGO_URL") or ""
     LEGACY_URIS = LEGACY_STR.split() if LEGACY_STR else []
     
@@ -58,7 +57,6 @@ except Exception as e:
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-# Silence noisy logs
 logging.getLogger("pyrogram").setLevel(logging.WARNING)
 logging.getLogger("hypercorn").setLevel(logging.INFO)
 warnings.filterwarnings("ignore")
@@ -582,7 +580,5 @@ async def main():
     await app.stop()
 
 if __name__ == '__main__':
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+    # RESTORED TO WORKING EXECUTION METHOD
+    app.run(main())

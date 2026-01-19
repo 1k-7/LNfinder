@@ -15,7 +15,7 @@ from bs4 import BeautifulSoup
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.errors import DuplicateKeyError
 
-# --- PYROBLACK IMPORTS (Match Working Code) ---
+# --- PYROBLACK IMPORTS ---
 from pyrogram import Client, filters, idle
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
 from pyrogram.enums import ParseMode
@@ -603,12 +603,6 @@ async def main():
     
     logger.info("🤖 Starting Telegram Bot (Working Version)...")
     await app.start()
-
-    # --- CRITICAL FIX FOR SILENT FAILURE ---
-    # Sometimes a stuck webhook prevents getUpdates from working.
-    # This deletes it to ensure polling works.
-    logger.info("🧹 Ensuring no stale webhooks exist...")
-    await app.delete_webhook()
 
     global BOT_USERNAME
     me = await app.get_me()

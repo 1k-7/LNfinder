@@ -10,7 +10,7 @@ import re
 import random
 import json
 import base64
-import urllib.request # Added for manual webhook deletion
+import urllib.request 
 import xml.etree.ElementTree as ET
 from bs4 import BeautifulSoup
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -278,9 +278,12 @@ async def indexing_process(client, start_id, end_id, status_msg):
     global indexing_active, files_found, files_saved
     files_found = 0; files_saved = 0
     queue = asyncio.Queue(maxsize=30)
+    
     if status_msg: 
-        try: await status_msg.edit(f"🚀 **Starting Scan...**\nRange: {start_id} - {end_id}")
-        except: pass
+        try:
+            await status_msg.edit(f"🚀 **Starting Scan...**\nRange: {start_id} - {end_id}")
+        except:
+            pass
 
     async def worker():
         global files_saved
@@ -320,8 +323,10 @@ async def indexing_process(client, start_id, end_id, status_msg):
             batch_end = min(current_id + BATCH_SIZE, end_id + 1)
             ids_to_fetch = list(range(current_id, batch_end))
             if status_msg and (current_id % 100 == 0):
-                try: await status_msg.edit(f"🔄 **Scanning...**\nID: `{current_id}`\nFound: `{files_found}`\nSaved: `{files_saved}`")
-                except: pass
+                try:
+                    await status_msg.edit(f"🔄 **Scanning...**\nID: `{current_id}`\nFound: `{files_found}`\nSaved: `{files_saved}`")
+                except:
+                    pass
             if not ids_to_fetch: break
             try:
                 messages = await client.get_messages(CHANNEL_ID, ids_to_fetch)
@@ -338,8 +343,11 @@ async def indexing_process(client, start_id, end_id, status_msg):
     finally:
         for w in workers: w.cancel()
         indexing_active = False
-        if status_msg: try: await status_msg.edit(f"✅ **Done!**\nScanned: `{end_id}`\nFound: `{files_found}`\nSaved: `{files_saved}`")
-        except: pass
+        if status_msg:
+            try:
+                await status_msg.edit(f"✅ **Done!**\nScanned: `{end_id}`\nFound: `{files_found}`\nSaved: `{files_saved}`")
+            except:
+                pass
 
 # --- TELEGRAM HANDLERS ---
 
@@ -548,7 +556,6 @@ async def main():
     await app.start()
     
     # --- CRITICAL FIX FOR GHOST WEBHOOK (MANUAL) ---
-    # This uses Raw HTTP, bypassing pyroblack's missing delete_webhook method.
     try:
         logger.info("🧹 Nuking Webhook (Raw HTTP)...")
         with urllib.request.urlopen(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook?drop_pending_updates=True") as response:

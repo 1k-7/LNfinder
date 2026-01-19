@@ -16,7 +16,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.errors import DuplicateKeyError
 
 # --- PYROGRAM IMPORTS ---
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.enums import ParseMode
 from pyrogram.errors import FloodWait
@@ -49,10 +49,9 @@ except Exception as e:
     print(f"❌ CONFIG ERROR: {e}")
     exit(1)
 
-# --- LOGGING SETUP ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-# Reduce noise from libraries
+# Reduce noise
 logging.getLogger("pyrogram").setLevel(logging.WARNING)
 logging.getLogger("hypercorn").setLevel(logging.INFO)
 warnings.filterwarnings("ignore")
@@ -72,12 +71,11 @@ web_app = Quart(__name__, template_folder='template')
 serializer = URLSafeTimedSerializer(SECRET_KEY)
 
 # --- TELEGRAM APP INIT ---
-# Ensure session directory exists
 if not os.path.exists("sessions"):
     os.makedirs("sessions")
 
-# FIXED: Removed in_memory=True to prevent Auth Key spam/Shadowban
-# FIXED: Pointed session to the volume path
+# KEY FIX: Persistent session path. 
+# Do NOT use in_memory=True, it causes "New Auth Key" spam and shadowbans.
 app = Client(
     "sessions/novel_bot_session",
     api_id=API_ID,
@@ -91,27 +89,6 @@ indexing_active = False
 files_found = 0
 files_saved = 0
 BOT_USERNAME = None
-
-# --- LIFECYCLE HOOKS (THE PROPER FIX) ---
-
-@web_app.before_serving
-async def startup():
-    """Starts the Telegram Client when the Web Server starts."""
-    logger.info("🤖 Starting Telegram Bot via Lifecycle Hook...")
-    await ensure_indexes()
-    await app.start()
-    
-    global BOT_USERNAME
-    me = await app.get_me()
-    BOT_USERNAME = me.username
-    logger.info(f"✅ Bot Started as @{BOT_USERNAME}")
-
-@web_app.after_serving
-async def cleanup():
-    """Stops the Telegram Client when the Web Server stops."""
-    logger.info("🛑 Stopping Telegram Bot...")
-    if app.is_connected:
-        await app.stop()
 
 # --- WEB HELPERS ---
 def get_user_from_cookie():
@@ -520,11 +497,13 @@ async def import_cmd(client, message):
 
 @app.on_message(filters.command("migrate") & filters.user(ADMIN_ID))
 async def migrate_cmd(client, message):
+    # Fixed error where legacy_collections might be undefined
+    if 'legacy_collections' not in globals() or not legacy_collections: 
+        return await message.reply("❌ No Legacy Collections defined.")
+    
+    s = await message.reply("🚀 Migrating...")
+    t=0
     try:
-        # Assuming legacy_collections would be defined globally if used
-        if 'legacy_collections' not in globals() or not legacy_collections: return await message.reply("❌ No Legacy")
-        s = await message.reply("🚀 Migrating...")
-        t=0
         for c in legacy_collections:
             async for d in c.find({}):
                 if '_id' in d: del d['_id']
@@ -535,7 +514,7 @@ async def migrate_cmd(client, message):
                     except: pass
         await s.edit(f"✅ {t} Done")
     except Exception as e:
-         await message.reply(f"❌ Error: {e}")
+        await s.edit(f"❌ Error: {e}")
 
 @app.on_message(filters.text & filters.incoming & ~filters.command(["start", "stats", "index", "stop_index", "export", "import", "migrate", "url"]))
 async def search_handler(client, message):
@@ -669,11 +648,35 @@ async def callback_handler(client, callback_query):
         except: pass
 
 async def main():
-    logger.info("🚀 Launching Web Server with Integrated Bot...")
+    await ensure_indexes()
+    
+    # 1. Start Pyrogram Client FIRST to ensure handlers are ready
+    logger.info("🤖 Starting Telegram Bot...")
+    await app.start()
+    
+    global BOT_USERNAME
+    me = await app.get_me()
+    BOT_USERNAME = me.username
+    logger.info(f"✅ Bot Started as @{BOT_USERNAME}")
+
+    # 2. Start Web Server as a non-blocking background task
+    # This prevents Hypercorn's loop management from interfering with Pyrogram
+    logger.info("🚀 Launching Web Server...")
     web_config = Config()
     web_config.bind = [f"0.0.0.0:{PORT}"]
-    # Hypercorn now manages the loop and triggers the 'before_serving' hook
-    await serve(web_app, web_config)
+    
+    server_task = asyncio.create_task(serve(web_app, web_config))
+    
+    # 3. Use Pyrogram's idle() to manage the lifecycle and signals (Ctrl+C)
+    await idle()
+    
+    # 4. Graceful Cleanup
+    logger.info("🛑 Shutting down...")
+    await app.stop()
+    server_task.cancel()
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass

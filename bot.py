@@ -13,6 +13,8 @@ import base64
 import urllib.request 
 import xml.etree.ElementTree as ET
 from bs4 import BeautifulSoup
+# --- ADDED MISSING IMPORT BELOW ---
+from bson.objectid import ObjectId 
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.errors import DuplicateKeyError
 
@@ -580,4 +582,7 @@ async def main():
     await app.stop()
 
 if __name__ == '__main__':
-    app.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass

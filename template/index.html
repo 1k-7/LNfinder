@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>LN Serve</title>
+    <title>Library</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
         :root {
@@ -132,7 +132,9 @@
             display: flex;
             border: 1px solid var(--border);
             transition: transform 0.2s, box-shadow 0.2s;
-            height: 180px; /* Fixed height for consistency */
+            min-height: 180px; /* CHANGED: min-height to allow expansion */
+            height: auto;
+            position: relative;
         }
 
         .card:hover {
@@ -144,7 +146,7 @@
         .card-cover {
             width: 120px;
             min-width: 120px;
-            height: 100%;
+            /* Height removed to fill parent */
             background: #333;
             position: relative;
         }
@@ -153,12 +155,15 @@
             width: 100%;
             height: 100%;
             object-fit: cover;
+            position: absolute;
+            top: 0; left: 0;
         }
 
         .no-cover {
             width: 100%; height: 100%;
             display: flex; align-items: center; justify-content: center;
             font-size: 24px; color: #555;
+            position: absolute;
         }
 
         .card-body {
@@ -166,7 +171,7 @@
             flex-grow: 1;
             display: flex;
             flex-direction: column;
-            overflow: hidden;
+            /* removed overflow:hidden to allow full text */
         }
 
         .card-title {
@@ -188,24 +193,43 @@
             gap: 10px;
         }
 
+        /* UPDATED SYNOPSIS CSS */
+        .synopsis-container {
+            margin-bottom: auto; /* Push tags to bottom */
+        }
+
         .synopsis {
             font-size: 13px;
             color: var(--text-muted);
             line-height: 1.5;
-            display: -webkit-box;
-            -webkit-line-clamp: 3;
-            -webkit-box-orient: vertical;
+            max-height: 4.5em; /* Approx 3 lines */
             overflow: hidden;
-            margin-bottom: auto;
+            transition: max-height 0.3s ease-out;
+            position: relative;
         }
+
+        .synopsis.expanded {
+            max-height: none; /* Shows full text */
+        }
+
+        .read-more-btn {
+            background: none;
+            border: none;
+            color: var(--accent);
+            font-size: 12px;
+            font-weight: 600;
+            cursor: pointer;
+            padding: 0;
+            margin-top: 4px;
+            outline: none;
+        }
+        .read-more-btn:hover { text-decoration: underline; }
 
         .tags {
             display: flex;
             gap: 6px;
             margin-top: 10px;
             flex-wrap: wrap;
-            overflow: hidden;
-            height: 24px;
         }
 
         .tag {
@@ -293,8 +317,9 @@
         @media (max-width: 600px) {
             .navbar { flex-direction: column; align-items: stretch; }
             .user-badge { position: absolute; top: 15px; right: 20px; }
-            .card { height: auto; flex-direction: column; }
-            .card-cover { width: 100%; height: 200px; }
+            .card { flex-direction: column; height: auto; }
+            .card-cover { width: 100%; height: 200px; min-height: 200px; position: relative; }
+            .cover-img { position: absolute; } /* Fix relative height */
             .card-actions { 
                 border-left: none; 
                 border-top: 1px solid var(--border);
@@ -308,7 +333,7 @@
 <body>
 
     <div class="navbar">
-        <a href="/" class="nav-brand">LNserve</a>
+        <a href="/" class="nav-brand">📚 Library</a>
         {% if user_id %}
             <div class="user-badge">User: {{ user_id }}</div>
         {% endif %}
@@ -348,7 +373,15 @@
                         <div class="card-meta">
                             <span>👤 {{ book.author }}</span>
                         </div>
-                        <div class="synopsis">{{ book.synopsis }}</div>
+                        
+                        <div class="synopsis-container">
+                            <div class="synopsis" id="syn-{{ book._id }}">
+                                {{ book.synopsis }}
+                            </div>
+                            {% if book.synopsis|length > 250 %}
+                                <button class="read-more-btn" id="btn-{{ book._id }}" onclick="toggleSynopsis('{{ book._id }}')">Read More...</button>
+                            {% endif %}
+                        </div>
                         
                         {% if book.tags %}
                         <div class="tags">
@@ -402,6 +435,19 @@
     </div>
 
     <script>
+        function toggleSynopsis(id) {
+            var textElement = document.getElementById('syn-' + id);
+            var btnElement = document.getElementById('btn-' + id);
+            
+            if (textElement.classList.contains('expanded')) {
+                textElement.classList.remove('expanded');
+                btnElement.innerText = 'Read More...';
+            } else {
+                textElement.classList.add('expanded');
+                btnElement.innerText = 'Show Less';
+            }
+        }
+
         async function requestDownload(bookId, btn) {
             var originalText = btn.innerText;
             btn.innerText = "Wait...";

@@ -169,35 +169,43 @@ async def search():
         )
     
     try:
-        # --- OPTIMIZED SEARCH ALGORITHM (SPEED FIX) ---
-        # 1. Prepare Text Query: 
-        # Wrapping words in quotes "word" tells MongoDB: "This word MUST appear" (AND logic)
-        # This allows "hogwarts" (in title) and "family" (in synopsis) to match a book.
         words = query.split()
+        
+        # --- MODE 1: Strict Text Search (Fast & Accurate) ---
+        # We wrap each word in quotes: "Harry" "Potter"
+        # This tells MongoDB: Document MUST contain Harry AND Potter.
         text_query = " ".join([f'"{w}"' for w in words])
         
-        # 2. Execute Fast Text Search
-        # This uses the pre-built indexes instead of scanning every file
-        base_query = {"$text": {"$search": text_query}}
+        mongo_query = {"$text": {"$search": text_query}}
         
-        cnt = await collection.count_documents(base_query)
+        # --- MODE 2: Fallback (Partial matches in TITLE ONLY) ---
+        # If text search fails (e.g. searching "Hogwart" instead of "Hogwarts"),
+        # we try Regex, but ONLY on the Title/Author to prevent hanging.
+        # We do NOT regex the synopsis.
+        if len(words) > 0:
+            cnt = await collection.count_documents(mongo_query)
+            if cnt == 0:
+                # Fallback to Title/Author regex
+                regex_list = [re.compile(re.escape(w), re.IGNORECASE) for w in words]
+                mongo_query = {
+                    "$and": [
+                        {"$or": [
+                            {"title": {"$in": regex_list}}, 
+                            {"author": {"$in": regex_list}},
+                            {"file_name": {"$in": regex_list}}
+                        ]}
+                    ]
+                }
+
+        # Execution
+        cnt = await collection.count_documents(mongo_query)
+        cursor = collection.find(mongo_query)
         
-        if cnt > 0:
-            cursor = collection.find(base_query)
-            # Sort by how well it matches (relevance)
+        # Sort results: Text Score (relevance) first, then Title
+        if "$text" in mongo_query:
             cursor = cursor.sort([("score", {"$meta": "textScore"})])
         else:
-            # 3. FAST FALLBACK (Title Only)
-            # If text search finds nothing (e.g. partial words like "hogwa"), 
-            # only search the TITLE with regex. Do NOT regex the synopsis (too slow).
-            regex_list = [re.compile(re.escape(w), re.IGNORECASE) for w in words]
-            fallback_query = {
-                "$and": [
-                    {"$or": [{"title": r}, {"file_name": r}]} for r in regex_list
-                ]
-            }
-            cnt = await collection.count_documents(fallback_query)
-            cursor = collection.find(fallback_query)
+            cursor = cursor.sort("title", 1)
 
         books_cursor = await cursor.skip(skip).limit(limit).to_list(length=limit)
         
@@ -207,14 +215,15 @@ async def search():
             if b.get('cover_image'):
                 cover_b64 = base64.b64encode(b['cover_image']).decode('utf-8')
             
+            # Clean HTML from synopsis to prevent layout breaking
             syn = b.get('synopsis', 'No synopsis available.').strip()
-            syn_clean = re.sub(r'<[^>]+>', '', syn) 
+            syn = re.sub(r'<[^>]+>', '', syn) 
             
             results.append({
                 "_id": str(b['_id']),
                 "title": get_display_title(b),
                 "author": b.get('author', 'Unknown'),
-                "synopsis": syn_clean,
+                "synopsis": syn,
                 "tags": b.get('tags', '').split(',') if b.get('tags') else [],
                 "cover_image": cover_b64
             })
@@ -490,6 +499,31 @@ async def export_cmd(client, message):
         if os.path.exists("lib.json"): os.remove("lib.json")
         if os.path.exists("lib.zip"): os.remove("lib.zip")
 
+@app.on_message(filters.command("fix_search") & filters.user(ADMIN_ID))
+async def fix_search_cmd(client, message):
+    s = await message.reply("🛠 **Fixing Search Index...**\nThis may take a minute.")
+    try:
+        # Drop existing indexes to clear corruption
+        await collection.drop_indexes()
+        
+        # Create the correct Text Index with Weights
+        # Giving Title higher weight means title matches appear first
+        await collection.create_index(
+            [
+                ("title", "text"), 
+                ("synopsis", "text"), 
+                ("author", "text"), 
+                ("tags", "text"),
+                ("file_name", "text")
+            ],
+            weights={"title": 10, "file_name": 5, "synopsis": 1},
+            name="TextIndex"
+        )
+        await s.edit("✅ **Search System Repaired!**\nindexes dropped and recreated.\nTry searching now.")
+    except Exception as e:
+        await s.edit(f"❌ Error: {e}")
+
+
 @app.on_message(filters.command("import") & filters.user(ADMIN_ID))
 async def import_cmd(client, message):
     if not message.reply_to_message or not message.reply_to_message.document: return await message.reply("Reply file.")
@@ -514,41 +548,49 @@ async def import_cmd(client, message):
     finally:
         if os.path.exists(path): os.remove(path)
         
-@app.on_message(filters.text & filters.incoming & ~filters.command(["start", "stats", "index", "stop_index", "export", "import", "migrate", "url"]))
+@app.on_message(filters.text & filters.incoming & ~filters.command(["start", "stats", "index", "stop_index", "export", "import", "migrate", "url", "fix_search"]))
 async def search_handler(client, message):
     q = message.text.strip()
-    if len(q) > 100: return
+    if len(q) > 100 or not q: return
+    
     keep_result = False
     real_q = q
     if q.startswith("!!"): keep_result=True; real_q=q[2:].strip()
-    if not real_q: return
 
     try:
-        # --- FAST SEARCH LOGIC FOR BOT ---
         words = real_q.split()
+        # 1. Strict Text Search (AND Logic)
         text_query = " ".join([f'"{w}"' for w in words])
+        mongo_query = {"$text": {"$search": text_query}}
         
-        base_query = {"$text": {"$search": text_query}}
-        cnt = await collection.count_documents(base_query)
+        cnt = await collection.count_documents(mongo_query)
         
-        if cnt > 0:
-            cursor = collection.find(base_query).sort([("score", {"$meta": "textScore"})])
-        else:
-            # Fallback: Title/Author Regex only (Fast)
-            regex_list = [re.compile(re.escape(w), re.IGNORECASE) for w in words]
-            fallback_query = {
-                "$and": [{"$or": [{"title": r}, {"author": r}, {"file_name": r}]} for r in regex_list]
+        # 2. Fallback to Partial Title Search if no full text match
+        if cnt == 0:
+             regex_list = [re.compile(re.escape(w), re.IGNORECASE) for w in words]
+             mongo_query = {
+                "$and": [
+                    {"$or": [
+                        {"title": {"$in": regex_list}}, 
+                        {"author": {"$in": regex_list}},
+                        {"file_name": {"$in": regex_list}}
+                    ]}
+                ]
             }
-            cnt = await collection.count_documents(fallback_query)
-            cursor = collection.find(fallback_query)
+             cnt = await collection.count_documents(mongo_query)
 
+        if cnt == 0:
+            return await message.reply("❌ No matches found.")
+
+        # Fetch Top 8
+        cursor = collection.find(mongo_query)
+        if "$text" in mongo_query:
+            cursor = cursor.sort([("score", {"$meta": "textScore"})])
+        
         res = await cursor.limit(8).to_list(length=8)
-        
-        if not res: return await message.reply("❌ No matches.")
-        
+
         sq = html.escape(real_q)
-        line_sep = "-" * 30
-        txt = (f"🔎 Results for: <b>{sq}</b>\nTotal Matches: {cnt}\n{line_sep}")
+        txt = (f"🔎 Results for: <b>{sq}</b>\nTotal Matches: {cnt}\n{'-'*30}")
         
         btns = []
         for b in res:
@@ -564,7 +606,7 @@ async def search_handler(client, message):
         await message.reply(txt, reply_markup=InlineKeyboardMarkup(btns), parse_mode=ParseMode.HTML)
     except Exception as e: 
         logger.error(f"Bot Search Error: {e}")
-        await message.reply(f"⚠️ Error: {e}")
+        await message.reply("⚠️ Search Error. Try /fix_search if this persists.")
 
 @app.on_callback_query()
 async def callback_handler(client, callback_query):

@@ -360,7 +360,7 @@ async def url_command(client, message):
         
         # CHANGED: Use ParseMode.HTML and wrap URL in <code> tags to prevent formatting errors
         await message.reply(
-            f"🔗 <b>Your Link</b>\n\n<code>{login_url}</code>", 
+            f"🔗 <b>Your Link</b>\n\n{login_url}", 
             disable_web_page_preview=True,
             parse_mode=ParseMode.HTML
         )

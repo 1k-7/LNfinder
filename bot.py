@@ -163,40 +163,42 @@ async def search():
     skip = (page - 1) * limit
 
     if not query:
-        return await render_template('index.html', query="", results=[], count=0, user_id=user_id, bot_username=BOT_USERNAME)
+        return await render_template(
+            'index.html', query="", results=[], count=0, 
+            pagination_list=[], user_id=user_id, bot_username=BOT_USERNAME
+        )
     
     try:
-        # --- NEW SEARCH ALGORITHM ---
-        # 1. Split query into words
+        # --- OPTIMIZED SEARCH ALGORITHM (SPEED FIX) ---
+        # 1. Prepare Text Query: 
+        # Wrapping words in quotes "word" tells MongoDB: "This word MUST appear" (AND logic)
+        # This allows "hogwarts" (in title) and "family" (in synopsis) to match a book.
         words = query.split()
+        text_query = " ".join([f'"{w}"' for w in words])
         
-        # 2. Create regex for each word (case insensitive)
-        regex_list = [re.compile(re.escape(w), re.IGNORECASE) for w in words]
+        # 2. Execute Fast Text Search
+        # This uses the pre-built indexes instead of scanning every file
+        base_query = {"$text": {"$search": text_query}}
         
-        # 3. Build an $and query. 
-        # Logic: For EVERY word in the search, it must appear in Title OR Author OR Synopsis OR Tags
-        and_conditions = []
-        for rgx in regex_list:
-            and_conditions.append({
-                "$or": [
-                    {"title": rgx},
-                    {"author": rgx},
-                    {"synopsis": rgx},
-                    {"tags": rgx},
-                    {"file_name": rgx}
+        cnt = await collection.count_documents(base_query)
+        
+        if cnt > 0:
+            cursor = collection.find(base_query)
+            # Sort by how well it matches (relevance)
+            cursor = cursor.sort([("score", {"$meta": "textScore"})])
+        else:
+            # 3. FAST FALLBACK (Title Only)
+            # If text search finds nothing (e.g. partial words like "hogwa"), 
+            # only search the TITLE with regex. Do NOT regex the synopsis (too slow).
+            regex_list = [re.compile(re.escape(w), re.IGNORECASE) for w in words]
+            fallback_query = {
+                "$and": [
+                    {"$or": [{"title": r}, {"file_name": r}]} for r in regex_list
                 ]
-            })
-            
-        search_query = {"$and": and_conditions}
+            }
+            cnt = await collection.count_documents(fallback_query)
+            cursor = collection.find(fallback_query)
 
-        # Count total matches
-        cnt = await collection.count_documents(search_query)
-        
-        # Fetch results
-        cursor = collection.find(search_query)
-        # Sort: Exact title matches first, then generic sort
-        cursor = cursor.sort("title", 1) 
-        
         books_cursor = await cursor.skip(skip).limit(limit).to_list(length=limit)
         
         results = []
@@ -206,8 +208,7 @@ async def search():
                 cover_b64 = base64.b64encode(b['cover_image']).decode('utf-8')
             
             syn = b.get('synopsis', 'No synopsis available.').strip()
-            # Clean up synopsis for display
-            syn_clean = re.sub(r'<[^>]+>', '', syn) # Remove HTML tags if any
+            syn_clean = re.sub(r'<[^>]+>', '', syn) 
             
             results.append({
                 "_id": str(b['_id']),
@@ -228,7 +229,7 @@ async def search():
             count=cnt, 
             page=page, 
             total_pages=total_pages, 
-            pagination_list=pagination_list, # Passing the list for buttons
+            pagination_list=pagination_list, 
             user_id=user_id, 
             bot_username=BOT_USERNAME
         )
@@ -512,7 +513,7 @@ async def import_cmd(client, message):
         except: pass
     finally:
         if os.path.exists(path): os.remove(path)
-
+        
 @app.on_message(filters.text & filters.incoming & ~filters.command(["start", "stats", "index", "stop_index", "export", "import", "migrate", "url"]))
 async def search_handler(client, message):
     q = message.text.strip()
@@ -521,30 +522,49 @@ async def search_handler(client, message):
     real_q = q
     if q.startswith("!!"): keep_result=True; real_q=q[2:].strip()
     if not real_q: return
+
     try:
-        cnt = await collection.count_documents({"$text": {"$search": real_q}})
+        # --- FAST SEARCH LOGIC FOR BOT ---
+        words = real_q.split()
+        text_query = " ".join([f'"{w}"' for w in words])
+        
+        base_query = {"$text": {"$search": text_query}}
+        cnt = await collection.count_documents(base_query)
+        
         if cnt > 0:
-            cursor = collection.find({"$text": {"$search": real_q}}).sort([("score", {"$meta": "textScore"})])
+            cursor = collection.find(base_query).sort([("score", {"$meta": "textScore"})])
         else:
-            reg = {"$regex": real_q, "$options": "i"}
-            cnt = await collection.count_documents({"$or": [{"title": reg}, {"file_name": reg}]})
-            cursor = collection.find({"$or": [{"title": reg}, {"file_name": reg}]})
+            # Fallback: Title/Author Regex only (Fast)
+            regex_list = [re.compile(re.escape(w), re.IGNORECASE) for w in words]
+            fallback_query = {
+                "$and": [{"$or": [{"title": r}, {"author": r}, {"file_name": r}]} for r in regex_list]
+            }
+            cnt = await collection.count_documents(fallback_query)
+            cursor = collection.find(fallback_query)
+
         res = await cursor.limit(8).to_list(length=8)
+        
         if not res: return await message.reply("❌ No matches.")
+        
         sq = html.escape(real_q)
-        line_sep = "-" * 101
-        txt = (f"🔎 Results fetched for your search : {sq}\nTotal Matches: {cnt}\n{line_sep}")
+        line_sep = "-" * 30
+        txt = (f"🔎 Results for: <b>{sq}</b>\nTotal Matches: {cnt}\n{line_sep}")
+        
         btns = []
         for b in res:
             label = get_button_label(b)[:40]
             cb_data = f"v:{str(b['_id'])}:k" if keep_result else f"v:{str(b['_id'])}"
             btns.append([InlineKeyboardButton(f"{label}", callback_data=cb_data)])
+            
         nav = []
         nav.append(InlineKeyboardButton(f"1/{math.ceil(cnt/8)}", callback_data="nop"))
-        if cnt > 8: nav.append(InlineKeyboardButton("➡️", callback_data=f"n:1:{q[:20]}"))
+        if cnt > 8: nav.append(InlineKeyboardButton("➡️", callback_data=f"n:1:{real_q[:20]}"))
         btns.append(nav)
+        
         await message.reply(txt, reply_markup=InlineKeyboardMarkup(btns), parse_mode=ParseMode.HTML)
-    except Exception as e: await message.reply(f"⚠️ {e}")
+    except Exception as e: 
+        logger.error(f"Bot Search Error: {e}")
+        await message.reply(f"⚠️ Error: {e}")
 
 @app.on_callback_query()
 async def callback_handler(client, callback_query):

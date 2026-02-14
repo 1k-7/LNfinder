@@ -42,12 +42,10 @@ try:
     AZURE_URL = os.environ.get("AZURE_URL")
     if not AZURE_URL: raise ValueError("Missing AZURE_URL")
     
-    # Optional legacy support
     LEGACY_STR = os.environ.get("MONGO_URI") or os.environ.get("MONGO_URL") or ""
     LEGACY_URIS = LEGACY_STR.split() if LEGACY_STR else []
     
     PORT = int(os.environ.get("PORT", 8080))
-    # Force the correct public URL if needed, or rely on env
     PUBLIC_URL = os.environ.get("PUBLIC_URL") or f"http://0.0.0.0:{PORT}"
     SECRET_KEY = os.environ.get("SECRET_KEY", "CHANGE_THIS_TO_RANDOM_STRING")
 
@@ -173,28 +171,24 @@ async def search():
         )
     
     try:
+        # --- FAST & LIGHT SEARCH ---
+        # 1. Split query into words
         words = query.split()
         
-        # --- FIXED SEARCH LOGIC ---
-        # 1. Strict AND (Word 1 + Word 2 must both exist)
-        # 2. Scope: Title OR Synopsis ONLY (Author/Tags removed)
-        and_conditions = []
-        for word in words:
-            reg = re.compile(re.escape(word), re.IGNORECASE)
-            and_conditions.append({
-                "$or": [
-                    {"title": reg},
-                    {"synopsis": reg},
-                    {"file_name": reg} # Kept as fallback for Title
-                ]
-            })
+        # 2. Build Text Search String
+        # We wrap each word in quotes: "Hogwarts" "Family"
+        # This forces MongoDB to find docs containing ALL words (AND logic).
+        # This uses the Text Index (O(1)) and avoids Regex scans.
+        text_query_str = ""
+        for w in words:
+            text_query_str += f"\"{w}\" "
             
-        mongo_query = { "$and": and_conditions }
+        mongo_query = {"$text": {"$search": text_query_str}}
 
-        # EXECUTION
+        # 3. Execution (No Sort)
+        # We DO NOT sort by textScore here to ensure we get results instantly
+        # without loading the whole dataset into memory.
         cnt = await collection.count_documents(mongo_query)
-        
-        # CRITICAL: NO SORTING to prevent hangs
         cursor = collection.find(mongo_query)
         
         books_cursor = await cursor.skip(skip).limit(limit).to_list(length=limit)
@@ -499,12 +493,21 @@ async def import_cmd(client, message):
 
 @app.on_message(filters.command("fix_search") & filters.user(ADMIN_ID))
 async def fix_search_cmd(client, message):
-    s = await message.reply("🛠 **Reseting Search Indexes...**")
+    s = await message.reply("🛠 **Optimizing Database...**\nCreating Wildcard Text Index. This enables 'All Fields' search.")
     try:
+        # 1. Drop old indexes to clear bad config
         await collection.drop_indexes()
+        
+        # 2. Create the Wildcard Text Index
+        # "$**" means "Index ALL string fields in the document recursively"
+        # This is the "Ingenious" way to support searching Title OR Synopsis OR Tags without complex queries
+        await collection.create_index([("$**", "text")])
+        
+        # 3. Restore essential unique indexes
         await collection.create_index("file_unique_id", unique=True)
         await collection.create_index("msg_id")
-        await s.edit("✅ Indexes Reset. Using Strict Regex Search (AND mode).")
+        
+        await s.edit("✅ **System Repaired!**\nWildcard Index Active. Search is now light and fast.")
     except Exception as e:
         await s.edit(f"❌ Error: {e}")
 
@@ -518,30 +521,20 @@ async def search_handler(client, message):
     if q.startswith("!!"): keep_result=True; real_q=q[2:].strip()
 
     try:
+        # STRICT AND LOGIC via TEXT SEARCH
         words = real_q.split()
-        
-        # --- FIXED SEARCH LOGIC FOR BOT ---
-        # 1. Strict AND
-        # 2. Scope: Title OR Synopsis ONLY (No Author/Tags)
-        and_conditions = []
-        for word in words:
-            reg = re.compile(re.escape(word), re.IGNORECASE)
-            and_conditions.append({
-                "$or": [
-                    {"title": reg},
-                    {"synopsis": reg},
-                    {"file_name": reg}
-                ]
-            })
+        text_query_str = ""
+        for w in words:
+            text_query_str += f"\"{w}\" "
             
-        mongo_query = { "$and": and_conditions }
+        mongo_query = {"$text": {"$search": text_query_str}}
         
         cnt = await collection.count_documents(mongo_query)
         
         if cnt == 0:
             return await message.reply("❌ No matches found.")
 
-        # NO SORT (Performance)
+        # No Sort for Speed
         cursor = collection.find(mongo_query)
         res = await cursor.limit(8).to_list(length=8)
 
@@ -575,19 +568,11 @@ async def callback_handler(client, callback_query):
             keep_result = False
             if q.startswith("!!"): keep_result=True; real_q=q[2:].strip()
             
-            # REPLICATE LOGIC IN PAGINATION
             words = real_q.split()
-            and_conditions = []
-            for word in words:
-                reg = re.compile(re.escape(word), re.IGNORECASE)
-                and_conditions.append({
-                    "$or": [
-                        {"title": reg},
-                        {"synopsis": reg},
-                        {"file_name": reg}
-                    ]
-                })
-            mongo_query = { "$and": and_conditions }
+            text_query_str = ""
+            for w in words:
+                text_query_str += f"\"{w}\" "
+            mongo_query = {"$text": {"$search": text_query_str}}
             
             cnt = await collection.count_documents(mongo_query)
             cursor = collection.find(mongo_query)
@@ -653,7 +638,7 @@ async def main():
     logger.info("🤖 Starting Telegram Bot...")
     await app.start()
     
-    # --- CRITICAL FIX FOR GHOST WEBHOOK (MANUAL) ---
+    # --- WEBHOOK NUKE (Keep this to fix ghost updates) ---
     try:
         logger.info("🧹 Nuking Webhook...")
         with urllib.request.urlopen(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook?drop_pending_updates=True") as response:

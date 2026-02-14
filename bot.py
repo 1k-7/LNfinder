@@ -130,6 +130,30 @@ async def index():
     user_id = get_user_from_cookie()
     return await render_template('index.html', query="", results=[], count=0, user_id=user_id, bot_username=BOT_USERNAME)
 
+# bot.py - Updated Search & Pagination Logic
+
+def get_pagination_list(current, total):
+    # Logic to create [1, '...', 4, 5, 6, '...', 20]
+    if total <= 1: return []
+    delta = 2
+    left = current - delta
+    right = current + delta + 1
+    range_l = []
+    range_with_dots = []
+    l = None
+
+    for i in range(1, total + 1):
+        if i == 1 or i == total or (i >= left and i < right):
+            range_l.append(i)
+
+    for i in range_l:
+        if l:
+            if i - l == 2: range_with_dots.append(l + 1)
+            elif i - l != 1: range_with_dots.append('...')
+        range_with_dots.append(i)
+        l = i
+    return range_with_dots
+
 @web_app.route('/search')
 async def search():
     user_id = get_user_from_cookie()
@@ -142,34 +166,74 @@ async def search():
         return await render_template('index.html', query="", results=[], count=0, user_id=user_id, bot_username=BOT_USERNAME)
     
     try:
-        cnt = await collection.count_documents({"$text": {"$search": query}})
-        if cnt > 0:
-            cursor = collection.find({"$text": {"$search": query}}).sort([("score", {"$meta": "textScore"})])
-        else:
-            reg = {"$regex": query, "$options": "i"}
-            fallback = {"$or": [{"title": reg}, {"author": reg}, {"file_name": reg}]}
-            cnt = await collection.count_documents(fallback)
-            cursor = collection.find(fallback)
+        # --- NEW SEARCH ALGORITHM ---
+        # 1. Split query into words
+        words = query.split()
+        
+        # 2. Create regex for each word (case insensitive)
+        regex_list = [re.compile(re.escape(w), re.IGNORECASE) for w in words]
+        
+        # 3. Build an $and query. 
+        # Logic: For EVERY word in the search, it must appear in Title OR Author OR Synopsis OR Tags
+        and_conditions = []
+        for rgx in regex_list:
+            and_conditions.append({
+                "$or": [
+                    {"title": rgx},
+                    {"author": rgx},
+                    {"synopsis": rgx},
+                    {"tags": rgx},
+                    {"file_name": rgx}
+                ]
+            })
+            
+        search_query = {"$and": and_conditions}
 
+        # Count total matches
+        cnt = await collection.count_documents(search_query)
+        
+        # Fetch results
+        cursor = collection.find(search_query)
+        # Sort: Exact title matches first, then generic sort
+        cursor = cursor.sort("title", 1) 
+        
         books_cursor = await cursor.skip(skip).limit(limit).to_list(length=limit)
+        
         results = []
         for b in books_cursor:
             cover_b64 = None
             if b.get('cover_image'):
                 cover_b64 = base64.b64encode(b['cover_image']).decode('utf-8')
+            
             syn = b.get('synopsis', 'No synopsis available.').strip()
-            has_more = len(syn) > 300
+            # Clean up synopsis for display
+            syn_clean = re.sub(r'<[^>]+>', '', syn) # Remove HTML tags if any
+            
             results.append({
                 "_id": str(b['_id']),
                 "title": get_display_title(b),
                 "author": b.get('author', 'Unknown'),
-                "synopsis": syn,
-                "has_more": has_more,
+                "synopsis": syn_clean,
+                "tags": b.get('tags', '').split(',') if b.get('tags') else [],
                 "cover_image": cover_b64
             })
+
         total_pages = math.ceil(cnt / limit)
-        return await render_template('index.html', query=query, results=results, count=cnt, page=page, total_pages=total_pages, user_id=user_id, bot_username=BOT_USERNAME)
+        pagination_list = get_pagination_list(page, total_pages)
+
+        return await render_template(
+            'index.html', 
+            query=query, 
+            results=results, 
+            count=cnt, 
+            page=page, 
+            total_pages=total_pages, 
+            pagination_list=pagination_list, # Passing the list for buttons
+            user_id=user_id, 
+            bot_username=BOT_USERNAME
+        )
     except Exception as e:
+        logger.error(f"Search Error: {e}")
         return await render_template('index.html', query=query, results=[], count=0, error=str(e), user_id=user_id)
 
 @web_app.route('/api/download/<book_id>')
@@ -360,7 +424,7 @@ async def url_command(client, message):
         
         # CHANGED: Use ParseMode.HTML and wrap URL in <code> tags to prevent formatting errors
         await message.reply(
-            f"🔗 <b>Your Link</b>\n\n<blockquote>{login_url}</blockquote>", 
+            f"🔗 <b>Your Link</b>\n\n<blockquote>{login_url</blockquote>", 
             disable_web_page_preview=True,
             parse_mode=ParseMode.HTML
         )

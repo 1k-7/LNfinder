@@ -357,9 +357,15 @@ async def url_command(client, message):
     try:
         token = serializer.dumps(message.from_user.id)
         login_url = f"{PUBLIC_URL}/login?token={token}"
-        await message.reply(f"🔗 **Your Personal Website Link**\n\n{login_url}", disable_web_page_preview=True)
+        
+        # CHANGED: Use ParseMode.HTML and wrap URL in <code> tags to prevent formatting errors
+        await message.reply(
+            f"🔗 <b>Your Link</b>\n\n<code>{login_url}</code>", 
+            disable_web_page_preview=True,
+            parse_mode=ParseMode.HTML
+        )
     except Exception as e: logger.error(f"URL Cmd Error: {e}")
-
+    
 @app.on_message(filters.command("start"))
 async def start_handler(client, message):
     if len(message.command) > 1 and message.command[1].startswith("d_"):

@@ -178,34 +178,40 @@ async def search():
         
         mongo_query = {"$text": {"$search": text_query}}
         
-        # --- MODE 2: Fallback (Partial matches in TITLE ONLY) ---
+        cnt = await collection.count_documents(mongo_query)
+        
+        # --- MODE 2: Fallback (Partial matches Cross-Field) ---
         # If text search fails (e.g. searching "Hogwart" instead of "Hogwarts"),
-        # we try Regex, but ONLY on the Title/Author to prevent hanging.
-        # We do NOT regex the synopsis.
-        if len(words) > 0:
-            cnt = await collection.count_documents(mongo_query)
-            if cnt == 0:
-                # Fallback to Title/Author regex
-                regex_list = [re.compile(re.escape(w), re.IGNORECASE) for w in words]
-                mongo_query = {
-                    "$and": [
-                        {"$or": [
-                            {"title": {"$in": regex_list}}, 
-                            {"author": {"$in": regex_list}},
-                            {"file_name": {"$in": regex_list}}
-                        ]}
+        # we try Regex using Cross-Field AND logic.
+        if cnt == 0 and len(words) > 0:
+            and_conditions = []
+            for word in words:
+                escaped_word = re.escape(word)
+                pattern = re.compile(escaped_word, re.IGNORECASE)
+                
+                # Check if THIS specific word exists in ANY of these fields
+                and_conditions.append({
+                    "$or": [
+                        {"title": pattern},
+                        {"author": pattern},
+                        {"synopsis": pattern},
+                        {"file_name": pattern},
+                        {"tags": pattern}
                     ]
-                }
+                })
+            
+            # Combine all word conditions with AND
+            mongo_query = {"$and": and_conditions}
+            cnt = await collection.count_documents(mongo_query)
 
         # Execution
-        cnt = await collection.count_documents(mongo_query)
         cursor = collection.find(mongo_query)
         
-        # Sort results: Text Score (relevance) first, then Title
+        # Sort results: Text Score (relevance) first.
+        # CRITICAL FIX: Do NOT sort by title if using Regex fallback. 
+        # Sorting Regex results on a large DB causes timeouts.
         if "$text" in mongo_query:
             cursor = cursor.sort([("score", {"$meta": "textScore"})])
-        else:
-            cursor = cursor.sort("title", 1)
 
         books_cursor = await cursor.skip(skip).limit(limit).to_list(length=limit)
         
@@ -567,23 +573,33 @@ async def search_handler(client, message):
         
         # 2. Fallback to Partial Title Search if no full text match
         if cnt == 0:
-             regex_list = [re.compile(re.escape(w), re.IGNORECASE) for w in words]
-             mongo_query = {
-                "$and": [
-                    {"$or": [
-                        {"title": {"$in": regex_list}}, 
-                        {"author": {"$in": regex_list}},
-                        {"file_name": {"$in": regex_list}}
-                    ]}
-                ]
-            }
-             cnt = await collection.count_documents(mongo_query)
+            and_conditions = []
+            for word in words:
+                escaped_word = re.escape(word)
+                pattern = re.compile(escaped_word, re.IGNORECASE)
+                
+                # Check if THIS specific word exists in ANY of these fields
+                and_conditions.append({
+                    "$or": [
+                        {"title": pattern},
+                        {"author": pattern},
+                        {"synopsis": pattern},
+                        {"file_name": pattern},
+                        {"tags": pattern}
+                    ]
+                })
+            
+            # Combine all word conditions with AND
+            mongo_query = {"$and": and_conditions}
+            cnt = await collection.count_documents(mongo_query)
 
         if cnt == 0:
             return await message.reply("❌ No matches found.")
 
         # Fetch Top 8
         cursor = collection.find(mongo_query)
+        # CRITICAL FIX: Only sort by score if using text search.
+        # Sorting Regex results forces a full scan and hangs.
         if "$text" in mongo_query:
             cursor = cursor.sort([("score", {"$meta": "textScore"})])
         

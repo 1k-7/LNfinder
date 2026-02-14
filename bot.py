@@ -13,12 +13,13 @@ import base64
 import urllib.request 
 import xml.etree.ElementTree as ET
 from bs4 import BeautifulSoup
-# --- IMPORT RESTORED ---
+
+# --- DATABASE IMPORTS ---
 from bson.objectid import ObjectId 
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.errors import DuplicateKeyError
 
-# --- PYROBLACK IMPORTS ---
+# --- PYROGRAM IMPORTS ---
 from pyrogram import Client, filters, idle
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
 from pyrogram.enums import ParseMode
@@ -41,10 +42,12 @@ try:
     AZURE_URL = os.environ.get("AZURE_URL")
     if not AZURE_URL: raise ValueError("Missing AZURE_URL")
     
+    # Optional legacy support
     LEGACY_STR = os.environ.get("MONGO_URI") or os.environ.get("MONGO_URL") or ""
     LEGACY_URIS = LEGACY_STR.split() if LEGACY_STR else []
     
     PORT = int(os.environ.get("PORT", 8080))
+    # Force the correct public URL if needed, or rely on env
     PUBLIC_URL = os.environ.get("PUBLIC_URL") or f"http://0.0.0.0:{PORT}"
     SECRET_KEY = os.environ.get("SECRET_KEY", "CHANGE_THIS_TO_RANDOM_STRING")
 
@@ -71,13 +74,6 @@ except Exception as e:
     logger.error(f"❌ DB Connection Error: {e}")
     exit(1)
 
-legacy_collections = []
-for uri in LEGACY_URIS:
-    try:
-        cli = AsyncIOMotorClient(uri)
-        legacy_collections.append(cli[DB_NAME][COLLECTION_NAME])
-    except: pass
-
 # --- WEB APP INIT ---
 web_app = Quart(__name__, template_folder='template')
 serializer = URLSafeTimedSerializer(SECRET_KEY)
@@ -88,7 +84,7 @@ files_found = 0
 files_saved = 0
 BOT_USERNAME = None
 
-# --- WEB HELPERS ---
+# --- HELPERS ---
 def get_user_from_cookie():
     token = request.cookies.get('auth_token')
     if not token: return None
@@ -106,6 +102,30 @@ def get_display_title(book_doc):
     if fname:
         return fname.replace('.epub', '').replace('_', ' ').replace('-', ' ').strip()
     return "Unknown Book"
+
+def get_button_label(book_doc):
+    full = get_display_title(book_doc)
+    # Strip chapter numbers for cleaner buttons
+    return re.sub(r'\s+(c|ch|chap|vol|v)\.?\s*\d+(?:[-–]\d+)?.*$', '', full, flags=re.IGNORECASE).strip()
+
+def get_pagination_list(current, total):
+    if total <= 1: return []
+    delta = 2
+    left = current - delta
+    right = current + delta + 1
+    range_l = []
+    range_with_dots = []
+    l = None
+    for i in range(1, total + 1):
+        if i == 1 or i == total or (i >= left and i < right):
+            range_l.append(i)
+    for i in range_l:
+        if l:
+            if i - l == 2: range_with_dots.append(l + 1)
+            elif i - l != 1: range_with_dots.append('...')
+        range_with_dots.append(i)
+        l = i
+    return range_with_dots
 
 # --- WEB ROUTES ---
 @web_app.route('/health')
@@ -128,31 +148,15 @@ async def login():
 @web_app.route('/')
 async def index():
     user_id = get_user_from_cookie()
-    return await render_template('index.html', query="", results=[], count=0, user_id=user_id, bot_username=BOT_USERNAME)
-
-# bot.py - Updated Search & Pagination Logic
-
-def get_pagination_list(current, total):
-    # Logic to create [1, '...', 4, 5, 6, '...', 20]
-    if total <= 1: return []
-    delta = 2
-    left = current - delta
-    right = current + delta + 1
-    range_l = []
-    range_with_dots = []
-    l = None
-
-    for i in range(1, total + 1):
-        if i == 1 or i == total or (i >= left and i < right):
-            range_l.append(i)
-
-    for i in range_l:
-        if l:
-            if i - l == 2: range_with_dots.append(l + 1)
-            elif i - l != 1: range_with_dots.append('...')
-        range_with_dots.append(i)
-        l = i
-    return range_with_dots
+    return await render_template(
+        'index.html', 
+        query="", 
+        results=[], 
+        count=0, 
+        pagination_list=[], 
+        user_id=user_id, 
+        bot_username=BOT_USERNAME
+    )
 
 @web_app.route('/search')
 async def search():
@@ -171,48 +175,28 @@ async def search():
     try:
         words = query.split()
         
-        # --- MODE 1: Strict Text Search (Fast & Accurate) ---
-        # We wrap each word in quotes: "Harry" "Potter"
-        # This tells MongoDB: Document MUST contain Harry AND Potter.
-        text_query = " ".join([f'"{w}"' for w in words])
-        
-        mongo_query = {"$text": {"$search": text_query}}
-        
+        # --- FIXED SEARCH LOGIC ---
+        # 1. Strict AND (Word 1 + Word 2 must both exist)
+        # 2. Scope: Title OR Synopsis ONLY (Author/Tags removed)
+        and_conditions = []
+        for word in words:
+            reg = re.compile(re.escape(word), re.IGNORECASE)
+            and_conditions.append({
+                "$or": [
+                    {"title": reg},
+                    {"synopsis": reg},
+                    {"file_name": reg} # Kept as fallback for Title
+                ]
+            })
+            
+        mongo_query = { "$and": and_conditions }
+
+        # EXECUTION
         cnt = await collection.count_documents(mongo_query)
         
-        # --- MODE 2: Fallback (Partial matches Cross-Field) ---
-        # If text search fails (e.g. searching "Hogwart" instead of "Hogwarts"),
-        # we try Regex using Cross-Field AND logic.
-        if cnt == 0 and len(words) > 0:
-            and_conditions = []
-            for word in words:
-                escaped_word = re.escape(word)
-                pattern = re.compile(escaped_word, re.IGNORECASE)
-                
-                # Check if THIS specific word exists in ANY of these fields
-                and_conditions.append({
-                    "$or": [
-                        {"title": pattern},
-                        {"author": pattern},
-                        {"synopsis": pattern},
-                        {"file_name": pattern},
-                        {"tags": pattern}
-                    ]
-                })
-            
-            # Combine all word conditions with AND
-            mongo_query = {"$and": and_conditions}
-            cnt = await collection.count_documents(mongo_query)
-
-        # Execution
+        # CRITICAL: NO SORTING to prevent hangs
         cursor = collection.find(mongo_query)
         
-        # Sort results: Text Score (relevance) first.
-        # CRITICAL FIX: Do NOT sort by title if using Regex fallback. 
-        # Sorting Regex results on a large DB causes timeouts.
-        if "$text" in mongo_query:
-            cursor = cursor.sort([("score", {"$meta": "textScore"})])
-
         books_cursor = await cursor.skip(skip).limit(limit).to_list(length=limit)
         
         results = []
@@ -221,7 +205,6 @@ async def search():
             if b.get('cover_image'):
                 cover_b64 = base64.b64encode(b['cover_image']).decode('utf-8')
             
-            # Clean HTML from synopsis to prevent layout breaking
             syn = b.get('synopsis', 'No synopsis available.').strip()
             syn = re.sub(r'<[^>]+>', '', syn) 
             
@@ -282,18 +265,7 @@ app = Client(
     sleep_threshold=60 
 )
 
-# --- INDEXING PROCESS ---
-async def ensure_indexes():
-    try:
-        await collection.create_index([("title", "text"), ("author", "text"), ("synopsis", "text"), ("tags", "text"), ("file_name", "text")])
-        await collection.create_index("file_unique_id", unique=True)
-        await collection.create_index("msg_id")
-    except: pass
-
-def get_button_label(book_doc):
-    full = get_display_title(book_doc)
-    return re.sub(r'\s+(c|ch|chap|vol|v)\.?\s*\d+(?:[-–]\d+)?.*$', '', full, flags=re.IGNORECASE).strip()
-
+# --- EPUB PARSER ---
 def parse_epub_direct(file_path):
     meta = {"title": None, "author": "Unknown", "synopsis": "No synopsis.", "tags": "", "cover_image": None}
     try:
@@ -354,6 +326,7 @@ def parse_epub_direct(file_path):
     if meta['tags'].endswith(", "): meta['tags'] = meta['tags'][:-2]
     return meta
 
+# --- INDEXING WORKER ---
 async def indexing_process(client, start_id, end_id, status_msg):
     global indexing_active, files_found, files_saved
     files_found = 0; files_saved = 0
@@ -362,8 +335,7 @@ async def indexing_process(client, start_id, end_id, status_msg):
     if status_msg:
         try:
             await status_msg.edit(f"🚀 **Starting Scan...**\nRange: {start_id} - {end_id}")
-        except:
-            pass
+        except: pass
 
     async def worker():
         global files_saved
@@ -405,8 +377,7 @@ async def indexing_process(client, start_id, end_id, status_msg):
             if status_msg and (current_id % 100 == 0):
                 try:
                     await status_msg.edit(f"🔄 **Scanning...**\nID: `{current_id}`\nFound: `{files_found}`\nSaved: `{files_saved}`")
-                except:
-                    pass
+                except: pass
             if not ids_to_fetch: break
             try:
                 messages = await client.get_messages(CHANNEL_ID, ids_to_fetch)
@@ -426,10 +397,9 @@ async def indexing_process(client, start_id, end_id, status_msg):
         if status_msg:
             try:
                 await status_msg.edit(f"✅ **Done!**\nScanned: `{end_id}`\nFound: `{files_found}`\nSaved: `{files_saved}`")
-            except:
-                pass
+            except: pass
 
-# --- TELEGRAM HANDLERS ---
+# --- TELEGRAM COMMANDS ---
 
 @app.on_message(filters.command("url"))
 async def url_command(client, message):
@@ -437,15 +407,13 @@ async def url_command(client, message):
     try:
         token = serializer.dumps(message.from_user.id)
         login_url = f"{PUBLIC_URL}/login?token={token}"
-        
-        # CHANGED: Use ParseMode.HTML and wrap URL in <code> tags to prevent formatting errors
         await message.reply(
-            f"🔗 <b>Your Link</b>\n\n<blockquote>{login_url}</blockquote>", 
+            f"🔗 <b>Your Personal Website Link</b>\n\n<code>{login_url}</code>", 
             disable_web_page_preview=True,
             parse_mode=ParseMode.HTML
         )
     except Exception as e: logger.error(f"URL Cmd Error: {e}")
-    
+
 @app.on_message(filters.command("start"))
 async def start_handler(client, message):
     if len(message.command) > 1 and message.command[1].startswith("d_"):
@@ -505,31 +473,6 @@ async def export_cmd(client, message):
         if os.path.exists("lib.json"): os.remove("lib.json")
         if os.path.exists("lib.zip"): os.remove("lib.zip")
 
-@app.on_message(filters.command("fix_search") & filters.user(ADMIN_ID))
-async def fix_search_cmd(client, message):
-    s = await message.reply("🛠 **Fixing Search Index...**\nThis may take a minute.")
-    try:
-        # Drop existing indexes to clear corruption
-        await collection.drop_indexes()
-        
-        # Create the correct Text Index with Weights
-        # Giving Title higher weight means title matches appear first
-        await collection.create_index(
-            [
-                ("title", "text"), 
-                ("synopsis", "text"), 
-                ("author", "text"), 
-                ("tags", "text"),
-                ("file_name", "text")
-            ],
-            weights={"title": 10, "file_name": 5, "synopsis": 1},
-            name="TextIndex"
-        )
-        await s.edit("✅ **Search System Repaired!**\nindexes dropped and recreated.\nTry searching now.")
-    except Exception as e:
-        await s.edit(f"❌ Error: {e}")
-
-
 @app.on_message(filters.command("import") & filters.user(ADMIN_ID))
 async def import_cmd(client, message):
     if not message.reply_to_message or not message.reply_to_message.document: return await message.reply("Reply file.")
@@ -553,7 +496,18 @@ async def import_cmd(client, message):
         except: pass
     finally:
         if os.path.exists(path): os.remove(path)
-        
+
+@app.on_message(filters.command("fix_search") & filters.user(ADMIN_ID))
+async def fix_search_cmd(client, message):
+    s = await message.reply("🛠 **Reseting Search Indexes...**")
+    try:
+        await collection.drop_indexes()
+        await collection.create_index("file_unique_id", unique=True)
+        await collection.create_index("msg_id")
+        await s.edit("✅ Indexes Reset. Using Strict Regex Search (AND mode).")
+    except Exception as e:
+        await s.edit(f"❌ Error: {e}")
+
 @app.on_message(filters.text & filters.incoming & ~filters.command(["start", "stats", "index", "stop_index", "export", "import", "migrate", "url", "fix_search"]))
 async def search_handler(client, message):
     q = message.text.strip()
@@ -565,44 +519,30 @@ async def search_handler(client, message):
 
     try:
         words = real_q.split()
-        # 1. Strict Text Search (AND Logic)
-        text_query = " ".join([f'"{w}"' for w in words])
-        mongo_query = {"$text": {"$search": text_query}}
+        
+        # --- FIXED SEARCH LOGIC FOR BOT ---
+        # 1. Strict AND
+        # 2. Scope: Title OR Synopsis ONLY (No Author/Tags)
+        and_conditions = []
+        for word in words:
+            reg = re.compile(re.escape(word), re.IGNORECASE)
+            and_conditions.append({
+                "$or": [
+                    {"title": reg},
+                    {"synopsis": reg},
+                    {"file_name": reg}
+                ]
+            })
+            
+        mongo_query = { "$and": and_conditions }
         
         cnt = await collection.count_documents(mongo_query)
         
-        # 2. Fallback to Partial Title Search if no full text match
-        if cnt == 0:
-            and_conditions = []
-            for word in words:
-                escaped_word = re.escape(word)
-                pattern = re.compile(escaped_word, re.IGNORECASE)
-                
-                # Check if THIS specific word exists in ANY of these fields
-                and_conditions.append({
-                    "$or": [
-                        {"title": pattern},
-                        {"author": pattern},
-                        {"synopsis": pattern},
-                        {"file_name": pattern},
-                        {"tags": pattern}
-                    ]
-                })
-            
-            # Combine all word conditions with AND
-            mongo_query = {"$and": and_conditions}
-            cnt = await collection.count_documents(mongo_query)
-
         if cnt == 0:
             return await message.reply("❌ No matches found.")
 
-        # Fetch Top 8
+        # NO SORT (Performance)
         cursor = collection.find(mongo_query)
-        # CRITICAL FIX: Only sort by score if using text search.
-        # Sorting Regex results forces a full scan and hangs.
-        if "$text" in mongo_query:
-            cursor = cursor.sort([("score", {"$meta": "textScore"})])
-        
         res = await cursor.limit(8).to_list(length=8)
 
         sq = html.escape(real_q)
@@ -622,7 +562,7 @@ async def search_handler(client, message):
         await message.reply(txt, reply_markup=InlineKeyboardMarkup(btns), parse_mode=ParseMode.HTML)
     except Exception as e: 
         logger.error(f"Bot Search Error: {e}")
-        await message.reply("⚠️ Search Error. Try /fix_search if this persists.")
+        await message.reply(f"⚠️ Error: {e}")
 
 @app.on_callback_query()
 async def callback_handler(client, callback_query):
@@ -634,30 +574,42 @@ async def callback_handler(client, callback_query):
             real_q = q
             keep_result = False
             if q.startswith("!!"): keep_result=True; real_q=q[2:].strip()
-            try:
-                cnt = await collection.count_documents({"$text": {"$search": real_q}})
-                if cnt > 0:
-                    cursor = collection.find({"$text": {"$search": real_q}}).sort([("score", {"$meta": "textScore"})])
-                else:
-                    reg = {"$regex": real_q, "$options": "i"}
-                    cnt = await collection.count_documents({"$or": [{"title": reg}, {"file_name": reg}]})
-                    cursor = collection.find({"$or": [{"title": reg}, {"file_name": reg}]})
-            except: pass
+            
+            # REPLICATE LOGIC IN PAGINATION
+            words = real_q.split()
+            and_conditions = []
+            for word in words:
+                reg = re.compile(re.escape(word), re.IGNORECASE)
+                and_conditions.append({
+                    "$or": [
+                        {"title": reg},
+                        {"synopsis": reg},
+                        {"file_name": reg}
+                    ]
+                })
+            mongo_query = { "$and": and_conditions }
+            
+            cnt = await collection.count_documents(mongo_query)
+            cursor = collection.find(mongo_query)
+            
             res = await cursor.skip(p*8).limit(8).to_list(length=8)
             if not res: return await callback_query.answer("End.", show_alert=True)
+            
             btns = []
             for b in res:
                 label = get_button_label(b)[:40]
                 cb_data = f"v:{str(b['_id'])}:k" if keep_result else f"v:{str(b['_id'])}"
                 btns.append([InlineKeyboardButton(f"{label}", callback_data=cb_data)])
+            
             nav = []
             if p > 0: nav.append(InlineKeyboardButton("⬅️", callback_data=f"n:{p-1}:{q}"))
             nav.append(InlineKeyboardButton(f"{p+1}/{math.ceil(cnt/8)}", callback_data="nop"))
             if p < math.ceil(cnt/8)-1: nav.append(InlineKeyboardButton("➡️", callback_data=f"n:{p+1}:{q}"))
             btns.append(nav)
+            
             sq = html.escape(real_q)
-            line_sep = "-" * 101
-            txt = (f"🔎 Results fetched for your search : {sq}\nTotal Matches: {cnt}\n{line_sep}")
+            line_sep = "-" * 30
+            txt = (f"🔎 Results for: <b>{sq}</b>\nTotal Matches: {cnt}\n{line_sep}")
             await callback_query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(btns), parse_mode=ParseMode.HTML)
         except: await callback_query.answer("Error", show_alert=True)
     elif d.startswith("v:"):
@@ -698,35 +650,29 @@ async def callback_handler(client, callback_query):
         except: pass
 
 async def main():
-    await ensure_indexes()
-    
     logger.info("🤖 Starting Telegram Bot...")
     await app.start()
     
     # --- CRITICAL FIX FOR GHOST WEBHOOK (MANUAL) ---
     try:
-        logger.info("🧹 Nuking Webhook (Raw HTTP)...")
+        logger.info("🧹 Nuking Webhook...")
         with urllib.request.urlopen(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook?drop_pending_updates=True") as response:
-            logger.info(f"Webhook Status: {response.read().decode('utf-8')}")
+            pass
     except Exception as e:
-        logger.error(f"Webhook Nuke Failed (Ignorable if token invalid): {e}")
+        logger.error(f"Webhook Nuke Failed: {e}")
 
     global BOT_USERNAME
     me = await app.get_me()
     BOT_USERNAME = me.username
     logger.info(f"✅ Bot Started as @{BOT_USERNAME}")
 
-    # --- START WEB SERVER IN BACKGROUND ---
     logger.info("🚀 Launching Web Server...")
     web_config = Config()
     web_config.bind = [f"0.0.0.0:{PORT}"]
     
-    # Run server without blocking
     asyncio.create_task(serve(web_app, web_config))
-    
     await idle()
     await app.stop()
 
 if __name__ == '__main__':
-    # RESTORED TO WORKING EXECUTION METHOD
     app.run(main())

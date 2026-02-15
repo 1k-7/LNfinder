@@ -14,9 +14,7 @@ import urllib.request
 from bson.objectid import ObjectId 
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.errors import DuplicateKeyError
-# REMOVED: TextIndexVersion (This was the cause of the crash)
-
-from pyrogram import Client, filters, idle
+from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.enums import ParseMode
 from quart import Quart, request, render_template, redirect, url_for, jsonify, make_response, Response
@@ -44,6 +42,7 @@ except Exception as e:
 # --- LOGGING ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+# Enable INFO logs to see if messages arrive
 logging.getLogger("pyrogram").setLevel(logging.INFO)
 logging.getLogger("hypercorn").setLevel(logging.INFO)
 
@@ -67,7 +66,7 @@ if os.path.exists("sessions"):
     except: pass
 os.makedirs("sessions")
 
-# IPv6 False is critical for Northflank/Render
+# IPv6 False is critical for cloud containers
 app = Client("sessions/novel_bot_session", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, ipv6=False)
 
 # --- GLOBAL VARS ---
@@ -82,7 +81,8 @@ def get_button_label(title):
 
 # --- WEB ROUTES ---
 @web_app.route('/health')
-async def health(): return "OK", 200
+async def health(): 
+    return "OK", 200
 
 @web_app.route('/login')
 async def login():
@@ -168,6 +168,12 @@ async def api_dl(book_id):
     b = await collection.find_one({"_id": ObjectId(book_id)})
     await app.send_document(user_id, b['file_id'], caption=f"📖 {b.get('title')}")
     return jsonify({"status": "ok"})
+
+# --- DEBUG MIDDLEWARE ---
+@app.on_message(group=-1)
+async def debug_log(client, message):
+    # This prints EVERY message received. If this prints, your bot is working.
+    logger.info(f"📨 Update Received from {message.from_user.id}: {message.text or 'Media'}")
 
 # --- BOT HANDLERS ---
 @app.on_message(filters.command("start"))
@@ -285,7 +291,7 @@ async def cb_handler(c, cb):
         await cb.answer("🚀 Sending...")
         await c.send_document(cb.message.chat.id, b['file_id'], caption=f"📖 {b.get('title')}")
 
-# --- ADMIN FEATURES ---
+# --- ADMIN FEATURES (INDEXING/IMPORT) ---
 def parse_epub_direct(file_path):
     meta = {"title": None, "author": "Unknown", "synopsis": "No synopsis.", "tags": "", "cover_image": None}
     try:
@@ -414,7 +420,6 @@ async def import_cmd(c, m):
 
 # --- BACKGROUND TASKS ---
 async def ensure_indexes():
-    """Runs safely in background."""
     await asyncio.sleep(5)
     try:
         idxs = await collection.index_information()
@@ -428,7 +433,7 @@ async def main():
     logger.info("🤖 Starting...")
     await app.start()
     
-    # NUKE WEBHOOK (Fixes Polling issues)
+    # NUKE WEBHOOK
     try: await app.delete_webhook()
     except: pass
     
@@ -437,12 +442,14 @@ async def main():
     
     asyncio.create_task(ensure_indexes())
     
-    # Start Web Server (Non-blocking task)
+    # WEB SERVER IS THE MAIN LOOP (KEEPS APP ALIVE)
     config = Config(); config.bind = [f"0.0.0.0:{PORT}"]
     logger.info(f"🚀 Web Server starting on port {PORT}")
-    asyncio.create_task(serve(web_app, config))
     
-    await idle()
+    # await serve() BLOCKS here (keeping script alive), Bot runs in background
+    await serve(web_app, config)
+    
+    # Cleanup when web server stops
     await app.stop()
 
 if __name__ == '__main__':

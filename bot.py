@@ -15,7 +15,7 @@ from bs4 import BeautifulSoup
 from bson.objectid import ObjectId
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.errors import DuplicateKeyError
-from pymongo import TextIndexVersion
+# REMOVED: from pymongo import TextIndexVersion (Causes ImportError and was unused)
 
 # --- PYROGRAM IMPORTS ---
 from pyrogram import Client, filters, idle

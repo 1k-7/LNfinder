@@ -430,7 +430,7 @@ async def callback_handler(client, cb):
         except Exception as e:
             await cb.answer("Error navigating.", show_alert=True)
 
-        elif d.startswith("v:"):
+    elif d.startswith("v:"):
         # Parse data: v:ID or v:ID:k
         parts = d.split(":")
         bid = parts[1]

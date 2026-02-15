@@ -4,16 +4,13 @@ import os
 import logging
 import warnings
 import io
-import zipfile
-import html
-import re
 import shutil
-import random
-import json
+import re
+import html
 import base64
 import urllib.request 
 import xml.etree.ElementTree as ET
-from bs4 import BeautifulSoup
+import zipfile
 
 # --- DATABASE IMPORTS ---
 from bson.objectid import ObjectId 
@@ -24,7 +21,6 @@ from pymongo.errors import DuplicateKeyError
 from pyrogram import Client, filters, idle
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
 from pyrogram.enums import ParseMode
-from pyrogram.errors import FloodWait
 
 # --- WEB SERVER IMPORTS ---
 from quart import Quart, request, render_template, redirect, url_for, jsonify, make_response, Response
@@ -72,18 +68,16 @@ except Exception as e:
 
 # --- BACKGROUND TASKS ---
 async def ensure_indexes():
-    """Runs in background to fix DB without freezing the bot."""
-    await asyncio.sleep(5) 
+    """Runs silently in background to fix DB."""
+    await asyncio.sleep(10) # Wait 10s to let bot start fully
     try:
         indexes = await collection.index_information()
-        # Drop conflicting wildcard index if it exists
         if "$**_text" in indexes:
             logger.info("🗑️ Removing old wildcard index...")
             await collection.drop_index("$**_text")
 
         if "TextIndex" not in indexes:
             logger.info("🛠 Creating Text Index (Background)...")
-            # background=True ensures the DB doesn't lock up during this
             await collection.create_index(
                 [("title", "text"), ("synopsis", "text")], 
                 name="TextIndex", 
@@ -93,7 +87,7 @@ async def ensure_indexes():
         
         await collection.create_index("file_unique_id", unique=True, background=True)
         await collection.create_index("msg_id", background=True)
-        logger.info("✅ Database Indexes Verified.")
+        logger.info("✅ Database Optimized.")
     except Exception as e:
         logger.error(f"❌ Index Error (Non-fatal): {e}")
 
@@ -169,7 +163,6 @@ async def index():
 @web_app.route('/cover/<book_id>')
 async def serve_cover(book_id):
     try:
-        # 2s Timeout to prevent hanging
         b = await collection.find_one({"_id": ObjectId(book_id)}, {"cover_image": 1})
         if b and b.get('cover_image'): return Response(b['cover_image'], mimetype='image/jpeg')
     except: pass
@@ -191,7 +184,7 @@ async def search():
         search_terms = " ".join([f'"{w}"' for w in words])
         mongo_query = {"$text": {"$search": search_terms}}
         
-        # Max Time 5s to prevent timeouts
+        # 5s Timeout on DB calls
         cnt = await collection.count_documents(mongo_query, maxTimeMS=5000)
         if cnt == 0:
              and_conditions = []
@@ -201,8 +194,8 @@ async def search():
              mongo_query = { "$and": and_conditions }
              cnt = await collection.count_documents(mongo_query, maxTimeMS=5000)
 
+        # SERVER SIDE SYNOPSIS LOAD
         projection = {"title": 1, "author": 1, "synopsis": 1, "tags": 1, "file_name": 1, "_id": 1}
-        
         cursor = collection.find(mongo_query, projection)
         books_cursor = await cursor.skip(skip).limit(limit).to_list(length=limit)
         
@@ -247,6 +240,7 @@ async def api_download(book_id):
     except Exception as e: return jsonify({"status": "error", "message": str(e)}), 500
 
 # --- BOT INIT ---
+# NUCLEAR OPTION: Delete sessions folder to fix "Connection" errors
 if os.path.exists("sessions"):
     try: shutil.rmtree("sessions")
     except: pass
@@ -352,14 +346,13 @@ async def indexing_process(client, start_id, end_id, status_msg):
 
 @app.on_message(filters.command("ping"))
 async def ping_cmd(client, message):
-    # This command touches NO database. Use it to check if bot is alive.
-    await message.reply("🏓 Pong! Bot is alive.")
+    await message.reply("🏓 Pong!")
 
 @app.on_message(filters.command("url"))
 async def url_cmd(client, message):
     try:
         token = serializer.dumps(message.from_user.id)
-        await message.reply(f"🔗 <b>Link:</b>\n<code>{PUBLIC_URL}/login?token={token}</code>", parse_mode=ParseMode.HTML)
+        await message.reply(f"🔗 <b>Your Link:</b>\n<code>{PUBLIC_URL}/login?token={token}</code>", parse_mode=ParseMode.HTML)
     except: pass
 
 @app.on_message(filters.command("stats"))
@@ -445,7 +438,7 @@ async def bot_search(client, message):
     search_terms = " ".join([f'"{w}"' for w in words])
     mongo_query = {"$text": {"$search": search_terms}}
     
-    # 5s Timeout on DB calls to stop bot freezing
+    # 5s Timeout on DB calls
     try:
         cnt = await collection.count_documents(mongo_query, maxTimeMS=5000)
         if cnt == 0:
@@ -540,13 +533,14 @@ async def main():
     logger.info("🤖 Starting...")
     await app.start()
     
+    # Nuke Webhook to fix Polling
     try: await app.delete_webhook()
     except: pass
     
     global BOT_USERNAME; BOT_USERNAME = (await app.get_me()).username
     logger.info(f"✅ Started @{BOT_USERNAME}")
     
-    # Non-blocking Index Fix
+    # Run Indexer in Background
     asyncio.create_task(ensure_indexes())
     
     config = Config(); config.bind = [f"0.0.0.0:{PORT}"]

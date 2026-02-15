@@ -13,7 +13,6 @@ import base64
 import urllib.request 
 import xml.etree.ElementTree as ET
 from bs4 import BeautifulSoup
-# --- IMPORT RESTORED ---
 from bson.objectid import ObjectId 
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.errors import DuplicateKeyError
@@ -120,10 +119,8 @@ def build_strict_query(raw_query):
     and_conditions = []
     
     for word in words:
-        # Escape special regex characters to prevent errors
-        escaped_word = re.escape(word)
         # Create a regex that matches the word (case-insensitive)
-        regex = {"$regex": escaped_word, "$options": "i"}
+        regex = {"$regex": re.escape(word), "$options": "i"}
         
         # Logic: (Title has Word OR Synopsis has Word)
         condition = {
@@ -135,6 +132,8 @@ def build_strict_query(raw_query):
         and_conditions.append(condition)
     
     # Logic: Condition1 AND Condition2 AND ...
+    if not and_conditions:
+        return {}
     return {"$and": and_conditions}
 
 # --- WEB ROUTES ---
@@ -181,7 +180,7 @@ async def search():
     user_id = get_user_from_cookie()
     raw_query = request.args.get('q', '').strip()
     page = int(request.args.get('page', 1))
-    limit = 30
+    limit = 20
     skip = (page - 1) * limit
 
     if not raw_query:
@@ -192,29 +191,23 @@ async def search():
         mongo_query = build_strict_query(raw_query)
         
         # 2. Count Results (for Pagination)
+        # Using the same query ensures count matches the results found
         count = await collection.count_documents(mongo_query)
         
         # 3. Fetch Results
         # PROJECT: Exclude 'cover_image' (0) to prevent crash/timeout.
-        # Images will be loaded via the /cover/ route in HTML.
         cursor = collection.find(mongo_query, {"cover_image": 0})
-        cursor.skip(skip).limit(limit)
         
-        # 4. Convert Cursor to List (Compatible with older Motor)
-        books = []
-        # Fallback for different Motor versions
-        try:
-            books = await cursor.to_list(length=limit)
-        except:
-            while (await cursor.fetch_next):
-                books.append(cursor.next_object())
+        # Apply skip/limit
+        books_cursor = await cursor.skip(skip).limit(limit).to_list(length=limit)
 
         results = []
-        for b in books:
+        for b in books_cursor:
             syn = b.get('synopsis', 'No synopsis available.').strip()
             
-            # Since we excluded cover_image, we assume it might exist for the <img> tag URL
-            # The frontend will try to load /cover/ID. If it fails, alt text shows.
+            # Note: We don't have cover_image here, but we can assume checking it via a separate lightweight query 
+            # or just letting the frontend try to load it is better for performance.
+            # To be safe, we let the frontend load /cover/<id> and handle 404s gracefully.
             
             results.append({
                 "_id": str(b['_id']),
@@ -270,10 +263,8 @@ app = Client(
 
 # --- INDEXING PROCESS ---
 async def ensure_indexes():
-    # We still keep text indexes for other potential uses, 
-    # but the main search now uses Regex AND logic.
     try:
-        await collection.create_index([("title", "text"), ("synopsis", "text")])
+        await collection.create_index([("title", "text"), ("author", "text"), ("synopsis", "text")])
         await collection.create_index("file_unique_id", unique=True)
         await collection.create_index("msg_id")
     except: pass
@@ -504,18 +495,19 @@ async def import_cmd(client, message):
     finally:
         if os.path.exists(path): os.remove(path)
 
-# --- BOT SEARCH (STRICT) ---
+# --- BOT SEARCH (UPDATED STRICT LOGIC) ---
 @app.on_message(filters.text & filters.incoming & ~filters.command(["start", "stats", "index", "stop_index", "export", "import", "migrate", "url"]))
 async def bot_search_handler(client, message):
     q = message.text.strip()
     if len(q) > 100: return
     
+    # Use STRICT query builder
+    mongo_query = build_strict_query(q)
+    if not mongo_query: return
+    
     try:
-        # Build strict AND logic for bot as well
-        mongo_query = build_strict_query(q)
+        # Match the logic: Count and Find using SAME query
         cnt = await collection.count_documents(mongo_query)
-        
-        # We limit bot results to 8
         cursor = collection.find(mongo_query).limit(8)
         
         res = []

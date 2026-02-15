@@ -1,34 +1,23 @@
 version: '3.8'
-
 services:
-  meilisearch:
-    image: getmeili/meilisearch:v1.6
-    environment:
-      - MEILI_MASTER_KEY=masterKey123
-      - MEILI_NO_ANALYTICS=true
+  mongo:
+    image: mongo:latest
+    container_name: mongodb
+    restart: always
     volumes:
-      - meili_data:/meili_data
-    restart: always
+      - mongo_data:/data/db
 
-  web:
+  bot:
     build: .
-    command: python bot.py
-    ports:
-      - "8080:8080"
-    environment:
-      - API_ID=${API_ID}
-      - API_HASH=${API_HASH}
-      - BOT_TOKEN=${BOT_TOKEN}
-      - CHANNEL_ID=${CHANNEL_ID}
-      - ADMIN_ID=${ADMIN_ID}
-      - AZURE_URL=${AZURE_URL}
-      - PUBLIC_URL=${PUBLIC_URL}
-      - SECRET_KEY=${SECRET_KEY}
-      - MEILI_URL=http://meilisearch:7700
-      - MEILI_KEY=masterKey123
-    depends_on:
-      - meilisearch
+    container_name: telegram_novel_bot
     restart: always
+    depends_on:
+      - mongo
+    environment:
+      - MONGO_URI=mongodb://mongo:27017
+    volumes:
+      - ./sessions:/app/sessions  # Persist login sessions
+    command: python bot.py
 
 volumes:
-  meili_data:
+  mongo_data:

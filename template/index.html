@@ -6,250 +6,101 @@
     <title>FictionZone</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
-        :root {
-            --bg-body: #121212;
-            --bg-card: #1E1E1E;
-            --bg-input: #2C2C2C;
-            --text-main: #FFFFFF;
-            --text-muted: #B0B0B0;
-            --accent: #00E676; /* Bright Green */
-            --accent-hover: #00C853;
-            --border: #333333;
-        }
-
-        body {
-            font-family: 'Inter', sans-serif;
-            background-color: var(--bg-body);
-            color: var(--text-main);
-            margin: 0; padding: 0;
-            -webkit-font-smoothing: antialiased;
-        }
-
-        /* NAVBAR */
-        .navbar {
-            background-color: rgba(18, 18, 18, 0.95);
-            backdrop-filter: blur(10px);
-            padding: 15px 20px;
-            position: sticky; top: 0; z-index: 1000;
-            border-bottom: 1px solid var(--border);
-            display: flex; align-items: center; justify-content: space-between; gap: 20px;
-        }
-        .nav-brand {
-            font-weight: 700; font-size: 18px; color: var(--accent);
-            text-decoration: none; display: flex; align-items: center; gap: 8px;
-        }
-        .user-badge {
-            font-size: 12px; background: rgba(0, 230, 118, 0.1);
-            color: var(--accent); padding: 4px 10px; border-radius: 20px; white-space: nowrap;
-        }
-
-        /* SEARCH BAR */
-        .search-container { flex-grow: 1; max-width: 600px; position: relative; }
-        .search-input {
-            width: 100%; background: var(--bg-input); border: 1px solid transparent;
-            color: white; padding: 12px 20px; padding-right: 100px;
-            border-radius: 50px; font-size: 15px; outline: none; transition: all 0.3s;
-            box-sizing: border-box;
-        }
-        .search-input:focus { border-color: var(--accent); background: #252525; }
-        .search-btn {
-            position: absolute; right: 5px; top: 5px; bottom: 5px;
-            background: var(--accent); color: #000; border: none;
-            border-radius: 40px; padding: 0 20px; font-weight: 600; cursor: pointer;
-        }
-        .search-btn:hover { background: var(--accent-hover); }
-
-        /* LAYOUT */
+        :root { --bg-body: #121212; --bg-card: #1E1E1E; --bg-input: #2C2C2C; --text-main: #FFFFFF; --text-muted: #B0B0B0; --accent: #00E676; --border: #333333; }
+        body { font-family: 'Inter', sans-serif; background: var(--bg-body); color: var(--text-main); margin: 0; padding: 0; }
+        .navbar { background: rgba(18, 18, 18, 0.95); padding: 15px 20px; position: sticky; top: 0; z-index: 1000; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; }
+        .nav-brand { font-weight: 700; font-size: 18px; color: var(--accent); text-decoration: none; }
+        .search-container { flex-grow: 1; max-width: 600px; margin: 0 20px; position: relative; }
+        .search-input { width: 100%; background: var(--bg-input); border: 1px solid transparent; color: white; padding: 12px 20px; border-radius: 50px; outline: none; box-sizing: border-box; }
+        .search-btn { position: absolute; right: 5px; top: 5px; bottom: 5px; background: var(--accent); border: none; border-radius: 40px; padding: 0 20px; font-weight: 600; cursor: pointer; }
         .container { max-width: 1000px; margin: 0 auto; padding: 20px; }
-        .results-header {
-            display: flex; justify-content: space-between; align-items: center;
-            margin-bottom: 20px; color: var(--text-muted); font-size: 14px;
-        }
         .novel-list { display: flex; flex-direction: column; gap: 16px; }
-
-        /* CARD STYLE */
-        .card {
-            background: var(--bg-card); border-radius: 12px;
-            overflow: hidden; display: flex; border: 1px solid var(--border);
-            transition: transform 0.2s, min-height 0.2s; min-height: 180px; position: relative;
-        }
-        .card:hover { transform: translateY(-2px); border-color: #555; }
-        
-        .card-cover { 
-            width: 120px; min-width: 120px; background: #333; position: relative; 
-            display: flex; align-items: center; justify-content: center;
-        }
-        
-        /* THIS IS THE KEY: Standard IMG tag pointing to our optimized route */
-        .cover-img { 
-            width: 100%; height: 100%; object-fit: cover; 
-            position: absolute; top: 0; left: 0; 
-            background: #333;
-        }
-        
+        .card { background: var(--bg-card); border-radius: 12px; overflow: hidden; display: flex; border: 1px solid var(--border); min-height: 180px; }
+        .card-cover { width: 120px; min-width: 120px; background: #333; position: relative; }
+        .cover-img { width: 100%; height: 100%; object-fit: cover; }
         .card-body { padding: 16px; flex-grow: 1; display: flex; flex-direction: column; }
-        .card-title {
-            font-size: 16px; font-weight: 700; margin: 0 0 4px 0; color: white;
-            display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical; overflow: hidden;
-        }
+        .card-title { font-size: 16px; font-weight: 700; margin-bottom: 8px; color: white; }
         .card-meta { font-size: 13px; color: var(--accent); margin-bottom: 8px; }
-        
-        /* SYNOPSIS TOGGLE */
-        .synopsis-container { margin-bottom: auto; }
-        .synopsis {
-            font-size: 13px; color: var(--text-muted); line-height: 1.5;
-            max-height: 4.5em; overflow: hidden; transition: max-height 0.3s ease-out;
-        }
+        .synopsis { font-size: 13px; color: var(--text-muted); line-height: 1.5; max-height: 4.5em; overflow: hidden; transition: max-height 0.3s; }
         .synopsis.expanded { max-height: none; }
-        .read-more-btn {
-            background: none; border: none; color: var(--accent);
-            font-size: 12px; font-weight: 600; cursor: pointer; padding: 0; margin-top: 4px;
-        }
-        
-        .tags { display: flex; gap: 6px; margin-top: 10px; flex-wrap: wrap; }
-        .tag { background: #333; font-size: 11px; padding: 3px 8px; border-radius: 4px; color: #ccc; }
-        
-        .card-actions {
-            margin-left: 10px; padding: 16px; display: flex; flex-direction: column;
-            justify-content: center; border-left: 1px solid var(--border);
-            min-width: 100px; background: #232323;
-        }
-        .dl-btn {
-            background: transparent; border: 1px solid var(--accent); color: var(--accent);
-            padding: 8px 12px; border-radius: 6px; font-size: 13px; font-weight: 600;
-            cursor: pointer; text-decoration: none; text-align: center; transition: 0.2s;
-        }
-        .dl-btn:hover { background: var(--accent); color: black; }
-
-        /* PAGINATION */
-        .pagination { display: flex; justify-content: center; gap: 5px; margin-top: 40px; flex-wrap: wrap; }
-        .page-link {
-            min-width: 32px; height: 32px; display: flex; align-items: center;
-            justify-content: center; background: var(--bg-card); border: 1px solid var(--border);
-            color: var(--text-muted); text-decoration: none; border-radius: 6px;
-            font-size: 13px; transition: 0.2s;
-        }
-        .page-link:hover { border-color: var(--accent); color: var(--accent); }
-        .page-link.active { background: var(--accent); color: black; border-color: var(--accent); font-weight: bold; }
-        .page-dots { color: #666; display: flex; align-items: end; padding: 0 5px; }
-
-        @media (max-width: 600px) {
-            .navbar { flex-direction: column; align-items: stretch; }
-            .user-badge { position: absolute; top: 15px; right: 20px; }
-            .card { flex-direction: column; height: auto; }
-            .card-cover { width: 100%; height: 200px; min-height: 200px; }
-            .card-actions { border-left: none; border-top: 1px solid var(--border); flex-direction: row; padding: 12px; }
-            .dl-btn { width: 100%; }
-        }
+        .read-more-btn { background: none; border: none; color: var(--accent); font-size: 12px; cursor: pointer; padding: 0; margin-top: 5px; }
+        .card-actions { padding: 16px; display: flex; flex-direction: column; justify-content: center; border-left: 1px solid var(--border); background: #232323; min-width: 100px; }
+        .dl-btn { background: transparent; border: 1px solid var(--accent); color: var(--accent); padding: 8px; border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer; text-decoration: none; text-align: center; }
+        .pagination { display: flex; justify-content: center; gap: 5px; margin-top: 40px; padding-bottom: 40px; }
+        .page-link { min-width: 32px; height: 32px; display: flex; align-items: center; justify-content: center; background: var(--bg-card); border: 1px solid var(--border); color: var(--text-muted); text-decoration: none; border-radius: 6px; }
+        .page-link.active { background: var(--accent); color: black; font-weight: bold; }
+        @media (max-width: 600px) { .card { flex-direction: column; } .card-cover { width: 100%; height: 200px; } .card-actions { border-left: none; border-top: 1px solid var(--border); padding: 10px; flex-direction: row; } }
     </style>
 </head>
 <body>
     <div class="navbar">
         <a href="/" class="nav-brand">📚 FictionZone</a>
-        {% if user_id %}<div class="user-badge">User: {{ user_id }}</div>{% endif %}
         <form action="/search" method="get" class="search-container">
             <input type="text" name="q" class="search-input" placeholder="Search title..." value="{{ query }}">
             <button type="submit" class="search-btn">Search</button>
         </form>
     </div>
-
     <div class="container">
-        {% if error %}
-            <div style="color: #ff5252; background: rgba(255,82,82,0.1); padding: 10px; border-radius: 8px; margin-bottom: 20px;">{{ error }}</div>
-        {% endif %}
-
         {% if results %}
-            <div class="results-header">
-                <span>Found {{ count }} results</span>
-                <span>Page {{ page }} of {{ total_pages }}</span>
-            </div>
-
-            <div class="novel-list">
-                {% for book in results %}
-                <div class="card">
-                    <div class="card-cover">
-                        <img src="/cover/{{ book._id }}" class="cover-img" loading="lazy" alt="Cover">
-                    </div>
-                    <div class="card-body">
-                        <div class="card-title">{{ book.title }}</div>
-                        <div class="card-meta">👤 {{ book.author }}</div>
-                        <div class="synopsis-container">
-                            <div class="synopsis" id="syn-{{ book._id }}">{{ book.synopsis }}</div>
-                            {% if book.synopsis|length > 250 %}
-                                <button class="read-more-btn" id="btn-{{ book._id }}" onclick="toggleSynopsis('{{ book._id }}')">Show More</button>
-                            {% endif %}
-                        </div>
-                        {% if book.tags %}
-                        <div class="tags">
-                            {% for tag in book.tags[:4] %}
-                                <span class="tag">{{ tag.strip() }}</span>
-                            {% endfor %}
-                        </div>
-                        {% endif %}
-                    </div>
-                    <div class="card-actions">
-                        {% if user_id %}
-                            <button onclick="requestDownload('{{ book._id }}', this)" class="dl-btn">DOWNLOAD</button>
-                        {% else %}
-                            <a href="https://t.me/{{ bot_username }}?start=d_{{ book._id }}" class="dl-btn">GET BOT</a>
-                        {% endif %}
-                    </div>
+        <div class="results-header">
+            <span>Found {{ count }} results</span>
+            <span>Page {{ page }} of {{ total_pages }}</span>
+        </div>
+        <div class="novel-list">
+            {% for book in results %}
+            <div class="card">
+                <div class="card-cover">
+                    <img src="/cover/{{ book.id }}" class="cover-img" loading="lazy">
                 </div>
-                {% endfor %}
-            </div>
-
-            <div class="pagination">
-                {% if page > 1 %}
-                    <a href="/search?q={{ query }}&page={{ page - 1 }}" class="page-link">←</a>
-                {% endif %}
-                {% for p in pagination_list %}
-                    {% if p == '...' %}
-                        <span class="page-dots">...</span>
-                    {% else %}
-                        <a href="/search?q={{ query }}&page={{ p }}" class="page-link {% if p == page %}active{% endif %}">{{ p }}</a>
+                <div class="card-body">
+                    <div class="card-title">{{ book.title }}</div>
+                    <div class="card-meta">👤 {{ book.author }}</div>
+                    <div class="synopsis" id="syn-{{ book.id }}">
+                        {{ book.synopsis_preview }}
+                    </div>
+                    <button class="read-more-btn" id="btn-{{ book.id }}" onclick="loadDetails('{{ book.id }}')">Show Full</button>
+                    {% if book.tags %}
+                    <div style="margin-top:10px; display:flex; gap:5px; flex-wrap:wrap;">
+                        {% for t in book.tags[:3] %}<span style="background:#333; padding:2px 6px; border-radius:4px; font-size:11px; color:#ccc;">{{ t }}</span>{% endfor %}
+                    </div>
                     {% endif %}
-                {% endfor %}
-                {% if page < total_pages %}
-                    <a href="/search?q={{ query }}&page={{ page + 1 }}" class="page-link">→</a>
-                {% endif %}
+                </div>
+                <div class="card-actions">
+                    {% if user_id %}<button onclick="dl('{{ book.id }}', this)" class="dl-btn">DOWNLOAD</button>
+                    {% else %}<a href="https://t.me/{{ bot_username }}?start=d_{{ book.id }}" class="dl-btn">GET BOT</a>{% endif %}
+                </div>
             </div>
-
+            {% endfor %}
+        </div>
+        <div class="pagination">
+            {% for p in pagination_list %}
+                {% if p == '...' %}<span class="page-link">...</span>
+                {% else %}<a href="/search?q={{ query }}&page={{ p }}" class="page-link {% if p == page %}active{% endif %}">{{ p }}</a>{% endif %}
+            {% endfor %}
+        </div>
         {% elif query %}
-            <div style="text-align: center; margin-top: 80px; color: #666;">
-                <h2>No results found</h2>
-                <p>Try different keywords.</p>
-            </div>
-        {% else %}
-            <div style="text-align: center; margin-top: 100px; color: #555;">
-                <h1>Welcome to FictionZone</h1>
-                <p>Search specifically (e.g., "Hogwarts System").</p>
-            </div>
+        <div style="text-align: center; margin-top: 50px; color: #666;"><h2>No matches found.</h2></div>
         {% endif %}
     </div>
-
     <script>
-        function toggleSynopsis(id) {
-            var el = document.getElementById('syn-' + id);
-            var btn = document.getElementById('btn-' + id);
-            if (el.classList.contains('expanded')) {
-                el.classList.remove('expanded'); btn.innerText = 'Show More';
-            } else {
-                el.classList.add('expanded'); btn.innerText = 'Show Less';
-            }
+        async function loadDetails(id) {
+            let btn = document.getElementById('btn-'+id);
+            let syn = document.getElementById('syn-'+id);
+            if (btn.innerText === "Show Less") { syn.innerText = syn.getAttribute('data-preview'); syn.classList.remove('expanded'); btn.innerText = "Show Full"; return; }
+            if (!syn.getAttribute('data-preview')) syn.setAttribute('data-preview', syn.innerText);
+            
+            btn.innerText = "...";
+            let res = await fetch('/api/details/' + id);
+            let d = await res.json();
+            if (d.status === 'ok') { syn.innerText = d.synopsis; syn.classList.add('expanded'); btn.innerText = "Show Less"; }
         }
-        async function requestDownload(bookId, btn) {
-            var original = btn.innerText;
-            btn.innerText = "..."; btn.disabled = true;
+        async function dl(id, btn) {
+            btn.innerText = "...";
             try {
-                var res = await fetch('/api/download/' + bookId);
-                var d = await res.json();
-                if (d.status === 'ok') {
-                    btn.innerText = "✅";
-                    setTimeout(() => { btn.innerText = original; btn.disabled = false; }, 3000);
-                } else {
-                    alert(d.message); btn.innerText = "Error"; btn.disabled = false;
-                }
-            } catch (e) { btn.innerText = "Error"; btn.disabled = false; }
+                let res = await fetch('/api/download/' + id);
+                let d = await res.json();
+                btn.innerText = d.status === 'ok' ? "✅ SENT" : "❌ ERR";
+            } catch { btn.innerText = "❌ ERR"; }
         }
     </script>
 </body>

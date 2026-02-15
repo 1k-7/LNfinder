@@ -6,4 +6,3 @@ tgcrypto
 dnspython
 beautifulsoup4
 lxml
-meilisearch

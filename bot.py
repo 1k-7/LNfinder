@@ -17,7 +17,7 @@ from bson.objectid import ObjectId
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.errors import DuplicateKeyError
 
-# --- PYROBLACK IMPORTS ---
+# --- PYROGRAM IMPORTS ---
 from pyrogram import Client, filters, idle
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
 from pyrogram.enums import ParseMode
@@ -157,7 +157,8 @@ async def login():
 @web_app.route('/')
 async def index():
     user_id = get_user_from_cookie()
-    return await render_template('index.html', query="", results=[], count=0, user_id=user_id, bot_username=BOT_USERNAME)
+    # FIX: Pass default page/total_pages to prevent Jinja2 UndefinedError
+    return await render_template('index.html', query="", results=[], count=0, page=1, total_pages=0, user_id=user_id, bot_username=BOT_USERNAME)
 
 @web_app.route('/cover/<book_id>')
 async def serve_cover(book_id):
@@ -180,35 +181,31 @@ async def search():
     user_id = get_user_from_cookie()
     raw_query = request.args.get('q', '').strip()
     page = int(request.args.get('page', 1))
-    limit = 20
+    limit = 30
     skip = (page - 1) * limit
 
     if not raw_query:
-        return await render_template('index.html', query="", results=[], count=0, user_id=user_id, bot_username=BOT_USERNAME)
+        return await render_template('index.html', query="", results=[], count=0, page=1, total_pages=0, user_id=user_id, bot_username=BOT_USERNAME)
     
     try:
         # 1. Build the Strict Query
         mongo_query = build_strict_query(raw_query)
         
-        # 2. Count Results (for Pagination)
-        # Using the same query ensures count matches the results found
+        # 2. Count Results
         count = await collection.count_documents(mongo_query)
         
         # 3. Fetch Results
         # PROJECT: Exclude 'cover_image' (0) to prevent crash/timeout.
         cursor = collection.find(mongo_query, {"cover_image": 0})
         
-        # Apply skip/limit
+        # Apply skip/limit and fetch
         books_cursor = await cursor.skip(skip).limit(limit).to_list(length=limit)
 
         results = []
         for b in books_cursor:
             syn = b.get('synopsis', 'No synopsis available.').strip()
             
-            # Note: We don't have cover_image here, but we can assume checking it via a separate lightweight query 
-            # or just letting the frontend try to load it is better for performance.
-            # To be safe, we let the frontend load /cover/<id> and handle 404s gracefully.
-            
+            # Frontend will fetch cover via /cover/<id>
             results.append({
                 "_id": str(b['_id']),
                 "title": get_display_title(b),
@@ -229,7 +226,7 @@ async def search():
         )
     except Exception as e:
         logger.error(f"Search Error: {e}")
-        return await render_template('index.html', query=raw_query, results=[], count=0, error=str(e), user_id=user_id)
+        return await render_template('index.html', query=raw_query, results=[], count=0, page=1, total_pages=0, error="Search failed.", user_id=user_id)
 
 @web_app.route('/api/download/<book_id>')
 async def api_download(book_id):

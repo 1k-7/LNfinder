@@ -15,7 +15,6 @@ from bs4 import BeautifulSoup
 from bson.objectid import ObjectId
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.errors import DuplicateKeyError
-# REMOVED: from pymongo import TextIndexVersion (Causes ImportError and was unused)
 
 # --- PYROGRAM IMPORTS ---
 from pyrogram import Client, filters, idle
@@ -60,7 +59,8 @@ warnings.filterwarnings("ignore")
 
 # --- DATABASE SETUP ---
 try:
-    mongo_client = AsyncIOMotorClient(MONGO_URL)
+    # Adding serverSelectionTimeoutMS helps fail fast on DNS errors
+    mongo_client = AsyncIOMotorClient(MONGO_URL, serverSelectionTimeoutMS=5000)
     db = mongo_client[DB_NAME]
     collection = db[COLLECTION_NAME]
     logger.info("✅ Connected to MongoDB.")
@@ -152,18 +152,16 @@ async def search():
         formatted_query = format_strict_query(raw_query)
         
         # 1. Try Strict Text Search
-        # We assume indexes are set.
         count = await collection.count_documents({"$text": {"$search": formatted_query}})
         cursor = None
 
         if count > 0:
             cursor = collection.find(
                 {"$text": {"$search": formatted_query}},
-                {"score": {"$meta": "textScore"}} # Project score
+                {"score": {"$meta": "textScore"}} 
             ).sort([("score", {"$meta": "textScore"})])
         else:
             # 2. Fallback: Title Regex ONLY (Fast)
-            # Do NOT regex scan synopsis to avoid timeouts.
             reg = {"$regex": re.escape(raw_query), "$options": "i"}
             query_filter = {"title": reg}
             count = await collection.count_documents(query_filter)
@@ -172,13 +170,12 @@ async def search():
         # Optimize: Don't fetch full cover image binary, just check existence
         books_cursor = cursor.project({
             "title": 1, "author": 1, "synopsis": 1, "file_name": 1, 
-            "cover_image": {"$slice": 1} # Fetch 1 byte to check existence (Optimization)
+            "cover_image": {"$slice": 1} 
         }).skip(skip).limit(limit)
 
         results = []
         async for b in books_cursor:
             syn = b.get('synopsis', 'No synopsis available.').strip()
-            # We don't truncate text here, CSS handles visual truncation.
             
             has_cover = False
             if b.get('cover_image') and len(b['cover_image']) > 0:
@@ -241,8 +238,6 @@ async def ensure_indexes():
     """Run strict index creation on startup"""
     try:
         logger.info("⚙️ Verifying Database Indexes...")
-        # Drop legacy indexes if schema changed implies manual fix, but we try to create what we need.
-        # We prioritize Title and Synopsis for the text search
         await collection.create_index(
             [("title", "text"), ("synopsis", "text"), ("author", "text")],
             weights={"title": 10, "synopsis": 5, "author": 1},
@@ -281,7 +276,6 @@ def parse_epub_direct(file_path):
             if not opf_path: return meta
             try:
                 root = ET.fromstring(z.read(opf_path))
-                # Simple namespace-agnostic parsing for robustness
                 for elem in root.iter():
                     tag = elem.tag.split('}')[-1].lower()
                     if not elem.text: continue
@@ -293,7 +287,6 @@ def parse_epub_direct(file_path):
                     elif tag == 'subject': meta['tags'] += text + ", "
             except: pass
             
-            # Cover Extraction Logic
             cover_href = None
             manifest = next((e for e in root.iter() if e.tag.split('}')[-1].lower() == 'manifest'), None)
             if manifest:
@@ -318,7 +311,6 @@ def parse_epub_direct(file_path):
                     if cover_href in z.namelist(): meta['cover_image'] = z.read(cover_href)
                 except: pass
             
-            # Synopsis Fallback
             if meta['synopsis'] == "No synopsis.":
                 for n in z.namelist():
                     if 'intro' in n.lower() and n.endswith(('html','xhtml')):

@@ -14,6 +14,7 @@ import shutil
 import time
 import uuid
 import xml.etree.ElementTree as ET
+from datetime import datetime
 from bs4 import BeautifulSoup
 from bson.objectid import ObjectId 
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -189,22 +190,49 @@ class LocalSearchDB:
 
 local_db = LocalSearchDB()
 
-# --- QUERY CACHE ---
+# --- HYBRID QUERY CACHE (Inline + Mongo) ---
 class QueryCache:
-    def __init__(self):
-        self.cache = {}
-    def store(self, query_text):
-        qid = str(uuid.uuid4())[:8]
-        self.cache[qid] = {"q": query_text, "t": time.time()}
-        if len(self.cache) > 500:
-            now = time.time()
-            self.cache = {k:v for k,v in self.cache.items() if now - v['t'] < 3600}
-        return qid
-    def get(self, qid):
-        item = self.cache.get(qid)
-        return item['q'] if item else None
+    def __init__(self, db_instance):
+        self.col = db_instance['bot_queries']
+        self.has_index = False
 
-q_cache = QueryCache()
+    async def ensure_index(self):
+        if self.has_index: return
+        # Expire large queries after 30 days
+        try: await self.col.create_index("ts", expireAfterSeconds=2592000)
+        except: pass
+        self.has_index = True
+
+    async def store(self, query_text):
+        await self.ensure_index()
+        # HEURISTIC: Telegram Callback Data limit is 64 bytes.
+        # Format: n:{data}:{page}
+        # Overhead: 'n::' (3) + page number (1-3) ~ 6 chars.
+        # Safe limit for query payload: ~50 bytes.
+        
+        # 1. Try Inline (Stateless)
+        # Check if short enough and contains no restricted chars (:)
+        if len(query_text.encode('utf-8')) < 50 and ":" not in query_text:
+            return f"~{query_text}"  # Tilde prefix marks inline query
+            
+        # 2. Store in Mongo (Stateful)
+        # Check if identical query already exists to save space (optional, but good)
+        # For now, just insert new to keep it simple and fast
+        res = await self.col.insert_one({"q": query_text, "ts": datetime.utcnow()})
+        return str(res.inserted_id)
+
+    async def get(self, qid):
+        # 1. Check Inline
+        if qid.startswith("~"):
+            return qid[1:]
+            
+        # 2. Check Mongo
+        try:
+            doc = await self.col.find_one({"_id": ObjectId(qid)})
+            return doc['q'] if doc else None
+        except: return None
+
+q_cache = QueryCache(db)
 
 # --- WEB APP ---
 web_app = Quart(__name__, template_folder='template')
@@ -316,7 +344,7 @@ app = Client("sessions/novel_bot_session", api_id=API_ID, api_hash=API_HASH, bot
 async def bot_search_handler(client, message):
     q = message.text.strip()
     if len(q) < 2: return
-    qid = q_cache.store(q)
+    qid = await q_cache.store(q)
     await show_bot_page(client, message.chat.id, q, 1, qid)
 
 async def show_bot_page(client, chat_id, query_text, page, qid, message_to_edit=None):
@@ -355,7 +383,7 @@ async def callback_handler(client, cb):
     if d.startswith("n:"):
         try:
             _, qid, page = d.split(":")
-            query_text = q_cache.get(qid)
+            query_text = await q_cache.get(qid)
             if not query_text: return await cb.answer("❌ Search expired.", show_alert=True)
             await show_bot_page(client, cb.message.chat.id, query_text, int(page), qid, message_to_edit=cb.message)
         except: await cb.answer("Error navigating.", show_alert=True)

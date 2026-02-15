@@ -26,7 +26,7 @@ from pyrogram.enums import ParseMode
 from pyrogram.errors import FloodWait
 
 # --- WEB SERVER IMPORTS ---
-from quart import Quart, request, render_template, redirect, url_for, jsonify, make_response
+from quart import Quart, request, render_template, redirect, url_for, jsonify, make_response, send_file, Response
 from hypercorn.config import Config
 from hypercorn.asyncio import serve
 from itsdangerous import URLSafeTimedSerializer
@@ -42,7 +42,6 @@ try:
     AZURE_URL = os.environ.get("AZURE_URL")
     if not AZURE_URL: raise ValueError("Missing AZURE_URL")
     
-    # Optional legacy support
     LEGACY_STR = os.environ.get("MONGO_URI") or os.environ.get("MONGO_URL") or ""
     LEGACY_URIS = LEGACY_STR.split() if LEGACY_STR else []
     
@@ -156,13 +155,27 @@ async def index():
         bot_username=BOT_USERNAME
     )
 
+# --- IMAGE SERVER ROUTE (CRITICAL FOR PERFORMANCE) ---
+@web_app.route('/cover/<book_id>')
+async def serve_cover(book_id):
+    try:
+        # Fetch ONLY the cover image field
+        b = await collection.find_one({"_id": ObjectId(book_id)}, {"cover_image": 1})
+        if b and b.get('cover_image'):
+            return Response(b['cover_image'], mimetype='image/jpeg')
+        else:
+            # Return a 1x1 transparent pixel or 404 if no cover
+            return "", 404
+    except:
+        return "", 404
+
 @web_app.route('/search')
 async def search():
     user_id = get_user_from_cookie()
     query = request.args.get('q', '').strip()
     page = int(request.args.get('page', 1))
     
-    # PER-PAGE LIMIT (Not Total Limit)
+    # 50 per page (Safe now because covers are loaded separately)
     limit = 50
     skip = (page - 1) * limit
 
@@ -175,42 +188,46 @@ async def search():
     try:
         words = query.split()
         
-        # --- THE FIX: STRICT AND LOGIC ---
-        # For a book to show up, it must satisfy ALL word conditions.
-        # Condition = Word is in Title OR Synopsis OR Filename.
+        # --- LOGIC: STRICT AND (INTERSECTION) ---
+        # 1. Create a regex for each word
+        # 2. Build a condition: Word X must be in Title OR Synopsis OR File
+        # 3. AND all conditions together
         
         and_conditions = []
         for word in words:
-            # Case-insensitive regex allows "Hogwar" -> "Hogwarts"
             reg = re.compile(re.escape(word), re.IGNORECASE)
-            
-            word_condition = {
+            and_conditions.append({
                 "$or": [
                     {"title": reg},
                     {"synopsis": reg},
                     {"file_name": reg}
                 ]
-            }
-            and_conditions.append(word_condition)
+            })
             
-        # $and forces Intersection: All words must match.
         mongo_query = { "$and": and_conditions }
 
-        # EXECUTION
-        # No sorting ensures speed. We accept natural order.
+        # --- OPTIMIZATION: PROJECTION ---
+        # Exclude cover_image from the main search list to prevent timeouts.
+        # The HTML will fetch the images via the /cover/<id> route.
+        projection = {
+            "title": 1,
+            "author": 1,
+            "synopsis": 1,
+            "tags": 1,
+            "file_name": 1,
+            "_id": 1
+        }
+
+        # Execution (No Sort)
         cnt = await collection.count_documents(mongo_query)
-        cursor = collection.find(mongo_query)
-        
+        cursor = collection.find(mongo_query, projection)
         books_cursor = await cursor.skip(skip).limit(limit).to_list(length=limit)
         
         results = []
         for b in books_cursor:
-            cover_b64 = None
-            if b.get('cover_image'):
-                cover_b64 = base64.b64encode(b['cover_image']).decode('utf-8')
-            
             syn = b.get('synopsis', 'No synopsis available.').strip()
-            syn = re.sub(r'<[^>]+>', '', syn) 
+            # Clean HTML tags and truncate for speed, full text is still fetchable if needed
+            syn = re.sub(r'<[^>]+>', '', syn)[:300] + "..." 
             
             results.append({
                 "_id": str(b['_id']),
@@ -218,7 +235,7 @@ async def search():
                 "author": b.get('author', 'Unknown'),
                 "synopsis": syn,
                 "tags": b.get('tags', '').split(',') if b.get('tags') else [],
-                "cover_image": cover_b64
+                # Note: No cover data sent here. HTML uses /cover/ID
             })
 
         total_pages = math.ceil(cnt / limit)
@@ -507,8 +524,7 @@ async def fix_search_cmd(client, message):
     try:
         await collection.drop_indexes()
         
-        # Create separate indexes for each field we Regex search on.
-        # This allows the database to scan these fields efficiently.
+        # KEY OPTIMIZATION: Index fields used in regex
         await collection.create_index("title")
         await collection.create_index("synopsis")
         await collection.create_index("file_name")
@@ -531,8 +547,7 @@ async def search_handler(client, message):
     try:
         words = real_q.split()
         
-        # --- FIXED SEARCH LOGIC FOR BOT ---
-        # STRICT AND logic with Regex
+        # --- BOT SEARCH (STRICT AND) ---
         and_conditions = []
         for word in words:
             reg = re.compile(re.escape(word), re.IGNORECASE)
@@ -546,14 +561,13 @@ async def search_handler(client, message):
             
         mongo_query = { "$and": and_conditions }
         
-        # Fast Count
         cnt = await collection.count_documents(mongo_query)
         
         if cnt == 0:
             return await message.reply("❌ No matches found.")
 
-        # Fetch Top 10 (LIMIT 10)
-        cursor = collection.find(mongo_query)
+        # PROJECTION FOR BOT: Title only
+        cursor = collection.find(mongo_query, {"title": 1, "author": 1, "file_name": 1})
         res = await cursor.limit(10).to_list(length=10)
 
         sq = html.escape(real_q)
@@ -586,7 +600,6 @@ async def callback_handler(client, callback_query):
             keep_result = False
             if q.startswith("!!"): keep_result=True; real_q=q[2:].strip()
             
-            # REPLICATE LOGIC IN PAGINATION
             words = real_q.split()
             and_conditions = []
             for word in words:
@@ -601,9 +614,8 @@ async def callback_handler(client, callback_query):
             mongo_query = { "$and": and_conditions }
             
             cnt = await collection.count_documents(mongo_query)
-            cursor = collection.find(mongo_query)
+            cursor = collection.find(mongo_query, {"title": 1, "author": 1, "file_name": 1})
             
-            # PER-PAGE LIMIT: 10
             res = await cursor.skip(p*10).limit(10).to_list(length=10)
             if not res: return await callback_query.answer("End.", show_alert=True)
             

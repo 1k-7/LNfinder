@@ -326,7 +326,7 @@ async def show_bot_page(client, chat_id, query_text, page, qid, message_to_edit=
         else: await client.send_message(chat_id, "❌ No matches found.")
         return
 
-    txt = f"🔎 <b>Results for:</b> <i>{html.escape(query_text)}</i>\nFound: {count}\nPage: {page}\n\n——————————————————————"
+    txt = f"——————————————————————\n🔎 <b>Results for:</b> <i>{html.escape(query_text)}</i>\nFound: {count}\nPage: {page}\n——————————————————————"
     btns = []
     
     # CHECK FOR PREFIX TO KEEP MENU

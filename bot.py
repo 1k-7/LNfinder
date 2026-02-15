@@ -65,7 +65,7 @@ if os.path.exists("sessions"):
     except: pass
 os.makedirs("sessions")
 
-# IPv6 False is critical for Northflank/Render
+# IPv6 False is critical for cloud hosting stability
 app = Client("sessions/novel_bot_session", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, ipv6=False)
 
 # --- GLOBAL VARS ---
@@ -170,6 +170,7 @@ async def api_dl(book_id):
 # --- BOT HANDLERS ---
 @app.on_message(filters.command("start"))
 async def start_handler(client, message):
+    logger.info(f"CMD /start from {message.from_user.id}")
     if len(message.command) > 1 and message.command[1].startswith("d_"):
         try:
             bid = message.command[1].split("_", 1)[1]
@@ -180,7 +181,9 @@ async def start_handler(client, message):
     await message.reply("👋 **Library Bot**\n\nSearch: Just type text\nLink: /url\nStats: /stats\nPing: /ping")
 
 @app.on_message(filters.command("ping"))
-async def ping(c, m): await m.reply("🏓 Pong!")
+async def ping(c, m): 
+    logger.info(f"CMD /ping from {m.from_user.id}")
+    await m.reply("🏓 Pong!")
 
 @app.on_message(filters.command("url"))
 async def url_cmd(c, m):
@@ -202,6 +205,7 @@ async def fix_search(c, m):
 
 @app.on_message(filters.text & filters.incoming & ~filters.command(["start", "ping", "url", "stats", "index", "export", "import", "fix_search", "stop_index"]))
 async def bot_search(c, m):
+    logger.info(f"SEARCH from {m.from_user.id}: {m.text}")
     q = m.text.strip()
     if not q: return
     
@@ -357,10 +361,8 @@ async def indexing_process(client, start_id, end_id, status_msg):
     finally:
         for w in workers: w.cancel()
         indexing_active = False
-        if status_msg: 
-            try:
-                await status_msg.edit(f"✅ Done!\nSaved: {files_saved}")
-            except: pass
+        if status_msg: try: await status_msg.edit(f"✅ Done!\nSaved: {files_saved}")
+        except: pass
 
 @app.on_message(filters.command("index") & filters.user(ADMIN_ID))
 async def index_cmd(c, m):
@@ -426,17 +428,21 @@ async def main():
     logger.info("🤖 Starting...")
     await app.start()
     
-    # NUKE WEBHOOK (Fixes Polling issues)
-    try: await app.delete_webhook()
-    except: pass
+    # ⚠️ CRITICAL: Check webhook status
+    try:
+        logger.info("💥 Clearing any stuck Webhooks...")
+        await app.delete_webhook()
+        logger.info("✅ Webhook Cleared! Bot is entering Polling Mode.")
+    except Exception as e:
+        logger.error(f"⚠️ Webhook Clear Failed: {e}")
     
     global BOT_USERNAME; BOT_USERNAME = (await app.get_me()).username
     logger.info(f"✅ Bot Started: @{BOT_USERNAME}")
     
     asyncio.create_task(ensure_indexes())
     
-    # Start Web Server (Non-blocking task)
     config = Config(); config.bind = [f"0.0.0.0:{PORT}"]
+    logger.info(f"🚀 Web Server starting on port {PORT}")
     asyncio.create_task(serve(web_app, config))
     
     await idle()

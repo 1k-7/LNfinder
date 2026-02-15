@@ -71,7 +71,7 @@ except Exception as e:
     logger.error(f"❌ DB Connection Error: {e}")
     exit(1)
 
-# --- SQLITE LOCAL CACHE ---
+# --- SQLITE LOCAL CACHE (FTS5 Engine) ---
 class LocalSearchDB:
     def __init__(self, db_path="cache.db"):
         self.db_path = db_path
@@ -114,22 +114,17 @@ class LocalSearchDB:
         cursor = self.conn.cursor()
         data = []
         last_id = None
-        
         for b in books_list:
             t = b.get('title', '') or ''
             a = b.get('author', '') or ''
             s = b.get('synopsis', '') or ''
             fid = b.get('file_id', '')
             has_cov = 1 if b.get('cover_image') else 0
-            
             data.append((str(b['_id']), t, a, s, fid, has_cov))
             last_id = b['_id']
-            
         cursor.executemany("INSERT INTO books_fts(mongo_id, title, author, synopsis, file_id, cover_exists) VALUES (?, ?, ?, ?, ?, ?)", data)
         self.conn.commit()
-        
-        if last_id:
-            self.update_last_id(last_id)
+        if last_id: self.update_last_id(last_id)
 
     def search(self, query, page=1, limit=24):
         cursor = self.conn.cursor()
@@ -146,20 +141,16 @@ class LocalSearchDB:
         words = search_q.split()
         try:
             if len(words) == 1:
-                sql = """
-                    SELECT *, rowid FROM books_fts 
-                    WHERE title LIKE ? OR author LIKE ? OR synopsis LIKE ?
-                    ORDER BY rank LIMIT ? OFFSET ?
-                """
+                # Single Word: Loose LIKE search
+                sql = "SELECT *, rowid FROM books_fts WHERE title LIKE ? OR author LIKE ? OR synopsis LIKE ? ORDER BY rank LIMIT ? OFFSET ?"
                 wild = f"%{search_q}%"
                 cursor.execute(sql, (wild, wild, wild, limit, offset))
                 rows = cursor.fetchall()
-                
                 c_sql = "SELECT count(*) FROM books_fts WHERE title LIKE ? OR author LIKE ? OR synopsis LIKE ?"
                 cursor.execute(c_sql, (wild, wild, wild))
                 total = cursor.fetchone()[0]
-                
             else:
+                # Multi Word: Strict FTS5 AND
                 fts_query = " AND ".join([f'"{w}"' for w in words])
                 sql = "SELECT *, rowid FROM books_fts WHERE books_fts MATCH ? ORDER BY rank LIMIT ? OFFSET ?"
                 cursor.execute(sql, (fts_query, limit, offset))
@@ -178,7 +169,6 @@ class LocalSearchDB:
                     "has_cover": bool(r['cover_exists'])
                 })
             return results, total
-
         except Exception as e:
             logger.error(f"SQL Search Error: {e}")
             return [], 0
@@ -199,11 +189,10 @@ class LocalSearchDB:
 
 local_db = LocalSearchDB()
 
-# --- QUERY CACHE (For Bot Pagination) ---
+# --- QUERY CACHE ---
 class QueryCache:
     def __init__(self):
         self.cache = {}
-        
     def store(self, query_text):
         qid = str(uuid.uuid4())[:8]
         self.cache[qid] = {"q": query_text, "t": time.time()}
@@ -211,55 +200,34 @@ class QueryCache:
             now = time.time()
             self.cache = {k:v for k,v in self.cache.items() if now - v['t'] < 3600}
         return qid
-        
     def get(self, qid):
         item = self.cache.get(qid)
         return item['q'] if item else None
 
 q_cache = QueryCache()
 
-# --- WEB APP INIT ---
+# --- WEB APP ---
 web_app = Quart(__name__, template_folder='template')
 serializer = URLSafeTimedSerializer(SECRET_KEY)
-
-# --- GLOBAL STATE ---
 indexing_active = False
 BOT_USERNAME = None
 
-# --- SYNC LOGIC ---
+# --- SYNC ---
 def check_and_download_cache():
-    if os.path.exists("cache.db"):
-        logger.info("📂 Found local cache.db")
-        return
-
+    if os.path.exists("cache.db"): return
     if CACHE_DUMP_URL:
-        logger.info(f"⬇️ Downloading cache from {CACHE_DUMP_URL}...")
-        try:
-            urllib.request.urlretrieve(CACHE_DUMP_URL, "cache.db")
-            logger.info("✅ Download complete.")
-        except Exception as e:
-            logger.error(f"❌ Failed to download cache: {e}")
-    else:
-        logger.info("⚠️ No CACHE_DUMP_URL provided. Starting fresh.")
+        try: urllib.request.urlretrieve(CACHE_DUMP_URL, "cache.db")
+        except: pass
 
 async def sync_mongo_to_sqlite():
-    logger.info("🔄 Initializing Cache...")
     local_db.init_db()
-    
     last_id_str = local_db.get_last_id()
-    query = {}
-    
-    if last_id_str:
-        try:
-            query = {"_id": {"$gt": ObjectId(last_id_str)}}
-            logger.info(f"🔄 Resuming sync from ID: {last_id_str}")
-        except: pass
+    query = {"_id": {"$gt": ObjectId(last_id_str)}} if last_id_str else {}
     
     count = 0
     batch = []
-    projection = {"title": 1, "author": 1, "synopsis": 1, "file_id": 1, "cover_image": {"$slice": 1}}
-    
-    cursor = collection.find(query, projection).sort("_id", 1)
+    # Fetch text + cover existence check
+    cursor = collection.find(query, {"title": 1, "author": 1, "synopsis": 1, "file_id": 1, "cover_image": {"$slice": 1}}).sort("_id", 1)
     
     async for doc in cursor:
         batch.append(doc)
@@ -267,34 +235,25 @@ async def sync_mongo_to_sqlite():
             local_db.add_batch(batch)
             count += len(batch)
             batch = []
-            if count % 10000 == 0: logger.info(f"📥 Synced +{count} books...")
-    
-    if batch:
-        local_db.add_batch(batch)
-        count += len(batch)
-        
+            if count % 10000 == 0: logger.info(f"📥 Synced +{count}...")
+    if batch: local_db.add_batch(batch)
     local_db.ready = True
-    logger.info(f"✅ Sync Complete. Added {count} new books.")
 
 # --- HELPERS ---
 def get_user_from_cookie():
     token = request.cookies.get('auth_token')
     if not token: return None
-    try:
-        return serializer.loads(token, max_age=86400*30)
-    except:
-        return None
+    try: return serializer.loads(token, max_age=86400*30)
+    except: return None
 
 def get_display_title(book_doc):
     db_title = book_doc.get('title')
-    if db_title and db_title.strip() and db_title != "Unknown Title":
-        return db_title.strip()
+    if db_title and db_title.strip() and db_title != "Unknown Title": return db_title.strip()
     return book_doc.get('file_name', 'Unknown Book').replace('.epub', '').replace('_', ' ').strip()
 
-# --- WEB ROUTES ---
+# --- ROUTES ---
 @web_app.route('/health')
-async def health():
-    return "OK", 200
+async def health(): return "OK", 200
 
 @web_app.route('/login')
 async def login():
@@ -305,8 +264,7 @@ async def login():
         resp = await make_response(redirect(url_for('index')))
         resp.set_cookie('auth_token', serializer.dumps(user_id), max_age=86400*30)
         return resp
-    except:
-        return "❌ Invalid link.", 400
+    except: return "❌ Invalid link.", 400
 
 @web_app.route('/')
 async def index():
@@ -335,13 +293,8 @@ async def search():
     try:
         results, total_count = local_db.search(raw_query, page=page, limit=24)
         total_pages = math.ceil(total_count / 24)
-        
-        return await render_template(
-            'index.html', query=raw_query, results=results, count=total_count, 
-            page=page, total_pages=total_pages, user_id=user_id, bot_username=BOT_USERNAME
-        )
-    except Exception as e:
-        logger.error(f"Search Error: {e}")
+        return await render_template('index.html', query=raw_query, results=results, count=total_count, page=page, total_pages=total_pages, user_id=user_id, bot_username=BOT_USERNAME)
+    except:
         return await render_template('index.html', query=raw_query, results=[], count=0, page=1, total_pages=0, error="Search failed.", user_id=user_id)
 
 @web_app.route('/api/download/<book_id>')
@@ -351,71 +304,50 @@ async def api_download(book_id):
     try:
         b = await collection.find_one({"_id": ObjectId(book_id)})
         if not b: return jsonify({"status": "error", "message": "Book not found"}), 404
-        
-        await app.send_document(
-            chat_id=int(user_id),
-            document=b['file_id'],
-            caption=f"📖 {get_display_title(b)}\n\n<i>Sent via Web Interface</i>",
-            parse_mode=ParseMode.HTML
-        )
+        await app.send_document(chat_id=int(user_id), document=b['file_id'], caption=f"📖 {get_display_title(b)}\n\n<i>Sent via Web Interface</i>", parse_mode=ParseMode.HTML)
         return jsonify({"status": "ok"})
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
+    except Exception as e: return jsonify({"status": "error", "message": str(e)}), 500
 
-# --- BOT INIT ---
+# --- BOT ---
 if not os.path.exists("sessions"): os.makedirs("sessions")
 app = Client("sessions/novel_bot_session", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, sleep_threshold=60)
 
-# --- BOT SEARCH HANDLER ---
-@app.on_message(filters.text & filters.private & ~filters.command(["start", "url", "index", "stats", "export_cache", "import"]))
+@app.on_message(filters.text & filters.private & ~filters.command(["start", "url", "index", "stats", "export_cache"]))
 async def bot_search_handler(client, message):
     q = message.text.strip()
     if len(q) < 2: return
-    
     qid = q_cache.store(q)
     await show_bot_page(client, message.chat.id, q, 1, qid)
 
 async def show_bot_page(client, chat_id, query_text, page, qid, message_to_edit=None):
     results, count = local_db.search(query_text, page=page, limit=8)
-    
     if not results:
         if message_to_edit: await message_to_edit.edit("❌ No matches found.")
         else: await client.send_message(chat_id, "❌ No matches found.")
         return
 
     txt = f"🔎 **Results for:** `{html.escape(query_text)}`\nFound: {count}\nPage: {page}\n\n"
-        
     btns = []
     
-    # Check if query starts with strict prefixes
+    # CHECK FOR PREFIX TO KEEP MENU
     should_keep = query_text.strip().startswith(("!!", ".."))
     
     for b in results:
         title = b['title'][:50] if b['title'] else "Unknown"
-        # Append ':k' to data if we should keep the menu
+        # Append ':k' to the callback data if we should keep the menu
         c_data = f"v:{b['_id']}:k" if should_keep else f"v:{b['_id']}"
         btns.append([InlineKeyboardButton(title, callback_data=c_data)])
-
     
     nav = []
     total_pages = math.ceil(count / 8)
-    
-    if page > 1:
-        nav.append(InlineKeyboardButton("⬅️", callback_data=f"n:{qid}:{page-1}"))
-    
+    if page > 1: nav.append(InlineKeyboardButton("⬅️", callback_data=f"n:{qid}:{page-1}"))
     nav.append(InlineKeyboardButton(f"{page}/{total_pages}", callback_data="nop"))
-    
-    if page < total_pages:
-        nav.append(InlineKeyboardButton("➡️", callback_data=f"n:{qid}:{page+1}"))
-        
+    if page < total_pages: nav.append(InlineKeyboardButton("➡️", callback_data=f"n:{qid}:{page+1}"))
     btns.append(nav)
     
     kb = InlineKeyboardMarkup(btns)
-    
-    if message_to_edit:
-        await message_to_edit.edit_text(txt, reply_markup=kb, parse_mode=ParseMode.HTML)
-    else:
-        await client.send_message(chat_id, txt, reply_markup=kb, parse_mode=ParseMode.HTML)
+    if message_to_edit: await message_to_edit.edit_text(txt, reply_markup=kb, parse_mode=ParseMode.HTML)
+    else: await client.send_message(chat_id, txt, reply_markup=kb, parse_mode=ParseMode.HTML)
 
 @app.on_callback_query()
 async def callback_handler(client, cb):
@@ -423,15 +355,13 @@ async def callback_handler(client, cb):
     if d.startswith("n:"):
         try:
             _, qid, page = d.split(":")
-            page = int(page)
             query_text = q_cache.get(qid)
             if not query_text: return await cb.answer("❌ Search expired.", show_alert=True)
-            await show_bot_page(client, cb.message.chat.id, query_text, page, qid, message_to_edit=cb.message)
-        except Exception as e:
-            await cb.answer("Error navigating.", show_alert=True)
+            await show_bot_page(client, cb.message.chat.id, query_text, int(page), qid, message_to_edit=cb.message)
+        except: await cb.answer("Error navigating.", show_alert=True)
 
     elif d.startswith("v:"):
-        # Parse data: v:ID or v:ID:k
+        # Parse: v:ID or v:ID:k
         parts = d.split(":")
         bid = parts[1]
         keep_menu = len(parts) > 2 and parts[2] == 'k'
@@ -439,50 +369,33 @@ async def callback_handler(client, cb):
         b_mongo = await collection.find_one({"_id": ObjectId(bid)})
         if not b_mongo: return await cb.answer("Not found.", show_alert=True)
         
-        # --- PART 1: COVER & HEADER ---
-        header_text = (f"<blockquote>📖 <b>{html.escape(get_display_title(b_mongo))}</b>\n"
-                       f"👤 <i>{html.escape(b_mongo.get('author','Unknown'))}</i></blockquote>")
+        # --- PREPARE SPLIT MESSAGES ---
+        # 1. Header (Cover/Title)
+        header_text = (f"📖 <b>{html.escape(get_display_title(b_mongo))}</b>\n"
+                       f"👤 <i>{html.escape(b_mongo.get('author','Unknown'))}</i>")
         
-        # Only delete if the keep flag is NOT present
-        if not keep_menu: 
-            await cb.message.delete()
-        else: 
-            await cb.answer("Opening...")
-
+        # 2. Body (Synopsis/Button)
+        syn_text = f"<blockquote expandable><b>SYNOPSIS</b>\n\n{html.escape(b_mongo.get('synopsis','No synopsis.')[:1500])}</blockquote>"
+        kb = [[InlineKeyboardButton("📥 Get Book", callback_data=f"d:{bid}")]]
         
-        
-        # 2. Prepare Synopsis/Button Body
-        synopsis_text = f"<blockquote expandable>{html.escape(b_mongo.get('synopsis','No synopsis.')[:1000])}</blockquote>"
-        kb = [[InlineKeyboardButton("📥 Download", callback_data=f"d:{bid}")]]
-        
-        # --- MENU PRESERVATION LOGIC ---
-        keep_menu = False
-        try:
-            if cb.message and cb.message.text:
-                for line in cb.message.text.splitlines():
-                    if "Results for:" in line:
-                        query_part = line.split("Results for:", 1)[1].strip().replace('`', '')
-                        if query_part.startswith("!!") or query_part.startswith(".."):
-                            keep_menu = True
-                        break
-        except: pass
-        
+        # --- MENU LOGIC ---
         if not keep_menu:
             await cb.message.delete()
-            
-        # --- MESSAGE SPLITTING ---
-        # Msg 1: Cover/Title
+        else:
+            await cb.answer("Opening...")
+
+        # Send Msg 1: Cover/Title
         if b_mongo.get('cover_image'):
             try:
                 f = io.BytesIO(b_mongo['cover_image']); f.name="c.jpg"
                 await client.send_photo(cb.message.chat.id, f, caption=header_text, parse_mode=ParseMode.HTML)
-            except:
+            except: 
                 await client.send_message(cb.message.chat.id, header_text, parse_mode=ParseMode.HTML)
         else:
             await client.send_message(cb.message.chat.id, header_text, parse_mode=ParseMode.HTML)
-            
-        # Msg 2: Synopsis + Button
-        await client.send_message(cb.message.chat.id, synopsis_text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+
+        # Send Msg 2: Synopsis/Button
+        await client.send_message(cb.message.chat.id, syn_text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
 
     elif d.startswith("d:"):
         bid = d.split(":")[1]
@@ -495,8 +408,7 @@ async def callback_handler(client, cb):
 
 # --- COMMANDS ---
 @app.on_message(filters.command("start"))
-async def start_handler(client, message):
-    await message.reply("👋 **Library Bot**\nFast Engine Active ⚡")
+async def start_handler(client, message): await message.reply("👋 **LN Library**\nCached Engine Active ⚡")
 
 @app.on_message(filters.command("url"))
 async def url_cmd(client, message):

@@ -16,7 +16,7 @@
         .container { max-width: 1000px; margin: 0 auto; padding: 20px; }
         .novel-list { display: flex; flex-direction: column; gap: 16px; }
         .card { background: var(--bg-card); border-radius: 12px; overflow: hidden; display: flex; border: 1px solid var(--border); min-height: 180px; }
-        .card-cover { width: 120px; min-width: 120px; background: #333; position: relative; }
+        .card-cover { width: 120px; min-width: 120px; background: #333; position: relative; display:flex; align-items:center; justify-content:center; }
         .cover-img { width: 100%; height: 100%; object-fit: cover; }
         .card-body { padding: 16px; flex-grow: 1; display: flex; flex-direction: column; }
         .card-title { font-size: 16px; font-weight: 700; margin-bottom: 8px; color: white; }
@@ -55,13 +55,13 @@
                 <div class="card-body">
                     <div class="card-title">{{ book.title }}</div>
                     <div class="card-meta">👤 {{ book.author }}</div>
-                    <div class="synopsis" id="syn-{{ book.id }}">
+                    <div class="synopsis" id="syn-{{ book.id }}" data-preview="{{ book.synopsis_preview }}">
                         {{ book.synopsis_preview }}
                     </div>
-                    <button class="read-more-btn" id="btn-{{ book.id }}" onclick="loadDetails('{{ book.id }}')">Show Full</button>
+                    <button class="read-more-btn" id="btn-{{ book.id }}" onclick="loadDetails('{{ book.id }}')">Show More</button>
                     {% if book.tags %}
                     <div style="margin-top:10px; display:flex; gap:5px; flex-wrap:wrap;">
-                        {% for t in book.tags[:3] %}<span style="background:#333; padding:2px 6px; border-radius:4px; font-size:11px; color:#ccc;">{{ t }}</span>{% endfor %}
+                        {% for t in book.tags.split(',')[:3] if t %}<span style="background:#333; padding:2px 6px; border-radius:4px; font-size:11px; color:#ccc;">{{ t }}</span>{% endfor %}
                     </div>
                     {% endif %}
                 </div>
@@ -86,20 +86,33 @@
         async function loadDetails(id) {
             let btn = document.getElementById('btn-'+id);
             let syn = document.getElementById('syn-'+id);
-            if (btn.innerText === "Show Less") { syn.innerText = syn.getAttribute('data-preview'); syn.classList.remove('expanded'); btn.innerText = "Show Full"; return; }
-            if (!syn.getAttribute('data-preview')) syn.setAttribute('data-preview', syn.innerText);
+            
+            if (btn.innerText === "Show Less") {
+                syn.innerText = syn.getAttribute('data-preview');
+                syn.classList.remove('expanded');
+                btn.innerText = "Show More";
+                return;
+            }
             
             btn.innerText = "...";
-            let res = await fetch('/api/details/' + id);
-            let d = await res.json();
-            if (d.status === 'ok') { syn.innerText = d.synopsis; syn.classList.add('expanded'); btn.innerText = "Show Less"; }
+            try {
+                let res = await fetch('/api/details/' + id);
+                let d = await res.json();
+                if (d.status === 'ok') {
+                    syn.innerText = d.synopsis;
+                    syn.classList.add('expanded');
+                    btn.innerText = "Show Less";
+                }
+            } catch { btn.innerText = "Error"; }
         }
         async function dl(id, btn) {
+            let orig = btn.innerText;
             btn.innerText = "...";
             try {
                 let res = await fetch('/api/download/' + id);
                 let d = await res.json();
                 btn.innerText = d.status === 'ok' ? "✅ SENT" : "❌ ERR";
+                setTimeout(() => btn.innerText = orig, 3000);
             } catch { btn.innerText = "❌ ERR"; }
         }
     </script>

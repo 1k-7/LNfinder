@@ -304,7 +304,7 @@ async def api_download(book_id):
     try:
         b = await collection.find_one({"_id": ObjectId(book_id)})
         if not b: return jsonify({"status": "error", "message": "Book not found"}), 404
-        await app.send_document(chat_id=int(user_id), document=b['file_id'], caption=f"📖 {get_display_title(b)}\n\n<i>Sent via Web Interface</i>", parse_mode=ParseMode.HTML)
+        await app.send_document(chat_id=int(user_id), document=b['file_id'], caption=f"<blockquote>📖 {get_display_title(b)}\n\n<i>Sent via Web Interface</i></blockquote>", parse_mode=ParseMode.HTML)
         return jsonify({"status": "ok"})
     except Exception as e: return jsonify({"status": "error", "message": str(e)}), 500
 
@@ -402,7 +402,7 @@ async def callback_handler(client, cb):
         b = await collection.find_one({"_id": ObjectId(bid)})
         if b:
             await cb.answer("🚀 Sending...")
-            await client.send_document(cb.message.chat.id, b['file_id'], caption=f"📖 {get_display_title(b)}")
+            await client.send_document(cb.message.chat.id, b['file_id'], caption=f"<blockquote>📖 {get_display_title(b)}</blockquote>")
         else:
             await cb.answer("Error.", show_alert=True)
 
@@ -413,7 +413,7 @@ async def start_handler(client, message): await message.reply("👋 **LN Library
 @app.on_message(filters.command("url"))
 async def url_cmd(client, message):
     token = serializer.dumps(message.from_user.id)
-    await message.reply(f"🔗 [Login to Web Interface]({PUBLIC_URL}/login?token={token})", disable_web_page_preview=True)
+    await message.reply(f"<blockquote>🔗 [Login to Web Interface]({PUBLIC_URL}/login?token={token})</blockquote>", disable_web_page_preview=True)
 
 @app.on_message(filters.command("export_cache") & filters.user(ADMIN_ID))
 async def export_cache_cmd(client, message):

@@ -7,7 +7,6 @@ import io
 import zipfile
 import html
 import re
-import shutil
 import random
 import json
 import base64
@@ -18,7 +17,7 @@ from bs4 import BeautifulSoup
 # --- DATABASE IMPORTS ---
 from bson.objectid import ObjectId 
 from motor.motor_asyncio import AsyncIOMotorClient
-from pymongo.errors import DuplicateKeyError
+from pymongo.errors import DuplicateKeyError, OperationFailure
 
 # --- PYROGRAM IMPORTS ---
 from pyrogram import Client, filters, idle
@@ -44,7 +43,7 @@ try:
     if not AZURE_URL: raise ValueError("Missing AZURE_URL")
     
     PORT = int(os.environ.get("PORT", 8080))
-    # Ensure PUBLIC_URL doesn't have a trailing slash
+    # Remove trailing slash to prevent double // in links
     PUBLIC_URL = (os.environ.get("PUBLIC_URL") or f"http://0.0.0.0:{PORT}").rstrip('/')
     SECRET_KEY = os.environ.get("SECRET_KEY", "CHANGE_THIS_TO_RANDOM_STRING")
 
@@ -74,18 +73,33 @@ except Exception as e:
 # --- BACKGROUND TASKS ---
 async def ensure_indexes():
     """Runs in background to fix DB without freezing the bot."""
-    await asyncio.sleep(5) # Wait for bot to fully start first
+    await asyncio.sleep(3) # Short wait to let bot login first
     try:
         logger.info("🛠 Checking Indexes...")
-        indexes = await collection.index_information()
-        # Only create if missing to save startup time
-        if "TextIndex" not in indexes:
-            logger.info("🛠 Creating Text Index...")
-            await collection.create_index([("title", "text"), ("synopsis", "text")], name="TextIndex", weights={"title": 10, "synopsis": 1})
         
+        # 1. DELETE THE CONFLICTING WILDCARD INDEX
+        # This is the specific fix for your error log "Expected exactly one text index"
+        try:
+            await collection.drop_index("$**_text")
+            logger.info("🗑️ Deleted old Wildcard Index (This was causing the conflict).")
+        except Exception: 
+            pass # Index didn't exist, ignore
+            
+        # 2. CREATE THE OPTIMIZED TEXT INDEX
+        indexes = await collection.index_information()
+        if "TextIndex" not in indexes:
+            logger.info("🛠 Creating Optimized Text Index...")
+            await collection.create_index(
+                [("title", "text"), ("synopsis", "text")], 
+                name="TextIndex", 
+                weights={"title": 10, "synopsis": 1}
+            )
+        
+        # 3. ENSURE STANDARD INDEXES
         await collection.create_index("file_unique_id", unique=True)
         await collection.create_index("msg_id")
-        logger.info("✅ Database Optimized.")
+        
+        logger.info("✅ Database Fully Optimized.")
     except Exception as e:
         logger.error(f"❌ Index Error (Non-fatal): {e}")
 
@@ -164,7 +178,6 @@ async def serve_cover(book_id):
         b = await collection.find_one({"_id": ObjectId(book_id)}, {"cover_image": 1})
         if b and b.get('cover_image'): return Response(b['cover_image'], mimetype='image/jpeg')
     except: pass
-    # 1x1 Pixel
     return Response(base64.b64decode('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7'), mimetype='image/gif')
 
 @web_app.route('/search')
@@ -192,7 +205,7 @@ async def search():
              mongo_query = { "$and": and_conditions }
              cnt = await collection.count_documents(mongo_query)
 
-        # FETCH SYNOPSIS HERE FOR SERVER SIDE RENDER
+        # FETCH SYNOPSIS FOR PAGE (Server Side)
         projection = {"title": 1, "author": 1, "synopsis": 1, "tags": 1, "file_name": 1, "_id": 1}
         
         cursor = collection.find(mongo_query, projection)
@@ -239,12 +252,7 @@ async def api_download(book_id):
     except Exception as e: return jsonify({"status": "error", "message": str(e)}), 500
 
 # --- BOT INIT ---
-# Clean session to force new login and fix connection issues
-if os.path.exists("sessions"):
-    try: shutil.rmtree("sessions")
-    except: pass
-os.makedirs("sessions")
-
+if not os.path.exists("sessions"): os.makedirs("sessions")
 app = Client("sessions/novel_bot_session", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 # --- EPUB PARSER ---
@@ -347,7 +355,7 @@ async def indexing_process(client, start_id, end_id, status_msg):
 async def url_cmd(client, message):
     try:
         token = serializer.dumps(message.from_user.id)
-        await message.reply(f"🔗 <b>Link:</b>\n<code>{PUBLIC_URL}/login?token={token}</code>", parse_mode=ParseMode.HTML)
+        await message.reply(f"🔗 <b>Your Link:</b>\n<code>{PUBLIC_URL}/login?token={token}</code>", parse_mode=ParseMode.HTML)
     except: pass
 
 @app.on_message(filters.command("stats"))
@@ -419,11 +427,11 @@ async def import_cmd(client, message):
 
 @app.on_message(filters.command("fix_search") & filters.user(ADMIN_ID))
 async def fix_search_cmd(client, message):
-    # Manual Trigger for Indexing
-    s = await message.reply("🛠 **Rebuilding Index...**")
+    s = await message.reply("🛠 **Manually Rebuilding Index...**")
     await ensure_indexes()
-    await s.edit("✅ **Done!**")
+    await s.edit("✅ **Fixed!** Strict Search Enabled.")
 
+# --- BOT SEARCH ---
 @app.on_message(filters.text & filters.incoming & ~filters.command(["start", "index", "stop_index", "url", "export", "import", "fix_search", "stats"]))
 async def bot_search(client, message):
     q = message.text.strip()
@@ -492,47 +500,50 @@ async def cb_handler(client, cb):
     
     elif d.startswith("v:"):
         bid = d.split(':')[1]
-        b = await collection.find_one({"_id": ObjectId(bid)})
-        if not b: return await cb.answer("Gone.", show_alert=True)
-        
-        title = html.escape(b.get('title', 'Unknown'))
-        author = html.escape(b.get('author', 'Unknown'))
-        syn = html.escape(b.get('synopsis', 'No synopsis.').strip())
-        
-        caption = (f"<blockquote><b>{title}</b>\nAuthor: {author}</blockquote>\n\n"
-                   f"<blockquote expandable>{syn}</blockquote>")
-        
-        kb = [[InlineKeyboardButton("📥 Download", callback_data=f"d:{bid}")]]
-        
-        await cb.message.delete()
-        if b.get('cover_image'):
-            f = io.BytesIO(b['cover_image']); f.name="c.jpg"
-            try: await client.send_photo(cb.message.chat.id, f, caption=caption, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
-            except: await client.send_message(cb.message.chat.id, caption, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
-        else:
-            await client.send_message(cb.message.chat.id, caption, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+        try:
+            b = await collection.find_one({"_id": ObjectId(bid)})
+            if not b: return await cb.answer("Gone.", show_alert=True)
+            
+            title = html.escape(b.get('title', 'Unknown'))
+            author = html.escape(b.get('author', 'Unknown'))
+            syn = html.escape(b.get('synopsis', 'No synopsis.').strip())
+            
+            caption = (f"<blockquote><b>{title}</b>\nAuthor: {author}</blockquote>\n\n"
+                       f"<blockquote expandable><b>SYNOPSIS</b>\n\n{syn}</blockquote>")
+            
+            kb = [[InlineKeyboardButton("📥 Download", callback_data=f"d:{bid}")]]
+            
+            await cb.message.delete()
+            if b.get('cover_image'):
+                f = io.BytesIO(b['cover_image']); f.name="c.jpg"
+                try: await client.send_photo(cb.message.chat.id, f, caption=caption, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+                except: await client.send_message(cb.message.chat.id, caption, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+            else:
+                await client.send_message(cb.message.chat.id, caption, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+        except: await cb.answer("Error.", show_alert=True)
     
     elif d.startswith("d:"):
         bid = d.split(':')[1]
         b = await collection.find_one({"_id": ObjectId(bid)})
         await cb.answer("🚀 Sending...")
-        await client.send_document(cb.message.chat.id, b['file_id'], caption=f"📖 {b.get('title')}")
+        await client.send_document(cb.message.chat.id, b['file_id'], caption=f"📖 {get_display_title(b)}")
 
 async def main():
     logger.info("🤖 Starting...")
     await app.start()
     
-    # Force delete webhook to ensure polling works
     try: await app.delete_webhook()
     except: pass
     
     global BOT_USERNAME; BOT_USERNAME = (await app.get_me()).username
     logger.info(f"✅ Started @{BOT_USERNAME}")
     
-    # Run Indexer in Background (Non-blocking)
+    # LAUNCH INDEX FIXER IN BACKGROUND (Prevents startup hang)
     asyncio.create_task(ensure_indexes())
     
     config = Config(); config.bind = [f"0.0.0.0:{PORT}"]
+    logger.info(f"🚀 Web Server on {PORT}")
+    
     asyncio.create_task(serve(web_app, config))
     await idle()
     await app.stop()

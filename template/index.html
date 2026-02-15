@@ -10,14 +10,14 @@
         body { font-family: 'Inter', sans-serif; background: var(--bg-body); color: var(--text-main); margin: 0; padding: 0; }
         .navbar { background: rgba(18, 18, 18, 0.95); padding: 15px 20px; position: sticky; top: 0; z-index: 1000; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; gap: 20px; }
         .nav-brand { font-weight: 700; font-size: 18px; color: var(--accent); text-decoration: none; }
-        .search-container { flex-grow: 1; max-width: 600px; position: relative; }
+        .search-container { flex-grow: 1; max-width: 600px; margin: 0 20px; position: relative; }
         .search-input { width: 100%; background: var(--bg-input); border: 1px solid transparent; color: white; padding: 12px 20px; border-radius: 50px; outline: none; box-sizing: border-box; }
         .search-btn { position: absolute; right: 5px; top: 5px; bottom: 5px; background: var(--accent); border: none; border-radius: 40px; padding: 0 20px; font-weight: 600; cursor: pointer; }
         .container { max-width: 1000px; margin: 0 auto; padding: 20px; }
         .results-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; color: var(--text-muted); font-size: 14px; }
         .novel-list { display: flex; flex-direction: column; gap: 16px; }
         .card { background: var(--bg-card); border-radius: 12px; overflow: hidden; display: flex; border: 1px solid var(--border); min-height: 180px; }
-        .card-cover { width: 120px; min-width: 120px; background: #333; position: relative; }
+        .card-cover { width: 120px; min-width: 120px; background: #333; position: relative; display:flex; align-items:center; justify-content:center; }
         .cover-img { width: 100%; height: 100%; object-fit: cover; }
         .card-body { padding: 16px; flex-grow: 1; display: flex; flex-direction: column; }
         .card-title { font-size: 16px; font-weight: 700; margin: 0 0 4px 0; color: white; }
@@ -29,7 +29,7 @@
         .tag { background: #333; font-size: 11px; padding: 3px 8px; border-radius: 4px; color: #ccc; }
         .card-actions { margin-left: 10px; padding: 16px; display: flex; flex-direction: column; justify-content: center; border-left: 1px solid var(--border); min-width: 100px; background: #232323; }
         .dl-btn { background: transparent; border: 1px solid var(--accent); color: var(--accent); padding: 8px 12px; border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer; text-decoration: none; text-align: center; }
-        .pagination { display: flex; justify-content: center; gap: 5px; margin-top: 40px; flex-wrap: wrap; }
+        .pagination { display: flex; justify-content: center; gap: 5px; margin-top: 40px; padding-bottom: 40px; }
         .page-link { min-width: 32px; height: 32px; display: flex; align-items: center; justify-content: center; background: var(--bg-card); border: 1px solid var(--border); color: var(--text-muted); text-decoration: none; border-radius: 6px; }
         .page-link.active { background: var(--accent); color: black; border-color: var(--accent); font-weight: bold; }
         @media (max-width: 600px) { .card { flex-direction: column; } .card-cover { width: 100%; height: 200px; } .card-actions { border-left: none; border-top: 1px solid var(--border); flex-direction: row; padding: 12px; } }
@@ -39,7 +39,7 @@
     <div class="navbar">
         <a href="/" class="nav-brand">📚 FictionZone</a>
         <form action="/search" method="get" class="search-container">
-            <input type="text" name="q" class="search-input" placeholder="Search title..." value="{{ query }}">
+            <input type="text" name="q" class="search-input" placeholder="Search..." value="{{ query }}">
             <button type="submit" class="search-btn">Search</button>
         </form>
     </div>
@@ -55,8 +55,10 @@
                     <div class="card-body">
                         <div class="card-title">{{ book.title }}</div>
                         <div class="card-meta">👤 {{ book.author }}</div>
-                        <div class="synopsis" id="syn-{{ book._id }}">{{ book.synopsis }}</div>
-                        <button class="read-more-btn" id="btn-{{ book._id }}" onclick="toggleSynopsis('{{ book._id }}')">Show More</button>
+                        <div class="synopsis" id="syn-{{ book._id }}">
+                            {{ book.synopsis }}
+                        </div>
+                        <button class="read-more-btn" id="btn-{{ book._id }}" onclick="toggleSynopsis('{{ book._id }}', this)">Show More</button>
                         {% if book.tags %}
                         <div class="tags">{% for tag in book.tags[:4] %}<span class="tag">{{ tag.strip() }}</span>{% endfor %}</div>
                         {% endif %}
@@ -79,9 +81,8 @@
         {% endif %}
     </div>
     <script>
-        function toggleSynopsis(id) {
+        function toggleSynopsis(id, btn) {
             var el = document.getElementById('syn-' + id);
-            var btn = document.getElementById('btn-' + id);
             if (el.classList.contains('expanded')) {
                 el.classList.remove('expanded'); btn.innerText = 'Show More';
             } else {
@@ -89,11 +90,13 @@
             }
         }
         async function dl(bookId, btn) {
+            var orig = btn.innerText;
             btn.innerText = "...";
             try {
                 var res = await fetch('/api/download/' + bookId);
                 var d = await res.json();
                 btn.innerText = d.status === 'ok' ? "✅ SENT" : "Error";
+                setTimeout(() => btn.innerText = orig, 3000);
             } catch (e) { btn.innerText = "Error"; }
         }
     </script>

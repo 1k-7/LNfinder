@@ -371,8 +371,8 @@ async def callback_handler(client, cb):
         
         # --- PREPARE SPLIT MESSAGES ---
         # 1. Header (Cover/Title)
-        header_text = (f"📖 <b>{html.escape(get_display_title(b_mongo))}</b>\n"
-                       f"👤 <i>{html.escape(b_mongo.get('author','Unknown'))}</i>")
+        header_text = (f"<blockquote>📖 <b>{html.escape(get_display_title(b_mongo))}</b>\n"
+                       f"👤 <i>{html.escape(b_mongo.get('author','Unknown'))}</i></blockquote>")
         
         # 2. Body (Synopsis/Button)
         syn_text = f"<blockquote expandable><b>SYNOPSIS</b>\n\n{html.escape(b_mongo.get('synopsis','No synopsis.')[:1500])}</blockquote>"

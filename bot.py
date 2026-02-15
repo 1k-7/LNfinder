@@ -13,6 +13,7 @@ import base64
 import urllib.request 
 import xml.etree.ElementTree as ET
 from bs4 import BeautifulSoup
+# --- IMPORT RESTORED ---
 from bson.objectid import ObjectId 
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.errors import DuplicateKeyError
@@ -106,15 +107,35 @@ def get_display_title(book_doc):
         return fname.replace('.epub', '').replace('_', ' ').replace('-', ' ').strip()
     return "Unknown Book"
 
-def format_strict_query(query):
+def build_strict_query(raw_query):
     """
-    Transforms 'Harry Potter' into '"Harry" "Potter"'
-    to enforce strict AND logic in MongoDB Text Search.
+    Splits query into words.
+    Returns a MongoDB query that enforces EVERY word must appear
+    in EITHER the Title OR the Synopsis.
     """
-    cleaned = re.sub(r'[^\w\s]', '', query).strip()
-    if not cleaned: return ""
-    terms = cleaned.split()
-    return " ".join([f'"{term}"' for term in terms])
+    clean = re.sub(r'[^\w\s]', '', raw_query).strip()
+    if not clean: return {}
+    
+    words = clean.split()
+    and_conditions = []
+    
+    for word in words:
+        # Escape special regex characters to prevent errors
+        escaped_word = re.escape(word)
+        # Create a regex that matches the word (case-insensitive)
+        regex = {"$regex": escaped_word, "$options": "i"}
+        
+        # Logic: (Title has Word OR Synopsis has Word)
+        condition = {
+            "$or": [
+                {"title": regex},
+                {"synopsis": regex}
+            ]
+        }
+        and_conditions.append(condition)
+    
+    # Logic: Condition1 AND Condition2 AND ...
+    return {"$and": and_conditions}
 
 # --- WEB ROUTES ---
 @web_app.route('/health')
@@ -141,9 +162,13 @@ async def index():
 
 @web_app.route('/cover/<book_id>')
 async def serve_cover(book_id):
-    """Lazy load route for images"""
+    """
+    Dedicated route to serve cover images.
+    Prevents memory overflow during search.
+    """
     try:
         if not ObjectId.is_valid(book_id): return "", 404
+        # Fetch ONLY the cover_image field
         book = await collection.find_one({"_id": ObjectId(book_id)}, {"cover_image": 1})
         if book and book.get('cover_image'):
             return await make_response(book['cover_image'], 200, {'Content-Type': 'image/jpeg'})
@@ -156,57 +181,61 @@ async def search():
     user_id = get_user_from_cookie()
     raw_query = request.args.get('q', '').strip()
     page = int(request.args.get('page', 1))
-    limit = 30 # UX Requirement
+    limit = 30
     skip = (page - 1) * limit
 
     if not raw_query:
         return await render_template('index.html', query="", results=[], count=0, user_id=user_id, bot_username=BOT_USERNAME)
     
     try:
-        formatted_query = format_strict_query(raw_query)
-
-        # 1. Try Strict Text Search
-        # We assume indexes are set.
-        count = await collection.count_documents({"$text": {"$search": formatted_query}})
+        # 1. Build the Strict Query
+        mongo_query = build_strict_query(raw_query)
         
-        if count > 0:
-            cursor = collection.find(
-                {"$text": {"$search": formatted_query}},
-                {"score": {"$meta": "textScore"}} 
-            ).sort([("score", {"$meta": "textScore"})])
-        else:
-            # 2. Fallback: Title Regex ONLY
-            reg = {"$regex": re.escape(raw_query), "$options": "i"}
-            query_filter = {"title": reg}
-            count = await collection.count_documents(query_filter)
-            cursor = collection.find(query_filter)
-
-        # OPTIMIZATION: Do not fetch full cover image binary, just check existence
-        # This prevents the Internal Server Error and timeouts
-        books_cursor = await cursor.project({
-            "title": 1, "author": 1, "synopsis": 1, "file_name": 1, 
-            "cover_image": {"$slice": 1} # Fetch 1 byte to check existence
-        }).skip(skip).limit(limit).to_list(length=limit)
+        # 2. Count Results (for Pagination)
+        count = await collection.count_documents(mongo_query)
+        
+        # 3. Fetch Results
+        # PROJECT: Exclude 'cover_image' (0) to prevent crash/timeout.
+        # Images will be loaded via the /cover/ route in HTML.
+        cursor = collection.find(mongo_query, {"cover_image": 0})
+        cursor.skip(skip).limit(limit)
+        
+        # 4. Convert Cursor to List (Compatible with older Motor)
+        books = []
+        # Fallback for different Motor versions
+        try:
+            books = await cursor.to_list(length=limit)
+        except:
+            while (await cursor.fetch_next):
+                books.append(cursor.next_object())
 
         results = []
-        for b in books_cursor:
+        for b in books:
             syn = b.get('synopsis', 'No synopsis available.').strip()
             
-            has_cover = False
-            if b.get('cover_image') and len(b['cover_image']) > 0:
-                has_cover = True
-
+            # Since we excluded cover_image, we assume it might exist for the <img> tag URL
+            # The frontend will try to load /cover/ID. If it fails, alt text shows.
+            
             results.append({
                 "_id": str(b['_id']),
                 "title": get_display_title(b),
                 "author": b.get('author', 'Unknown'),
-                "synopsis": syn,
-                "has_cover": has_cover
+                "synopsis": syn
             })
 
         total_pages = math.ceil(count / limit)
-        return await render_template('index.html', query=raw_query, results=results, count=count, page=page, total_pages=total_pages, user_id=user_id, bot_username=BOT_USERNAME)
+        return await render_template(
+            'index.html', 
+            query=raw_query, 
+            results=results, 
+            count=count, 
+            page=page, 
+            total_pages=total_pages, 
+            user_id=user_id, 
+            bot_username=BOT_USERNAME
+        )
     except Exception as e:
+        logger.error(f"Search Error: {e}")
         return await render_template('index.html', query=raw_query, results=[], count=0, error=str(e), user_id=user_id)
 
 @web_app.route('/api/download/<book_id>')
@@ -241,34 +270,20 @@ app = Client(
 
 # --- INDEXING PROCESS ---
 async def ensure_indexes():
+    # We still keep text indexes for other potential uses, 
+    # but the main search now uses Regex AND logic.
     try:
-        # STRICT Search Requirement
-        await collection.create_index(
-            [("title", "text"), ("synopsis", "text")],
-            weights={"title": 10, "synopsis": 5},
-            name="TextSearchIndex"
-        )
+        await collection.create_index([("title", "text"), ("synopsis", "text")])
         await collection.create_index("file_unique_id", unique=True)
         await collection.create_index("msg_id")
     except: pass
 
-@app.on_message(filters.command("fix_search") & filters.user(ADMIN_ID))
-async def fix_search_cmd(client, message):
-    m = await message.reply("⚙️ Rebuilding indexes...")
-    try:
-        await collection.drop_indexes()
-        await ensure_indexes()
-        await m.edit("✅ Indexes rebuilt.")
-    except Exception as e:
-        await m.edit(f"❌ Error: {e}")
-
-# ... [KEEP YOUR EPUB PARSING FUNCTIONS HERE] ...
 def get_button_label(book_doc):
     full = get_display_title(book_doc)
     return re.sub(r'\s+(c|ch|chap|vol|v)\.?\s*\d+(?:[-–]\d+)?.*$', '', full, flags=re.IGNORECASE).strip()
 
 def parse_epub_direct(file_path):
-    # (Exact copy of your provided function)
+    # (Existing logic preserved exactly)
     meta = {"title": None, "author": "Unknown", "synopsis": "No synopsis.", "tags": "", "cover_image": None}
     try:
         with zipfile.ZipFile(file_path, 'r') as z:
@@ -397,10 +412,9 @@ async def indexing_process(client, start_id, end_id, status_msg):
             try: await status_msg.edit(f"✅ **Done!**\nScanned: `{end_id}`\nFound: `{files_found}`\nSaved: `{files_saved}`")
             except: pass
 
-# --- TELEGRAM HANDLERS (UNCHANGED EXCEPT SEARCH) ---
+# --- TELEGRAM HANDLERS ---
 @app.on_message(filters.command("url"))
 async def url_command(client, message):
-    logger.info(f"CMD /url from {message.from_user.id}")
     try:
         token = serializer.dumps(message.from_user.id)
         login_url = f"{PUBLIC_URL}/login?token={token}"
@@ -490,27 +504,26 @@ async def import_cmd(client, message):
     finally:
         if os.path.exists(path): os.remove(path)
 
-# --- BOT SEARCH (UPDATED STRICT LOGIC) ---
-@app.on_message(filters.text & filters.incoming & ~filters.command(["start", "stats", "index", "stop_index", "export", "import", "migrate", "url", "fix_search"]))
-async def search_handler(client, message):
+# --- BOT SEARCH (STRICT) ---
+@app.on_message(filters.text & filters.incoming & ~filters.command(["start", "stats", "index", "stop_index", "export", "import", "migrate", "url"]))
+async def bot_search_handler(client, message):
     q = message.text.strip()
     if len(q) > 100: return
     
-    # 1. Strict Query Formatting
-    formatted_query = format_strict_query(q)
-    
     try:
-        # 2. Strict Search
-        cnt = await collection.count_documents({"$text": {"$search": formatted_query}})
-        if cnt > 0:
-            cursor = collection.find({"$text": {"$search": formatted_query}}).sort([("score", {"$meta": "textScore"})])
-        else:
-            # 3. Fallback
-            reg = {"$regex": re.escape(q), "$options": "i"}
-            cnt = await collection.count_documents({"title": reg})
-            cursor = collection.find({"title": reg})
-            
-        res = await cursor.limit(8).to_list(length=8)
+        # Build strict AND logic for bot as well
+        mongo_query = build_strict_query(q)
+        cnt = await collection.count_documents(mongo_query)
+        
+        # We limit bot results to 8
+        cursor = collection.find(mongo_query).limit(8)
+        
+        res = []
+        try: res = await cursor.to_list(length=8)
+        except:
+             while (await cursor.fetch_next):
+                 res.append(cursor.next_object())
+                 
         if not res: return await message.reply("❌ No matches.")
         
         sq = html.escape(q)
@@ -522,53 +535,13 @@ async def search_handler(client, message):
             label = get_button_label(b)[:40]
             btns.append([InlineKeyboardButton(f"{label}", callback_data=f"v:{str(b['_id'])}")])
             
-        nav = []
-        # Calculate pages correctly based on STRICT count
-        nav.append(InlineKeyboardButton(f"1/{math.ceil(cnt/8)}", callback_data="nop"))
-        if cnt > 8: nav.append(InlineKeyboardButton("➡️", callback_data=f"n:1:{q[:20]}"))
-        btns.append(nav)
-        
         await message.reply(txt, reply_markup=InlineKeyboardMarkup(btns), parse_mode=ParseMode.HTML)
     except Exception as e: await message.reply(f"⚠️ {e}")
 
 @app.on_callback_query()
 async def callback_handler(client, callback_query):
     d = callback_query.data
-    if d.startswith("n:"):
-        try:
-            _, p, q = d.split(':', 2)
-            p = int(p)
-            formatted_query = format_strict_query(q)
-            
-            # Recalculate strict count for pagination
-            cnt = await collection.count_documents({"$text": {"$search": formatted_query}})
-            if cnt > 0:
-                cursor = collection.find({"$text": {"$search": formatted_query}}).sort([("score", {"$meta": "textScore"})])
-            else:
-                reg = {"$regex": re.escape(q), "$options": "i"}
-                cnt = await collection.count_documents({"title": reg})
-                cursor = collection.find({"title": reg})
-            
-            res = await cursor.skip(p*8).limit(8).to_list(length=8)
-            if not res: return await callback_query.answer("End.", show_alert=True)
-            
-            btns = []
-            for b in res:
-                label = get_button_label(b)[:40]
-                btns.append([InlineKeyboardButton(f"{label}", callback_data=f"v:{str(b['_id'])}")])
-            
-            nav = []
-            if p > 0: nav.append(InlineKeyboardButton("⬅️", callback_data=f"n:{p-1}:{q}"))
-            nav.append(InlineKeyboardButton(f"{p+1}/{math.ceil(cnt/8)}", callback_data="nop"))
-            if p < math.ceil(cnt/8)-1: nav.append(InlineKeyboardButton("➡️", callback_data=f"n:{p+1}:{q}"))
-            btns.append(nav)
-            
-            sq = html.escape(q)
-            line_sep = "-" * 101
-            txt = (f"🔎 Results fetched for: {sq}\nTotal Matches: {cnt}\n{line_sep}")
-            await callback_query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(btns), parse_mode=ParseMode.HTML)
-        except: await callback_query.answer("Error", show_alert=True)
-    elif d.startswith("v:"):
+    if d.startswith("v:"):
         try:
             parts = d.split(':')
             bid = parts[1]
@@ -579,7 +552,7 @@ async def callback_handler(client, callback_query):
             auth = b.get('author', 'Unknown')
             syn = b.get('synopsis', 'No synopsis.')
             
-            # New Blockquote Format
+            # Using Blockquotes
             text = (
                 f"<blockquote><b>{html.escape(title)}</b>\n"
                 f"<i>{html.escape(auth)}</i></blockquote>\n\n"
@@ -587,8 +560,8 @@ async def callback_handler(client, callback_query):
             )
             
             kb = [[InlineKeyboardButton("📥 Download", callback_data=f"d:{bid}")]]
-            await callback_query.message.delete()
             
+            await callback_query.message.delete()
             if b.get('cover_image'):
                 try:
                     f = io.BytesIO(b['cover_image']); f.name="c.jpg"
@@ -601,7 +574,6 @@ async def callback_handler(client, callback_query):
             logger.error(f"View Error: {e}")
             await callback_query.answer("Error displaying.", show_alert=True)
     elif d.startswith("d:"):
-        # (Download handler kept exactly as is)
         try:
             bid = d.split(':')[1]
             b = await collection.find_one({"_id": ObjectId(bid)})

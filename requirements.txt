@@ -6,3 +6,5 @@ quart
 hypercorn
 jinja2
 itsdangerous
+lxml
+dnspython

@@ -384,11 +384,18 @@ async def show_bot_page(client, chat_id, query_text, page, qid, message_to_edit=
         return
 
     txt = f"🔎 **Results for:** `{html.escape(query_text)}`\nFound: {count}\nPage: {page}\n\n"
+        
     btns = []
+    
+    # Check if query starts with strict prefixes
+    should_keep = query_text.strip().startswith(("!!", ".."))
     
     for b in results:
         title = b['title'][:50] if b['title'] else "Unknown"
-        btns.append([InlineKeyboardButton(title, callback_data=f"v:{b['_id']}")])
+        # Append ':k' to data if we should keep the menu
+        c_data = f"v:{b['_id']}:k" if should_keep else f"v:{b['_id']}"
+        btns.append([InlineKeyboardButton(title, callback_data=c_data)])
+
     
     nav = []
     total_pages = math.ceil(count / 8)
@@ -423,14 +430,26 @@ async def callback_handler(client, cb):
         except Exception as e:
             await cb.answer("Error navigating.", show_alert=True)
 
-    elif d.startswith("v:"):
-        bid = d.split(":")[1]
+        elif d.startswith("v:"):
+        # Parse data: v:ID or v:ID:k
+        parts = d.split(":")
+        bid = parts[1]
+        keep_menu = len(parts) > 2 and parts[2] == 'k'
+
         b_mongo = await collection.find_one({"_id": ObjectId(bid)})
         if not b_mongo: return await cb.answer("Not found.", show_alert=True)
         
-        # 1. Prepare Title/Author Header
+        # --- PART 1: COVER & HEADER ---
         header_text = (f"📖 <b>{html.escape(get_display_title(b_mongo))}</b>\n"
                        f"👤 <i>{html.escape(b_mongo.get('author','Unknown'))}</i>")
+        
+        # Only delete if the keep flag is NOT present
+        if not keep_menu: 
+            await cb.message.delete()
+        else: 
+            await cb.answer("Opening...")
+
+        
         
         # 2. Prepare Synopsis/Button Body
         synopsis_text = f"<blockquote expandable>{html.escape(b_mongo.get('synopsis','No synopsis.')[:1000])}</blockquote>"

@@ -3,239 +3,288 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>OmniLibrary</title>
-    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&display=swap" rel="stylesheet">
+    <title>LN Library</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
         :root {
-            --bg-dark: #020617;
-            --bg-card: #0f172a;
+            --bg-body: #0f172a;
+            --bg-card: #1e293b;
             --primary: #3b82f6;
             --primary-hover: #2563eb;
-            --text-main: #f8fafc;
-            --text-sub: #94a3b8;
-            --border: #1e293b;
+            --text-main: #f1f5f9;
+            --text-muted: #94a3b8;
+            --border: #334155;
+            
+            /* User Preferences (Defaults) */
+            --cols: 2;
+            --cover-scale: 1;
         }
+
+        /* --- Reset & Base --- */
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
-            font-family: 'Outfit', sans-serif;
-            background: linear-gradient(135deg, #020617 0%, #0f172a 100%);
+            font-family: 'Inter', sans-serif;
+            background: linear-gradient(180deg, #0f172a 0%, #020617 100%);
             color: var(--text-main);
             min-height: 100vh;
             display: flex; flex-direction: column;
         }
 
-        /* NAVBAR */
+        /* --- Navbar --- */
         .navbar {
-            background: rgba(15, 23, 42, 0.85);
-            backdrop-filter: blur(12px);
+            background: rgba(15, 23, 42, 0.95);
             border-bottom: 1px solid var(--border);
-            padding: 16px 32px;
+            padding: 1rem 2rem;
             display: flex; justify-content: space-between; align-items: center;
             position: sticky; top: 0; z-index: 100;
+            backdrop-filter: blur(10px);
         }
-        .brand { font-size: 1.4rem; font-weight: 700; color: var(--primary); text-decoration: none; letter-spacing: -0.5px; }
-        .user-info { font-size: 0.9rem; color: var(--text-sub); background: rgba(255,255,255,0.05); padding: 6px 12px; border-radius: 20px; border: 1px solid var(--border); }
-        .user-id { color: #fff; font-weight: 600; }
+        .logo { font-size: 1.5rem; font-weight: 700; color: var(--primary); text-decoration: none; letter-spacing: -0.02em; }
+        .nav-right { display: flex; align-items: center; gap: 1rem; }
+        .user-badge { font-size: 0.85rem; color: var(--text-muted); background: rgba(255,255,255,0.05); padding: 0.3rem 0.8rem; border-radius: 20px; }
+        .settings-btn {
+            background: none; border: none; cursor: pointer; color: var(--text-muted);
+            transition: color 0.2s; padding: 0.2rem;
+        }
+        .settings-btn:hover { color: var(--primary); }
 
-        /* HERO SECTION (Home Page) */
-        .hero {
-            flex-grow: 1;
-            display: flex; flex-direction: column;
-            align-items: center; justify-content: center;
-            padding: 20px; text-align: center;
+        /* --- Settings Panel --- */
+        .settings-modal {
+            position: absolute; top: 60px; right: 20px;
+            background: var(--bg-card); border: 1px solid var(--border);
+            padding: 1.5rem; border-radius: 12px;
+            box-shadow: 0 10px 25px rgba(0,0,0,0.5);
+            display: none; z-index: 200; width: 250px;
         }
-        .hero h1 {
-            font-size: 3rem; font-weight: 800; margin-bottom: 30px;
-            background: linear-gradient(to right, #60a5fa, #3b82f6, #a855f7);
-            -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-        }
-        .hero-search-wrapper { width: 100%; max-width: 600px; display: flex; flex-direction: column; gap: 15px; }
-        .hero-input {
-            width: 100%; padding: 18px 25px;
+        .settings-modal.active { display: block; animation: fadeIn 0.2s; }
+        .setting-group { margin-bottom: 1rem; }
+        .setting-label { display: block; font-size: 0.85rem; color: var(--text-muted); margin-bottom: 0.5rem; }
+        .setting-input { width: 100%; cursor: pointer; accent-color: var(--primary); }
+
+        /* --- Hero / Search --- */
+        .hero { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 2rem; text-align: center; }
+        .hero h1 { font-size: 3rem; margin-bottom: 2rem; background: linear-gradient(to right, #60a5fa, #3b82f6); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+        
+        .search-container { width: 100%; max-width: 600px; position: relative; }
+        .search-bar {
+            width: 100%; padding: 1rem 1.5rem;
             border-radius: 50px; border: 2px solid var(--border);
-            background: rgba(30, 41, 59, 0.5);
-            color: white; font-size: 1.1rem; outline: none;
-            transition: 0.3s;
+            background: rgba(30, 41, 59, 0.6); color: white;
+            font-size: 1.1rem; outline: none; transition: 0.3s;
         }
-        .hero-input:focus { border-color: var(--primary); box-shadow: 0 0 20px rgba(59, 130, 246, 0.15); background: rgba(30, 41, 59, 0.8); }
-        
-        .hero-btn {
-            padding: 16px; border-radius: 50px;
-            background: var(--primary); color: white;
-            font-size: 1.1rem; font-weight: 600; border: none;
-            cursor: pointer; transition: 0.3s; width: 100%;
-            box-shadow: 0 4px 15px rgba(59, 130, 246, 0.3);
+        .search-bar:focus { border-color: var(--primary); background: rgba(30, 41, 59, 0.9); box-shadow: 0 0 0 4px rgba(59, 130, 246, 0.15); }
+        .search-btn-hero {
+            margin-top: 1rem; padding: 0.8rem 2rem; width: 100%;
+            background: var(--primary); color: white; border: none;
+            border-radius: 12px; font-weight: 600; cursor: pointer;
+            transition: 0.2s;
         }
-        .hero-btn:hover { background: var(--primary-hover); transform: translateY(-2px); }
+        .search-btn-hero:hover { background: var(--primary-hover); }
 
-        /* HEADER SEARCH (Results Page) */
-        .top-search-bar {
-            background: var(--bg-card); border-bottom: 1px solid var(--border);
-            padding: 15px 0;
-        }
-        .inline-form {
-            width: 90%; max-width: 800px; margin: 0 auto;
-            display: flex; gap: 10px;
-        }
-        .inline-input {
-            flex-grow: 1; padding: 12px 20px;
-            border-radius: 12px; border: 1px solid var(--border);
-            background: #020617; color: white; font-size: 1rem;
-            outline: none;
-        }
+        /* --- Results Header --- */
+        .results-header { background: var(--bg-card); padding: 1rem 0; border-bottom: 1px solid var(--border); }
+        .inline-search { max-width: 800px; margin: 0 auto; display: flex; gap: 10px; padding: 0 1rem; }
+        .inline-input { flex: 1; padding: 0.8rem 1.2rem; border-radius: 8px; border: 1px solid var(--border); background: #020617; color: white; outline: none; }
         .inline-input:focus { border-color: var(--primary); }
-        .inline-btn {
-            width: 20%; min-width: 100px;
-            background: var(--primary); color: white;
-            border: none; border-radius: 12px; font-weight: 600;
-            cursor: pointer; transition: 0.2s;
-        }
-        .inline-btn:hover { background: var(--primary-hover); }
+        .inline-btn { width: 20%; background: var(--primary); color: white; border: none; border-radius: 8px; font-weight: 600; cursor: pointer; }
 
-        /* GRID */
-        .results-info { max-width: 1400px; margin: 20px auto 0; padding: 0 20px; color: var(--text-sub); }
+        /* --- Grid System --- */
+        .main-container { max-width: 1400px; margin: 0 auto; padding: 2rem; width: 100%; }
         .grid {
-            display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
-            gap: 20px; max-width: 1400px; margin: 20px auto; padding: 0 20px;
+            display: grid;
+            /* Use user pref --cols, default to responsive auto-fill if not set */
+            grid-template-columns: repeat(var(--cols), 1fr);
+            gap: 1.5rem;
         }
+        /* Mobile Default Override */
+        @media (max-width: 768px) {
+            :root { --cols: 2; } /* Default mobile columns */
+        }
+
         .card {
-            background: var(--bg-card); border-radius: 12px; overflow: hidden;
-            border: 1px solid var(--border);
+            background: var(--bg-card); border-radius: 12px;
+            overflow: hidden; border: 1px solid var(--border);
             display: flex; flex-direction: column;
-            transition: transform 0.2s, box-shadow 0.2s;
+            transition: transform 0.2s;
         }
-        .card:hover { transform: translateY(-5px); box-shadow: 0 10px 25px rgba(0,0,0,0.4); border-color: var(--primary); }
+        .card:hover { transform: translateY(-4px); border-color: var(--primary); }
+
+        .cover-box {
+            width: 100%; overflow: hidden; position: relative;
+            padding-top: calc(150% * var(--cover-scale)); /* Aspect Ratio Scaler */
+            background: #000;
+        }
+        .cover-img {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            object-fit: cover; transition: opacity 0.3s;
+        }
+
+        .info { padding: 1rem; display: flex; flex-direction: column; flex: 1; }
+        .book-title { font-weight: 700; font-size: 1rem; line-height: 1.3; margin-bottom: 0.3rem; }
+        .book-author { color: var(--primary); font-size: 0.85rem; margin-bottom: 0.8rem; }
         
-        .cover-wrap { width: 100%; aspect-ratio: 2/3; background: #0b1120; position: relative; overflow: hidden; }
-        .cover-img { width: 100%; height: 100%; object-fit: cover; transition: 0.3s; }
-        .cover-img.loaded { opacity: 1; }
-        
-        .info { padding: 12px; flex-grow: 1; display: flex; flex-direction: column; }
-        .title { font-weight: 700; font-size: 0.95rem; margin-bottom: 5px; line-height: 1.4; color: #fff; }
-        .author { font-size: 0.8rem; color: var(--primary); margin-bottom: 10px; font-weight: 500; }
-        
-        .dl-btn {
+        .synopsis {
+            font-size: 0.85rem; color: var(--text-muted); margin-bottom: 1rem;
+            display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical;
+            overflow: hidden; transition: 0.3s; line-height: 1.5;
+        }
+        .synopsis.expanded { -webkit-line-clamp: unset; overflow: visible; }
+        .read-more { background: none; border: none; color: var(--primary); font-size: 0.75rem; cursor: pointer; padding: 0; margin-bottom: 1rem; display: block; }
+
+        .get-btn {
             margin-top: auto; display: block; width: 100%;
             background: rgba(59, 130, 246, 0.1); color: var(--primary);
-            text-align: center; padding: 8px; border-radius: 8px;
-            text-decoration: none; font-weight: 600; font-size: 0.85rem;
-            border: 1px solid rgba(59, 130, 246, 0.2); transition: 0.2s; cursor: pointer;
+            text-align: center; padding: 0.8rem; border-radius: 8px;
+            text-decoration: none; font-weight: 600; border: 1px solid rgba(59, 130, 246, 0.2);
+            transition: 0.2s; cursor: pointer;
         }
-        .dl-btn:hover { background: var(--primary); color: white; }
+        .get-btn:hover { background: var(--primary); color: white; }
 
-        /* PAGINATION */
-        .pagination { display: flex; justify-content: center; gap: 6px; padding: 40px 0; flex-wrap: wrap; }
+        /* --- Pagination --- */
+        .pagination { margin-top: 3rem; display: flex; justify-content: center; gap: 0.5rem; flex-wrap: wrap; }
         .page-link {
-            min-width: 36px; height: 36px; display: flex; align-items: center; justify-content: center;
-            background: var(--bg-card); border: 1px solid var(--border); color: var(--text-sub);
-            border-radius: 8px; text-decoration: none; font-size: 0.9rem; transition: 0.2s;
+            width: 36px; height: 36px; display: flex; align-items: center; justify-content: center;
+            background: var(--bg-card); border: 1px solid var(--border); color: var(--text-muted);
+            border-radius: 8px; text-decoration: none; transition: 0.2s;
         }
-        .page-link:hover { border-color: var(--primary); color: white; }
-        .page-link.active { background: var(--primary); color: white; border-color: var(--primary); }
-        .dots { color: var(--text-sub); padding: 8px; }
+        .page-link:hover, .page-link.active { border-color: var(--primary); background: var(--primary); color: white; }
+
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(-10px); } to { opacity: 1; transform: translateY(0); } }
     </style>
 </head>
 <body>
 
     <nav class="navbar">
-        <a href="/" class="brand">OmniPortal</a>
-        {% if user_id %}
-            <div class="user-info">Logged in as: <span class="user-id">{{ user_id }}</span></div>
-        {% else %}
-            <a href="https://t.me/{{ bot_username }}" class="user-info" style="text-decoration: none;">Login via Bot</a>
-        {% endif %}
+        <a href="/" class="logo">LN Library</a>
+        <div class="nav-right">
+            {% if user_id %}
+                <span class="user-badge">User: {{ user_id }}</span>
+            {% else %}
+                <a href="https://t.me/{{ bot_username }}" class="user-badge" style="text-decoration:none">Login</a>
+            {% endif %}
+            
+            <button class="settings-btn" onclick="toggleSettings()">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z"/>
+                    <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1Z"/>
+                </svg>
+            </button>
+        </div>
     </nav>
+
+    <div class="settings-modal" id="settingsPanel">
+        <div class="setting-group">
+            <label class="setting-label">Books per Row: <span id="colVal">2</span></label>
+            <input type="range" min="1" max="6" value="2" class="setting-input" oninput="updateCols(this.value)">
+        </div>
+        <div class="setting-group">
+            <label class="setting-label">Cover Height</label>
+            <input type="range" min="0.5" max="1.2" step="0.1" value="1" class="setting-input" oninput="updateScale(this.value)">
+        </div>
+    </div>
 
     {% if not query %}
         <div class="hero">
-            <h1>Discover Your Next Story</h1>
-            <form action="/search" method="get" class="hero-search-wrapper">
-                <input type="text" name="q" class="hero-input" placeholder="Search for novels, authors, or tags..." autofocus>
-                <button type="submit" class="hero-btn">Search</button>
-            </form>
+            <h1>LN Library</h1>
+            <div class="search-container">
+                <form action="/search" method="get">
+                    <input type="text" name="q" class="search-bar" placeholder="Search title or author..." autofocus>
+                    <button type="submit" class="search-btn-hero">Search</button>
+                </form>
+            </div>
         </div>
     {% else %}
-        <div class="top-search-bar">
-            <form action="/search" method="get" class="inline-form">
-                <input type="text" name="q" class="inline-input" value="{{ query }}" placeholder="Search...">
+        <div class="results-header">
+            <form action="/search" method="get" class="inline-search">
+                <input type="text" name="q" class="inline-input" value="{{ query }}">
                 <button type="submit" class="inline-btn">Search</button>
             </form>
         </div>
 
-        <div class="results-info">Found {{ count }} novels</div>
+        <div class="main-container">
+            <div style="margin-bottom: 20px; color: var(--text-muted);">Found {{ count }} novels</div>
+            
+            <div class="grid">
+                {% for book in results %}
+                <div class="card">
+                    <div class="cover-box">
+                        <img src="/cover/{{ book._id }}" loading="lazy" class="cover-img" onload="this.style.opacity=1" style="opacity:0">
+                    </div>
+                    <div class="info">
+                        <div class="book-title">{{ book.title }}</div>
+                        <div class="book-author">{{ book.author }}</div>
+                        
+                        <div class="synopsis" id="syn-{{ book._id }}">
+                            {{ book.synopsis }}
+                        </div>
+                        <button class="read-more" onclick="toggleSyn('{{ book._id }}', this)">Read More</button>
 
-        <div class="grid">
-            {% for book in results %}
-            <div class="card">
-                <div class="cover-wrap">
-                    {% if book.has_cover %}
-                        <img src="/cover/{{ book._id }}" loading="lazy" class="cover-img" onload="this.classList.add('loaded')" onerror="this.style.display='none'">
-                    {% else %}
-                        <div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:2rem;color:#334155;">📚</div>
-                    {% endif %}
+                        {% if user_id %}
+                            <button onclick="get('{{ book._id }}', this)" class="get-btn">Get</button>
+                        {% else %}
+                            <a href="https://t.me/{{ bot_username }}?start=d_{{ book._id }}" class="get-btn">Get via Bot</a>
+                        {% endif %}
+                    </div>
                 </div>
-                <div class="info">
-                    <div class="title">{{ book.title }}</div>
-                    <div class="author">{{ book.author }}</div>
-                    {% if user_id %}
-                        <button onclick="dl('{{ book._id }}', this)" class="dl-btn">Download</button>
-                    {% else %}
-                        <a href="https://t.me/{{ bot_username }}?start=d_{{ book._id }}" class="dl-btn">Get on Telegram</a>
-                    {% endif %}
-                </div>
+                {% endfor %}
             </div>
-            {% endfor %}
-        </div>
 
-        {% if total_pages > 1 %}
-        <div class="pagination">
-            {% if page > 1 %}
-                <a href="/search?q={{ query }}&page={{ page - 1 }}" class="page-link">←</a>
-            {% endif %}
-
-            {% set start = page - 2 %}
-            {% set end = page + 2 %}
-            {% if start > 1 %}
-                <a href="/search?q={{ query }}&page=1" class="page-link">1</a>
-                {% if start > 2 %}<span class="dots">...</span>{% endif %}
-            {% endif %}
-
-            {% for p in range(1, total_pages + 1) %}
-                {% if p >= start and p <= end %}
-                    <a href="/search?q={{ query }}&page={{ p }}" class="page-link {% if p == page %}active{% endif %}">{{ p }}</a>
-                {% endif %}
-            {% endfor %}
-
-            {% if end < total_pages %}
-                {% if end < total_pages - 1 %}<span class="dots">...</span>{% endif %}
-                <a href="/search?q={{ query }}&page={{ total_pages }}" class="page-link">{{ total_pages }}</a>
-            {% endif %}
-
-            {% if page < total_pages %}
-                <a href="/search?q={{ query }}&page={{ page + 1 }}" class="page-link">→</a>
+            {% if total_pages > 1 %}
+            <div class="pagination">
+                {% if page > 1 %}<a href="/search?q={{ query }}&page={{ page-1 }}" class="page-link">←</a>{% endif %}
+                <a href="#" class="page-link active">{{ page }}</a>
+                {% if page < total_pages %}<a href="/search?q={{ query }}&page={{ page+1 }}" class="page-link">→</a>{% endif %}
+            </div>
             {% endif %}
         </div>
-        {% endif %}
     {% endif %}
 
     <script>
-    async function dl(id, btn) {
-        const original = btn.innerText;
-        btn.innerText = "Sending...";
-        try {
-            const res = await fetch(`/api/download/${id}`);
-            const data = await res.json();
-            if(data.status === 'ok') {
-                btn.innerText = "Sent ✅";
-                btn.style.background = "#10b981";
-                btn.style.color = "white";
-                btn.style.borderColor = "#10b981";
-            } else {
-                alert(data.message);
-                btn.innerText = "Error";
-            }
-        } catch { btn.innerText = "Error"; }
-    }
+        // Settings Logic
+        function toggleSettings() {
+            document.getElementById('settingsPanel').classList.toggle('active');
+        }
+
+        function updateCols(val) {
+            document.documentElement.style.setProperty('--cols', val);
+            document.getElementById('colVal').innerText = val;
+            localStorage.setItem('ln_cols', val);
+        }
+
+        function updateScale(val) {
+            document.documentElement.style.setProperty('--cover-scale', val);
+            localStorage.setItem('ln_scale', val);
+        }
+
+        // Init Settings
+        window.addEventListener('DOMContentLoaded', () => {
+            const cols = localStorage.getItem('ln_cols') || 2;
+            const scale = localStorage.getItem('ln_scale') || 1;
+            updateCols(cols);
+            updateScale(scale);
+            // Sync slider positions
+            document.querySelector('input[oninput*="updateCols"]').value = cols;
+            document.querySelector('input[oninput*="updateScale"]').value = scale;
+        });
+
+        // UI Logic
+        function toggleSyn(id, btn) {
+            const el = document.getElementById('syn-' + id);
+            el.classList.toggle('expanded');
+            btn.innerText = el.classList.contains('expanded') ? "Show Less" : "Read More";
+        }
+
+        async function get(id, btn) {
+            const original = btn.innerText;
+            btn.innerText = "Sending...";
+            try {
+                const res = await fetch(`/api/download/${id}`);
+                const d = await res.json();
+                if(d.status === 'ok') { btn.innerText = "Sent ✅"; }
+                else { alert(d.message); btn.innerText = "Error"; }
+            } catch { btn.innerText = "Error"; }
+            setTimeout(() => { if(btn.innerText === "Sent ✅") btn.innerText = original; }, 3000);
+        }
     </script>
 </body>
 </html>

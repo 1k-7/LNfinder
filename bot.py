@@ -4,20 +4,32 @@ import os
 import logging
 import warnings
 import io
-import re
+import zipfile
 import html
+import re
+import random
+import json
+import base64
 import urllib.request 
+import xml.etree.ElementTree as ET
+from bs4 import BeautifulSoup
+
+# --- DATABASE IMPORTS ---
 from bson.objectid import ObjectId 
 from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo.errors import DuplicateKeyError
+
+# --- PYROGRAM IMPORTS ---
 from pyrogram import Client, filters, idle
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
 from pyrogram.enums import ParseMode
+from pyrogram.errors import FloodWait
+
+# --- WEB SERVER IMPORTS ---
 from quart import Quart, request, render_template, redirect, url_for, jsonify, make_response, Response
 from hypercorn.config import Config
 from hypercorn.asyncio import serve
 from itsdangerous import URLSafeTimedSerializer
-import xml.etree.ElementTree as ET
-import zipfile
 
 # --- CONFIGURATION ---
 try:
@@ -26,6 +38,7 @@ try:
     BOT_TOKEN = os.environ.get("BOT_TOKEN")
     CHANNEL_ID = int(os.environ.get("CHANNEL_ID")) 
     ADMIN_ID = int(os.environ.get("ADMIN_ID"))
+    
     AZURE_URL = os.environ.get("AZURE_URL")
     if not AZURE_URL: raise ValueError("Missing AZURE_URL")
     
@@ -35,6 +48,7 @@ try:
 
     DB_NAME = os.environ.get("DB_NAME", "novel_library")
     COLLECTION_NAME = os.environ.get("COLLECTION_NAME", "books")
+
 except Exception as e:
     print(f"❌ CONFIG ERROR: {e}")
     exit(1)
@@ -45,7 +59,7 @@ logging.getLogger("pyrogram").setLevel(logging.WARNING)
 logging.getLogger("hypercorn").setLevel(logging.INFO)
 warnings.filterwarnings("ignore")
 
-# --- DATABASE ---
+# --- DATABASE SETUP ---
 try:
     azure_client = AsyncIOMotorClient(AZURE_URL)
     db = azure_client[DB_NAME]
@@ -55,21 +69,48 @@ except Exception as e:
     logger.error(f"❌ DB Connection Error: {e}")
     exit(1)
 
-# --- HELPERS ---
+# --- WEB APP INIT ---
 web_app = Quart(__name__, template_folder='template')
 serializer = URLSafeTimedSerializer(SECRET_KEY)
-global BOT_USERNAME
+
+# --- GLOBAL STATE ---
+indexing_active = False
+files_found = 0
+files_saved = 0
 BOT_USERNAME = None
 
-def get_button_label(title):
-    # Clean title for buttons (remove chapter numbers etc)
-    return re.sub(r'\s+(c|ch|chap|vol|v)\.?\s*\d+(?:[-–]\d+)?.*$', '', title, flags=re.IGNORECASE).strip()
-
+# --- HELPERS ---
 def get_user_from_cookie():
     token = request.cookies.get('auth_token')
     if not token: return None
     try: return serializer.loads(token, max_age=86400*30)
     except: return None
+
+def get_display_title(book_doc):
+    db_title = book_doc.get('title')
+    if db_title and db_title.strip() and db_title != "Unknown Title":
+        return db_title.strip()
+    fname = book_doc.get('file_name')
+    if fname:
+        return fname.replace('.epub', '').replace('_', ' ').replace('-', ' ').strip()
+    return "Unknown Book"
+
+def get_button_label(book_doc):
+    full = get_display_title(book_doc)
+    return re.sub(r'\s+(c|ch|chap|vol|v)\.?\s*\d+(?:[-–]\d+)?.*$', '', full, flags=re.IGNORECASE).strip()
+
+def get_pagination_list(current, total):
+    if total <= 1: return []
+    delta = 2; left = current - delta; right = current + delta + 1
+    range_l = []; range_with_dots = []; l = None
+    for i in range(1, total + 1):
+        if i == 1 or i == total or (i >= left and i < right): range_l.append(i)
+    for i in range_l:
+        if l:
+            if i - l == 2: range_with_dots.append(l + 1)
+            elif i - l != 1: range_with_dots.append('...')
+        range_with_dots.append(i); l = i
+    return range_with_dots
 
 # --- WEB ROUTES ---
 @web_app.route('/health')
@@ -91,63 +132,67 @@ async def index():
     user_id = get_user_from_cookie()
     return await render_template('index.html', query="", results=[], count=0, pagination_list=[], user_id=user_id, bot_username=BOT_USERNAME)
 
+# --- IMAGE SERVER ---
+@web_app.route('/cover/<book_id>')
+async def serve_cover(book_id):
+    try:
+        b = await collection.find_one({"_id": ObjectId(book_id)}, {"cover_image": 1})
+        if b and b.get('cover_image'): return Response(b['cover_image'], mimetype='image/jpeg')
+    except: pass
+    # Return 1x1 transparent pixel if no cover to prevent broken image icon
+    return Response(base64.b64decode('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7'), mimetype='image/gif')
+
 @web_app.route('/search')
 async def search():
     user_id = get_user_from_cookie()
     query = request.args.get('q', '').strip()
     page = int(request.args.get('page', 1))
-    limit = 50 
+    limit = 30 # Limit 30 to allow full synopsis loading without timeout
     skip = (page - 1) * limit
-    
+
     if not query:
         return await render_template('index.html', query="", results=[], count=0, user_id=user_id, bot_username=BOT_USERNAME)
     
     try:
-        # --- FIXED SEARCH LOGIC (STRICT AND) ---
-        # 1. Split query into words
+        # STRICT AND SEARCH
         words = query.split()
-        
-        # 2. Wrap each word in quotes to enforce "Phrase Match"
-        # In MongoDB Text Search, "word" means strict match. 
-        # "Hogwarts" "System" -> Document MUST contain BOTH terms.
         search_terms = " ".join([f'"{w}"' for w in words])
-        
         mongo_query = {"$text": {"$search": search_terms}}
         
-        # 3. Projection: Only fetch what we need for the LIST. 
-        # NO SYNOPSIS. NO IMAGES. This makes it light.
-        projection = {"title": 1, "author": 1, "tags": 1, "file_name": 1, "_id": 1}
-        
-        # 4. Execute (No Sort - Rely on Text Score implicitly)
+        # Count First
         cnt = await collection.count_documents(mongo_query)
+        
+        # Fallback to Regex if Text Search misses (e.g. partial words)
+        if cnt == 0:
+             and_conditions = []
+             for word in words:
+                 reg = re.compile(re.escape(word), re.IGNORECASE)
+                 and_conditions.append({"$or": [{"title": reg}, {"synopsis": reg}, {"file_name": reg}]})
+             mongo_query = { "$and": and_conditions }
+             cnt = await collection.count_documents(mongo_query)
+
+        # PROJECTION: Fetch Text Data, EXCLUDE Covers (fetch via /cover/ID)
+        projection = {"title": 1, "author": 1, "tags": 1, "synopsis": 1, "file_name": 1, "_id": 1}
+        
         cursor = collection.find(mongo_query, projection)
         books_cursor = await cursor.skip(skip).limit(limit).to_list(length=limit)
         
         results = []
         for b in books_cursor:
-            title = b.get('title')
-            # Fallback title if missing
-            if not title: title = b.get('file_name', 'Unknown').replace('.epub','').replace('_',' ')
+            syn = b.get('synopsis', 'No synopsis available.').strip()
+            # Clean HTML
+            syn = re.sub(r'<[^>]+>', '', syn)
             
             results.append({
                 "_id": str(b['_id']),
-                "title": title,
+                "title": get_display_title(b),
                 "author": b.get('author', 'Unknown'),
-                "tags": b.get('tags', []) if isinstance(b.get('tags'), list) else []
+                "synopsis": syn, # Full synopsis loaded server-side
+                "tags": b.get('tags', '').split(',') if b.get('tags') else []
             })
 
-        # Pagination Logic
         total_pages = math.ceil(cnt / limit)
-        delta = 2; left = page - delta; right = page + delta + 1
-        pagination_list = []
-        l = None
-        for i in range(1, total_pages + 1):
-            if i == 1 or i == total_pages or (i >= left and i < right):
-                if l:
-                    if i - l == 2: pagination_list.append(l + 1)
-                    elif i - l != 1: pagination_list.append('...')
-                pagination_list.append(i)
-                l = i
+        pagination_list = get_pagination_list(page, total_pages)
 
         return await render_template(
             'index.html', query=query, results=results, count=cnt, 
@@ -156,73 +201,67 @@ async def search():
         )
     except Exception as e:
         logger.error(f"Search Error: {e}")
-        return await render_template('index.html', query=query, results=[], count=0, error=str(e), user_id=user_id)
-
-# --- LAZY ASSETS ROUTES ---
-@web_app.route('/cover/<book_id>')
-async def serve_cover(book_id):
-    try:
-        # DB Hit: Only for cover image
-        b = await collection.find_one({"_id": ObjectId(book_id)}, {"cover_image": 1})
-        if b and b.get('cover_image'): return Response(b['cover_image'], mimetype='image/jpeg')
-    except: pass
-    return "", 404
-
-@web_app.route('/api/details/<book_id>')
-async def api_details(book_id):
-    try:
-        # DB Hit: Only for synopsis
-        b = await collection.find_one({"_id": ObjectId(book_id)}, {"synopsis": 1})
-        if not b: return jsonify({"status": "error"}), 404
-        return jsonify({"status": "ok", "synopsis": b.get('synopsis', 'No synopsis.')})
-    except: return jsonify({"status": "error"}), 500
+        return await render_template('index.html', query=query, results=[], error=str(e), user_id=user_id)
 
 @web_app.route('/api/download/<book_id>')
 async def api_download(book_id):
+    user_id = get_user_from_cookie()
+    if not user_id: return jsonify({"status": "error", "message": "Not logged in"}), 401
     try:
-        token = request.cookies.get('auth_token')
-        user_id = serializer.loads(token, max_age=86400*30) if token else None
-        if not user_id: return jsonify({"status": "error", "message": "Not logged in"}), 401
-        
         b = await collection.find_one({"_id": ObjectId(book_id)})
-        if not b: return jsonify({"status": "error", "message": "Book not found"}), 404
-        
         await app.send_document(
             chat_id=int(user_id),
             document=b['file_id'],
-            caption=f"📖 {b.get('title', 'Book')}\n\n<i>Sent via Web Interface</i>",
+            caption=f"📖 {get_display_title(b)}\n\n<i>Sent via Web Interface</i>",
             parse_mode=ParseMode.HTML
         )
         return jsonify({"status": "ok"})
     except Exception as e: return jsonify({"status": "error", "message": str(e)}), 500
 
-# --- BOT ---
+# --- BOT INIT ---
 if not os.path.exists("sessions"): os.makedirs("sessions")
 app = Client("sessions/novel_bot_session", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# --- ADMIN TOOLS ---
+# --- EPUB PARSER (RESTORED) ---
 def parse_epub_direct(file_path):
-    # Lightweight parser to extract metadata for indexing
     meta = {"title": None, "author": "Unknown", "synopsis": "No synopsis.", "tags": "", "cover_image": None}
     try:
         with zipfile.ZipFile(file_path, 'r') as z:
-            opf_path = next((n for n in z.namelist() if n.endswith('.opf')), None)
+            opf_path = None
+            try:
+                root = ET.fromstring(z.read('META-INF/container.xml'))
+                for child in root.iter():
+                    if child.get('full-path'): opf_path = child.get('full-path'); break
+            except: pass
+            if not opf_path:
+                for n in z.namelist():
+                    if n.endswith('.opf'): opf_path = n; break
             if not opf_path: return meta
-            root = ET.fromstring(z.read(opf_path))
-            # Extract basic tags
-            for elem in root.findall('.//{http://purl.org/dc/elements/1.1/}title'): meta['title'] = elem.text
-            for elem in root.findall('.//{http://purl.org/dc/elements/1.1/}creator'): meta['author'] = elem.text
-            for elem in root.findall('.//{http://purl.org/dc/elements/1.1/}description'): meta['synopsis'] = elem.text
-            
-            # Extract cover (simple heuristic)
-            for item in root.findall('.//{http://www.idpf.org/2007/opf}item'):
-                if 'cover' in item.get('id', '').lower() or 'cover' in item.get('properties', '').lower():
-                    href = item.get('href')
-                    if '/' in opf_path: href = os.path.join(os.path.dirname(opf_path), href)
-                    if href in z.namelist(): meta['cover_image'] = z.read(href); break
+            try:
+                root = ET.fromstring(z.read(opf_path))
+                ns = {'dc': 'http://purl.org/dc/elements/1.1/', 'opf': 'http://www.idpf.org/2007/opf'}
+                # Extract Metadata
+                for elem in root.findall('.//{http://purl.org/dc/elements/1.1/}title'): meta['title'] = elem.text
+                for elem in root.findall('.//{http://purl.org/dc/elements/1.1/}creator'): meta['author'] = elem.text
+                for elem in root.findall('.//{http://purl.org/dc/elements/1.1/}description'): meta['synopsis'] = elem.text
+                for elem in root.findall('.//{http://purl.org/dc/elements/1.1/}subject'): meta['tags'] += (elem.text or "") + ", "
+                
+                # Extract Cover
+                cover_id = None
+                for meta_tag in root.findall('.//{http://www.idpf.org/2007/opf}meta'):
+                    if meta_tag.get('name') == 'cover': cover_id = meta_tag.get('content')
+                
+                for item in root.findall('.//{http://www.idpf.org/2007/opf}item'):
+                    if item.get('id') == cover_id or 'cover-image' in item.get('properties', ''):
+                        href = item.get('href')
+                        if '/' in opf_path: href = os.path.join(os.path.dirname(opf_path), href)
+                        if href in z.namelist(): meta['cover_image'] = z.read(href); break
+            except: pass
     except: pass
+    if meta['tags'].endswith(", "): meta['tags'] = meta['tags'][:-2]
     return meta
 
+# --- BACKGROUND WORKER (RESTORED) ---
 async def indexing_process(client, start_id, end_id, status_msg):
     global indexing_active, files_found, files_saved
     files_found = 0; files_saved = 0
@@ -273,7 +312,7 @@ async def indexing_process(client, start_id, end_id, status_msg):
             if status_msg and (current_id % 100 == 0):
                 try: await status_msg.edit(f"🔄 **Scanning...**\nID: `{current_id}`\nFound: `{files_found}`\nSaved: `{files_saved}`")
                 except: pass
-                
+            
             try:
                 messages = await client.get_messages(CHANNEL_ID, ids)
                 for m in messages:
@@ -282,7 +321,6 @@ async def indexing_process(client, start_id, end_id, status_msg):
                         await queue.put(m)
             except FloodWait as e: await asyncio.sleep(e.value + 1); continue
             except: pass
-            
             current_id += BATCH_SIZE
             await asyncio.sleep(2) 
         await queue.join()
@@ -293,6 +331,7 @@ async def indexing_process(client, start_id, end_id, status_msg):
             try: await status_msg.edit(f"✅ **Done!**\nScanned: `{end_id}`\nFound: `{files_found}`\nSaved: `{files_saved}`")
             except: pass
 
+# --- ADMIN COMMANDS (RESTORED) ---
 @app.on_message(filters.command("url"))
 async def url_cmd(client, message):
     try:
@@ -316,46 +355,87 @@ async def stop_cmd(client, message):
     global indexing_active; indexing_active = False
     await message.reply("🛑 Stopping...")
 
+@app.on_message(filters.command("export") & filters.user(ADMIN_ID))
+async def export_cmd(client, message):
+    s = await message.reply("📦 Exporting...")
+    try:
+        with open("lib.json", 'w') as f:
+            f.write('[')
+            first = True
+            async for d in collection.find({}):
+                if not first: f.write(',')
+                first = False
+                if d.get('cover_image'): d['cover_image'] = base64.b64encode(d['cover_image']).decode()
+                d['_id'] = str(d['_id'])
+                json.dump(d, f)
+            f.write(']')
+        with zipfile.ZipFile("lib.zip", 'w', zipfile.ZIP_DEFLATED) as z: z.write("lib.json")
+        await client.send_document(message.chat.id, "lib.zip", caption="✅ Backup")
+    except Exception as e: await s.edit(f"❌ {e}")
+    finally:
+        if os.path.exists("lib.json"): os.remove("lib.json")
+        if os.path.exists("lib.zip"): os.remove("lib.zip")
+
+@app.on_message(filters.command("import") & filters.user(ADMIN_ID))
+async def import_cmd(client, message):
+    if not message.reply_to_message or not message.reply_to_message.document: return await message.reply("Reply file.")
+    s = await message.reply("📥 Importing...")
+    path = await message.reply_to_message.download()
+    try:
+        if zipfile.is_zipfile(path):
+            with zipfile.ZipFile(path, 'r') as z: z.extractall(); path = z.namelist()[0]
+        with open(path, 'r') as f: data = json.load(f)
+        for c in [data[i:i+50] for i in range(0,len(data),50)]:
+            for x in c:
+                if x.get('cover_image'): 
+                    try: x['cover_image'] = base64.b64decode(x['cover_image'])
+                    except: x['cover_image'] = None
+                if '_id' in x: del x['_id']
+                try: await collection.replace_one({"file_unique_id":x['file_unique_id']},x,upsert=True)
+                except: pass
+        await s.edit("✅ Done")
+    except Exception as e: await s.edit(f"❌ {e}")
+    finally:
+        if os.path.exists(path): os.remove(path)
+
 @app.on_message(filters.command("fix_search") & filters.user(ADMIN_ID))
 async def fix_search_cmd(client, message):
-    # THIS IS THE MOST IMPORTANT COMMAND
-    s = await message.reply("🛠 **Rebuilding Index...**")
+    s = await message.reply("🛠 **Optimizing Database...**")
     try:
         await collection.drop_indexes()
-        # Create a TEXT index on Title and Synopsis.
-        # This enables the "Strict AND" query mode.
-        await collection.create_index(
-            [("title", "text"), ("synopsis", "text")],
-            name="TextIndex"
-        )
+        await collection.create_index([("title", "text"), ("synopsis", "text")], name="TextIndex")
         await collection.create_index("file_unique_id", unique=True)
-        await collection.create_index("msg_id")
-        await s.edit("✅ **Fixed!**\nDatabase optimized for Strict AND Search.")
-    except Exception as e:
-        await s.edit(f"❌ Error: {e}")
+        await s.edit("✅ **Fixed!** Strict Search Enabled.")
+    except Exception as e: await s.edit(f"❌ Error: {e}")
 
-@app.on_message(filters.text & filters.incoming & ~filters.command(["start", "index", "stop_index", "url", "fix_search"]))
+# --- BOT SEARCH (STRICT AND) ---
+@app.on_message(filters.text & filters.incoming & ~filters.command(["start", "index", "stop_index", "url", "export", "import", "fix_search"]))
 async def bot_search(client, message):
     q = message.text.strip()
     if not q: return
     
-    # 1. Search DB with Strict Text Search
     words = q.split()
     search_terms = " ".join([f'"{w}"' for w in words])
     mongo_query = {"$text": {"$search": search_terms}}
     
     cnt = await collection.count_documents(mongo_query)
+    if cnt == 0:
+        # Fallback to Regex for partial matches
+        and_conditions = []
+        for word in words:
+            reg = re.compile(re.escape(word), re.IGNORECASE)
+            and_conditions.append({"$or": [{"title": reg}, {"synopsis": reg}]})
+        mongo_query = { "$and": and_conditions }
+        cnt = await collection.count_documents(mongo_query)
+
+    if cnt == 0: return await message.reply("❌ No matches found.")
     
-    if cnt == 0: return await message.reply("❌ No matches.")
-    
-    # Fetch top 10 for Bot UI
     cursor = collection.find(mongo_query, {"title": 1, "author": 1})
     res = await cursor.limit(10).to_list(length=10)
     
     btns = []
     for b in res:
-        title = b.get('title') or "Unknown"
-        btns.append([InlineKeyboardButton(get_button_label(title)[:40], callback_data=f"v:{str(b['_id'])}")])
+        btns.append([InlineKeyboardButton(get_button_label(b.get('title', 'Unknown'))[:40], callback_data=f"v:{str(b['_id'])}")])
     
     nav = [InlineKeyboardButton(f"1/{math.ceil(cnt/10)}", callback_data="nop")]
     if cnt > 10: nav.append(InlineKeyboardButton("➡️", callback_data=f"n:1:{q[:20]}"))
@@ -366,26 +446,27 @@ async def bot_search(client, message):
 @app.on_callback_query()
 async def cb_handler(client, cb):
     d = cb.data
-    
-    # --- PAGINATION ---
     if d.startswith("n:"):
         _, p, q = d.split(':', 2)
         p = int(p)
-        
         words = q.split()
         search_terms = " ".join([f'"{w}"' for w in words])
         mongo_query = {"$text": {"$search": search_terms}}
         
         cnt = await collection.count_documents(mongo_query)
+        if cnt == 0:
+             and_conditions = []
+             for word in words:
+                 reg = re.compile(re.escape(word), re.IGNORECASE)
+                 and_conditions.append({"$or": [{"title": reg}, {"synopsis": reg}]})
+             mongo_query = { "$and": and_conditions }
+        
         cursor = collection.find(mongo_query, {"title": 1, "author": 1})
         res = await cursor.skip(p*10).limit(10).to_list(length=10)
         
-        if not res: return await cb.answer("End.", show_alert=True)
-        
         btns = []
         for b in res:
-            title = b.get('title') or "Unknown"
-            btns.append([InlineKeyboardButton(get_button_label(title)[:40], callback_data=f"v:{str(b['_id'])}")])
+            btns.append([InlineKeyboardButton(get_button_label(b.get('title', 'Unknown'))[:40], callback_data=f"v:{str(b['_id'])}")])
         
         nav = []
         if p > 0: nav.append(InlineKeyboardButton("⬅️", callback_data=f"n:{p-1}:{q}"))
@@ -395,7 +476,6 @@ async def cb_handler(client, cb):
         
         await cb.edit_message_text(f"🔎 Results: <b>{html.escape(q)}</b> ({cnt})", reply_markup=InlineKeyboardMarkup(btns), parse_mode=ParseMode.HTML)
     
-    # --- VIEW DETAILS (Restored Nice UI) ---
     elif d.startswith("v:"):
         bid = d.split(':')[1]
         try:
@@ -404,15 +484,14 @@ async def cb_handler(client, cb):
             
             title = html.escape(b.get('title', 'Unknown'))
             author = html.escape(b.get('author', 'Unknown'))
-            syn = html.escape(b.get('synopsis', 'No synopsis available.').strip())
+            syn = html.escape(b.get('synopsis', 'No synopsis.').strip())
             
-            # YOUR REQUESTED FORMATTING
+            # THE RESTORED FORMATTING
             caption = (
                 f"<blockquote><b>{title}</b>\n"
                 f"👤 {author}</blockquote>\n\n"
                 f"<blockquote expandable>{syn}</blockquote>"
             )
-            
             kb = [[InlineKeyboardButton("📥 Download", callback_data=f"d:{bid}")]]
             
             await cb.message.delete()
@@ -424,14 +503,13 @@ async def cb_handler(client, cb):
                 await client.send_message(cb.message.chat.id, caption, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
         except: await cb.answer("Error.", show_alert=True)
     
-    # --- DOWNLOAD ---
     elif d.startswith("d:"):
         bid = d.split(':')[1]
         try:
             b = await collection.find_one({"_id": ObjectId(bid)})
-            await cb.answer("🚀 Sending file...")
+            await cb.answer("🚀 Sending...")
             await client.send_document(cb.message.chat.id, b['file_id'], caption=f"📖 {b.get('title')}")
-        except: await cb.answer("File not found.", show_alert=True)
+        except: await cb.answer("File missing.", show_alert=True)
 
 async def main():
     logger.info("🤖 Starting...")

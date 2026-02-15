@@ -326,7 +326,7 @@ async def show_bot_page(client, chat_id, query_text, page, qid, message_to_edit=
         else: await client.send_message(chat_id, "❌ No matches found.")
         return
 
-    txt = f"🔎 **Results for:** `{html.escape(query_text)}`\nFound: {count}\nPage: {page}\n\n"
+    txt = f"🔎 <b>Results for:</b> <i>{html.escape(query_text)}</i>\nFound: {count}\nPage: {page}\n\n——————————————————————"
     btns = []
     
     # CHECK FOR PREFIX TO KEEP MENU
@@ -413,7 +413,7 @@ async def start_handler(client, message): await message.reply("👋 **LN Library
 @app.on_message(filters.command("url"))
 async def url_cmd(client, message):
     token = serializer.dumps(message.from_user.id)
-    await message.reply(f"<blockquote>🔗 [Login to Web Interface]({PUBLIC_URL}/login?token={token})</blockquote>", disable_web_page_preview=True)
+    await message.reply(f"<blockquote>🔗   [Login to Web Interface]({PUBLIC_URL}/login?token={token})</blockquote>", disable_web_page_preview=True)
 
 @app.on_message(filters.command("export_cache") & filters.user(ADMIN_ID))
 async def export_cache_cmd(client, message):

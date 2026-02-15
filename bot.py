@@ -10,6 +10,9 @@ import re
 import sqlite3
 import base64
 import urllib.request 
+import shutil
+import time
+import uuid
 import xml.etree.ElementTree as ET
 from bs4 import BeautifulSoup
 from bson.objectid import ObjectId 
@@ -39,7 +42,6 @@ try:
     AZURE_URL = os.environ.get("AZURE_URL")
     if not AZURE_URL: raise ValueError("Missing AZURE_URL")
     
-    # Optional: URL to download cache.db from on cold start
     CACHE_DUMP_URL = os.environ.get("CACHE_DUMP_URL")
     
     PORT = int(os.environ.get("PORT", 8080))
@@ -77,7 +79,6 @@ class LocalSearchDB:
         self.ready = False
 
     def init_db(self):
-        """Initialize SQLite with FTS5"""
         self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         cursor = self.conn.cursor()
@@ -93,22 +94,12 @@ class LocalSearchDB:
                 tokenize='porter ascii'
             )
         """)
+        cursor.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
         self.conn.commit()
 
     def get_last_id(self):
-        """Get the latest MongoDB Object ID stored in cache"""
         try:
             cursor = self.conn.cursor()
-            # FTS5 tables don't support simple MAX() on unindexed columns fast, 
-            # but usually, we insert in order.
-            # However, for robustness, we just scan for the 'latest' inserted if IDs are monotonic.
-            # MongoDB ObjectIDs ARE strictly increasing over time.
-            
-            # Since mongo_id is UNINDEXED in FTS5, this might be slow on 100k rows.
-            # Optimization: Create a standard side-table for tracking sync state.
-            cursor.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
-            self.conn.commit()
-            
             cursor.execute("SELECT value FROM meta WHERE key='last_sync_id'")
             row = cursor.fetchone()
             return row[0] if row else None
@@ -188,11 +179,39 @@ class LocalSearchDB:
 
     def get_by_id(self, mongo_id):
         cursor = self.conn.cursor()
-        # FTS queries on non-indexed columns are slow, but getting by ID is rare (only on download)
-        # For better performance, query MongoDB for single item details
-        return None 
+        cursor.execute("SELECT * FROM books_fts WHERE mongo_id = ?", (mongo_id,))
+        r = cursor.fetchone()
+        if r:
+            return {
+                "_id": r['mongo_id'],
+                "title": r['title'],
+                "author": r['author'],
+                "synopsis": r['synopsis'],
+                "file_id": r['file_id']
+            }
+        return None
 
 local_db = LocalSearchDB()
+
+# --- QUERY CACHE (For Bot Pagination) ---
+class QueryCache:
+    def __init__(self):
+        self.cache = {}
+        
+    def store(self, query_text):
+        qid = str(uuid.uuid4())[:8]
+        self.cache[qid] = {"q": query_text, "t": time.time()}
+        # Cleanup
+        if len(self.cache) > 500:
+            now = time.time()
+            self.cache = {k:v for k,v in self.cache.items() if now - v['t'] < 3600}
+        return qid
+        
+    def get(self, qid):
+        item = self.cache.get(qid)
+        return item['q'] if item else None
+
+q_cache = QueryCache()
 
 # --- WEB APP INIT ---
 web_app = Quart(__name__, template_folder='template')
@@ -202,9 +221,8 @@ serializer = URLSafeTimedSerializer(SECRET_KEY)
 indexing_active = False
 BOT_USERNAME = None
 
-# --- CACHE MANAGEMENT ---
+# --- SYNC LOGIC ---
 def check_and_download_cache():
-    """Checks if cache.db exists. If not, tries to download it."""
     if os.path.exists("cache.db"):
         logger.info("📂 Found local cache.db")
         return
@@ -217,10 +235,9 @@ def check_and_download_cache():
         except Exception as e:
             logger.error(f"❌ Failed to download cache: {e}")
     else:
-        logger.info("⚠️ No CACHE_DUMP_URL provided. Starting with empty cache.")
+        logger.info("⚠️ No CACHE_DUMP_URL provided. Starting fresh.")
 
 async def sync_mongo_to_sqlite():
-    """Smart Sync: Only fetches what is missing"""
     logger.info("🔄 Initializing Cache...")
     local_db.init_db()
     
@@ -231,24 +248,21 @@ async def sync_mongo_to_sqlite():
         try:
             query = {"_id": {"$gt": ObjectId(last_id_str)}}
             logger.info(f"🔄 Resuming sync from ID: {last_id_str}")
-        except:
-            logger.warning("⚠️ Invalid last ID, resyncing all.")
+        except: pass
     
     count = 0
     batch = []
-    
-    # We only fetch text fields + cover boolean. NO binary data.
     projection = {"title": 1, "author": 1, "synopsis": 1, "file_id": 1, "cover_image": {"$slice": 1}}
     
-    cursor = collection.find(query, projection).sort("_id", 1) # Sort by ID ascending is crucial
+    cursor = collection.find(query, projection).sort("_id", 1)
     
     async for doc in cursor:
         batch.append(doc)
-        if len(batch) >= 1000:
+        if len(batch) >= 2000:
             local_db.add_batch(batch)
             count += len(batch)
             batch = []
-            if count % 5000 == 0: logger.info(f"📥 Synced +{count} books...")
+            if count % 10000 == 0: logger.info(f"📥 Synced +{count} books...")
     
     if batch:
         local_db.add_batch(batch)
@@ -270,10 +284,7 @@ def get_display_title(book_doc):
     db_title = book_doc.get('title')
     if db_title and db_title.strip() and db_title != "Unknown Title":
         return db_title.strip()
-    fname = book_doc.get('file_name')
-    if fname:
-        return fname.replace('.epub', '').replace('_', ' ').replace('-', ' ').strip()
-    return "Unknown Book"
+    return book_doc.get('file_name', 'Unknown Book').replace('.epub', '').replace('_', ' ').strip()
 
 # --- WEB ROUTES ---
 @web_app.route('/health')
@@ -321,14 +332,8 @@ async def search():
         total_pages = math.ceil(total_count / 24)
         
         return await render_template(
-            'index.html', 
-            query=raw_query, 
-            results=results, 
-            count=total_count, 
-            page=page, 
-            total_pages=total_pages, 
-            user_id=user_id, 
-            bot_username=BOT_USERNAME
+            'index.html', query=raw_query, results=results, count=total_count, 
+            page=page, total_pages=total_pages, user_id=user_id, bot_username=BOT_USERNAME
         )
     except Exception as e:
         logger.error(f"Search Error: {e}")
@@ -356,29 +361,72 @@ async def api_download(book_id):
 if not os.path.exists("sessions"): os.makedirs("sessions")
 app = Client("sessions/novel_bot_session", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, sleep_threshold=60)
 
-# --- BOT SEARCH ---
+# --- BOT SEARCH HANDLER ---
 @app.on_message(filters.text & filters.private & ~filters.command(["start", "url", "index", "stats", "export_cache", "import"]))
 async def bot_search_handler(client, message):
     q = message.text.strip()
     if len(q) < 2: return
     
-    results, count = local_db.search(q, page=1, limit=8)
+    # Store query for pagination
+    qid = q_cache.store(q)
     
-    if not results: return await message.reply("❌ No matches found.")
+    # Search Page 1
+    await show_bot_page(client, message.chat.id, q, 1, qid)
+
+async def show_bot_page(client, chat_id, query_text, page, qid, message_to_edit=None):
+    results, count = local_db.search(query_text, page=page, limit=8)
     
-    txt = f"🔎 **Results for:** `{html.escape(q)}`\nFound: {count}\n\n"
+    if not results:
+        if message_to_edit: await message_to_edit.edit("❌ No matches found.")
+        else: await client.send_message(chat_id, "❌ No matches found.")
+        return
+
+    txt = f"🔎 **Results for:** `{html.escape(query_text)}`\nFound: {count}\nPage: {page}\n\n"
     btns = []
     
     for b in results:
         title = b['title'][:50] if b['title'] else "Unknown"
         btns.append([InlineKeyboardButton(title, callback_data=f"v:{b['_id']}")])
+    
+    # Navigation Buttons
+    nav = []
+    total_pages = math.ceil(count / 8)
+    
+    if page > 1:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"n:{qid}:{page-1}"))
+    
+    nav.append(InlineKeyboardButton(f"{page}/{total_pages}", callback_data="nop"))
+    
+    if page < total_pages:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"n:{qid}:{page+1}"))
         
-    await message.reply(txt, reply_markup=InlineKeyboardMarkup(btns), parse_mode=ParseMode.HTML)
+    btns.append(nav)
+    
+    kb = InlineKeyboardMarkup(btns)
+    
+    if message_to_edit:
+        await message_to_edit.edit_text(txt, reply_markup=kb, parse_mode=ParseMode.HTML)
+    else:
+        await client.send_message(chat_id, txt, reply_markup=kb, parse_mode=ParseMode.HTML)
 
 @app.on_callback_query()
 async def callback_handler(client, cb):
     d = cb.data
-    if d.startswith("v:"):
+    if d.startswith("n:"):
+        try:
+            _, qid, page = d.split(":")
+            page = int(page)
+            query_text = q_cache.get(qid)
+            
+            if not query_text:
+                return await cb.answer("❌ Search expired. Please search again.", show_alert=True)
+            
+            await show_bot_page(client, cb.message.chat.id, query_text, page, qid, message_to_edit=cb.message)
+        except Exception as e:
+            logger.error(f"Nav error: {e}")
+            await cb.answer("Error navigating.", show_alert=True)
+
+    elif d.startswith("v:"):
         bid = d.split(":")[1]
         b_mongo = await collection.find_one({"_id": ObjectId(bid)})
         if not b_mongo: return await cb.answer("Not found.", show_alert=True)
@@ -420,20 +468,23 @@ async def url_cmd(client, message):
 
 @app.on_message(filters.command("export_cache") & filters.user(ADMIN_ID))
 async def export_cache_cmd(client, message):
-    """Sends the cache.db file to admin so it can be saved/hosted."""
-    if os.path.exists("cache.db"):
-        await message.reply_document("cache.db", caption="💾 **Current Search Cache**\nUpload this to a URL and set `CACHE_DUMP_URL` to skip full syncs.")
-    else:
-        await message.reply("❌ No cache file found.")
-
-# ... [Indexing code omitted for brevity, same as before] ...
-# Just ensure when indexing new files, you call local_db.add_batch([new_book]) to keep sync.
+    logger.info("📦 Export Cache command received.")
+    if not os.path.exists("cache.db"):
+        return await message.reply("❌ No cache file found.")
+        
+    status = await message.reply("📦 creating snapshot...")
+    try:
+        shutil.copy2("cache.db", "cache_dump.db")
+        await status.edit("🚀 Uploading snapshot...")
+        await message.reply_document("cache_dump.db", caption="💾 **Cache Snapshot**")
+        await status.delete()
+        os.remove("cache_dump.db")
+    except Exception as e:
+        logger.error(f"Export failed: {e}")
+        await status.edit(f"❌ Error: {e}")
 
 async def main():
-    # 1. Download if missing
     await asyncio.to_thread(check_and_download_cache)
-    
-    # 2. Sync changes
     asyncio.create_task(sync_mongo_to_sqlite())
     
     await app.start()

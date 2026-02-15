@@ -19,6 +19,9 @@ from bson.objectid import ObjectId
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.errors import DuplicateKeyError
 
+# --- SEARCH ENGINE ---
+import meilisearch
+
 # --- PYROGRAM IMPORTS ---
 from pyrogram import Client, filters, idle
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
@@ -39,19 +42,21 @@ try:
     CHANNEL_ID = int(os.environ.get("CHANNEL_ID")) 
     ADMIN_ID = int(os.environ.get("ADMIN_ID"))
     
+    # DB
     AZURE_URL = os.environ.get("AZURE_URL")
-    if not AZURE_URL: raise ValueError("Missing AZURE_URL")
+    DB_NAME = os.environ.get("DB_NAME", "novel_library")
+    COLLECTION_NAME = os.environ.get("COLLECTION_NAME", "books")
     
-    # Optional legacy support
-    LEGACY_STR = os.environ.get("MONGO_URI") or os.environ.get("MONGO_URL") or ""
-    LEGACY_URIS = LEGACY_STR.split() if LEGACY_STR else []
+    # MeiliSearch
+    MEILI_URL = os.environ.get("MEILI_URL", "http://meilisearch:7700")
+    MEILI_KEY = os.environ.get("MEILI_KEY", "masterKey123")
     
+    # Web
     PORT = int(os.environ.get("PORT", 8080))
     PUBLIC_URL = os.environ.get("PUBLIC_URL") or f"http://0.0.0.0:{PORT}"
     SECRET_KEY = os.environ.get("SECRET_KEY", "CHANGE_THIS_TO_RANDOM_STRING")
 
-    DB_NAME = os.environ.get("DB_NAME", "novel_library")
-    COLLECTION_NAME = os.environ.get("COLLECTION_NAME", "books")
+    if not AZURE_URL: raise ValueError("Missing AZURE_URL")
 
 except Exception as e:
     print(f"❌ CONFIG ERROR: {e}")
@@ -63,14 +68,26 @@ logging.getLogger("pyrogram").setLevel(logging.WARNING)
 logging.getLogger("hypercorn").setLevel(logging.INFO)
 warnings.filterwarnings("ignore")
 
-# --- DATABASE SETUP ---
+# --- CLIENTS SETUP ---
 try:
-    azure_client = AsyncIOMotorClient(AZURE_URL)
-    db = azure_client[DB_NAME]
+    # MongoDB
+    mongo_client = AsyncIOMotorClient(AZURE_URL)
+    db = mongo_client[DB_NAME]
     collection = db[COLLECTION_NAME]
-    logger.info("✅ Connected to Azure Cosmos DB.")
+    
+    # MeiliSearch
+    ms_client = meilisearch.Client(MEILI_URL, MEILI_KEY)
+    
+    # Ensure Index Exists
+    try:
+        ms_client.create_index('books', {'primaryKey': 'id'})
+        ms_client.index('books').update_searchable_attributes(['title', 'author', 'tags', 'synopsis', 'file_name'])
+        ms_client.index('books').update_filterable_attributes(['tags'])
+    except: pass
+    
+    logger.info("✅ Connected to DB and Search Engine.")
 except Exception as e:
-    logger.error(f"❌ DB Connection Error: {e}")
+    logger.error(f"❌ Connection Error: {e}")
     exit(1)
 
 # --- WEB APP INIT ---
@@ -104,7 +121,6 @@ def get_display_title(book_doc):
 
 def get_button_label(book_doc):
     full = get_display_title(book_doc)
-    # Strip chapter numbers for cleaner buttons
     return re.sub(r'\s+(c|ch|chap|vol|v)\.?\s*\d+(?:[-–]\d+)?.*$', '', full, flags=re.IGNORECASE).strip()
 
 def get_pagination_list(current, total):
@@ -148,13 +164,7 @@ async def login():
 async def index():
     user_id = get_user_from_cookie()
     return await render_template(
-        'index.html', 
-        query="", 
-        results=[], 
-        count=0, 
-        pagination_list=[], 
-        user_id=user_id, 
-        bot_username=BOT_USERNAME
+        'index.html', query="", results=[], count=0, pagination_list=[], user_id=user_id, bot_username=BOT_USERNAME
     )
 
 @web_app.route('/search')
@@ -162,75 +172,63 @@ async def search():
     user_id = get_user_from_cookie()
     query = request.args.get('q', '').strip()
     page = int(request.args.get('page', 1))
-    limit = 20
-    skip = (page - 1) * limit
+    
+    # Increase limit to 50 for better UX
+    limit = 50
+    offset = (page - 1) * limit
 
     if not query:
         return await render_template(
-            'index.html', query="", results=[], count=0, 
-            pagination_list=[], user_id=user_id, bot_username=BOT_USERNAME
+            'index.html', query="", results=[], count=0, pagination_list=[], user_id=user_id, bot_username=BOT_USERNAME
         )
     
     try:
-        # --- FIXED SEARCH LOGIC (STRICT AND) ---
-        # We split the query into words.
-        # We create a specific condition for EACH word.
-        # Condition: "This word must appear in Title OR Synopsis OR Filename"
-        # Then we join all word-conditions with $and.
+        # --- MEILISEARCH QUERY ---
+        # matchingStrategy='all' guarantees that ALL words must be present.
+        search_result = ms_client.index('books').search(query, {
+            'limit': limit,
+            'offset': offset,
+            'matchingStrategy': 'all', 
+            'attributesToRetrieve': ['id'] 
+        })
         
-        words = query.split()
-        and_conditions = []
+        total_hits = search_result['estimatedTotalHits']
+        hits = search_result['hits']
         
-        for word in words:
-            # Simple substring match (regex), case insensitive
-            reg = re.compile(re.escape(word), re.IGNORECASE)
-            
-            # The condition for THIS word
-            word_matches_any_field = {
-                "$or": [
-                    {"title": reg},
-                    {"synopsis": reg},
-                    {"file_name": reg}
-                ]
-            }
-            and_conditions.append(word_matches_any_field)
-            
-        # The Final Query: ALL word conditions must be true
-        mongo_query = { "$and": and_conditions }
-
-        # EXECUTION (No Sort)
-        # We assume natural order to avoid timeouts on large datasets
-        cnt = await collection.count_documents(mongo_query)
-        cursor = collection.find(mongo_query)
-        
-        books_cursor = await cursor.skip(skip).limit(limit).to_list(length=limit)
+        # Hydrate results from MongoDB
+        book_ids = [ObjectId(h['id']) for h in hits]
+        books_cursor = collection.find({"_id": {"$in": book_ids}})
+        books_map = {str(doc['_id']): doc for doc in await books_cursor.to_list(length=len(book_ids))}
         
         results = []
-        for b in books_cursor:
-            cover_b64 = None
-            if b.get('cover_image'):
-                cover_b64 = base64.b64encode(b['cover_image']).decode('utf-8')
-            
-            syn = b.get('synopsis', 'No synopsis available.').strip()
-            syn = re.sub(r'<[^>]+>', '', syn) 
-            
-            results.append({
-                "_id": str(b['_id']),
-                "title": get_display_title(b),
-                "author": b.get('author', 'Unknown'),
-                "synopsis": syn,
-                "tags": b.get('tags', '').split(',') if b.get('tags') else [],
-                "cover_image": cover_b64
-            })
+        for h in hits:
+            bid = h['id']
+            if bid in books_map:
+                b = books_map[bid]
+                cover_b64 = None
+                if b.get('cover_image'):
+                    cover_b64 = base64.b64encode(b['cover_image']).decode('utf-8')
+                
+                syn = b.get('synopsis', 'No synopsis available.').strip()
+                syn = re.sub(r'<[^>]+>', '', syn) 
+                
+                results.append({
+                    "_id": str(b['_id']),
+                    "title": get_display_title(b),
+                    "author": b.get('author', 'Unknown'),
+                    "synopsis": syn,
+                    "tags": b.get('tags', '').split(',') if b.get('tags') else [],
+                    "cover_image": cover_b64
+                })
 
-        total_pages = math.ceil(cnt / limit)
+        total_pages = math.ceil(total_hits / limit)
         pagination_list = get_pagination_list(page, total_pages)
 
         return await render_template(
             'index.html', 
             query=query, 
             results=results, 
-            count=cnt, 
+            count=total_hits, 
             page=page, 
             total_pages=total_pages, 
             pagination_list=pagination_list, 
@@ -332,7 +330,6 @@ def parse_epub_direct(file_path):
     if meta['tags'].endswith(", "): meta['tags'] = meta['tags'][:-2]
     return meta
 
-# --- INDEXING WORKER ---
 async def indexing_process(client, start_id, end_id, status_msg):
     global indexing_active, files_found, files_saved
     files_found = 0; files_saved = 0
@@ -356,19 +353,35 @@ async def indexing_process(client, start_id, end_id, status_msg):
                 meta = await asyncio.to_thread(parse_epub_direct, path)
                 if os.path.exists(path): os.remove(path)
                 if not meta['title']: meta['title'] = message.document.file_name.replace('.epub', '').replace('_', ' ')
+                
+                doc = {
+                    "file_id": message.document.file_id,
+                    "file_unique_id": message.document.file_unique_id,
+                    "file_name": message.document.file_name,
+                    "title": meta['title'],
+                    "author": meta['author'],
+                    "synopsis": meta['synopsis'],
+                    "tags": meta['tags'],
+                    "cover_image": meta['cover_image'],
+                    "msg_id": message.id
+                }
+                
                 try:
-                    await collection.insert_one({
-                        "file_id": message.document.file_id,
-                        "file_unique_id": message.document.file_unique_id,
-                        "file_name": message.document.file_name,
-                        "title": meta['title'],
-                        "author": meta['author'],
-                        "synopsis": meta['synopsis'],
-                        "tags": meta['tags'],
-                        "cover_image": meta['cover_image'],
-                        "msg_id": message.id
-                    })
+                    res = await collection.insert_one(doc)
                     files_saved += 1
+                    
+                    # --- SYNC TO MEILISEARCH ---
+                    meili_doc = {
+                        "id": str(res.inserted_id),
+                        "title": doc['title'],
+                        "author": doc['author'],
+                        "synopsis": doc['synopsis'],
+                        "tags": doc['tags'],
+                        "file_name": doc['file_name']
+                    }
+                    ms_client.index('books').add_documents([meili_doc])
+                    # ---------------------------
+                    
                 except DuplicateKeyError: pass
                 except Exception as e: logger.error(f"DB Error: {e}")
                 queue.task_done()
@@ -436,8 +449,8 @@ async def start_handler(client, message):
 async def stats_handler(client, message):
     try:
         c = await collection.count_documents({})
-        cv = await collection.count_documents({"cover_image": {"$ne": None}})
-        await message.reply(f"📊 **Stats**\n📚 Books: `{c}`\n🖼️ Covers: `{cv}`")
+        m_stats = ms_client.index('books').get_stats()
+        await message.reply(f"📊 **Stats**\n📚 Mongo Books: `{c}`\n🔎 Search Index: `{m_stats.number_of_documents}`")
     except: pass
 
 @app.on_message(filters.command("index") & filters.user(ADMIN_ID))
@@ -503,28 +516,45 @@ async def import_cmd(client, message):
     finally:
         if os.path.exists(path): os.remove(path)
 
-@app.on_message(filters.command("fix_search") & filters.user(ADMIN_ID))
-async def fix_search_cmd(client, message):
-    s = await message.reply("🛠 **Optimizing Database...**\nCreating standard field indexes for fast partial matching.")
+@app.on_message(filters.command("reindex") & filters.user(ADMIN_ID))
+async def reindex_cmd(client, message):
+    s = await message.reply("🔄 **Syncing Database -> MeiliSearch...**\nThis clears the index and rebuilds it.")
     try:
-        # Drop old indexes (Text/Wildcard) that were causing issues or not used
-        await collection.drop_indexes()
+        # Clear Index
+        ms_client.index('books').delete_all_documents()
         
-        # Create standard indexes for fields we regex on
-        # This helps Cosmos DB optimize the $or lookups
-        await collection.create_index("title")
-        await collection.create_index("synopsis")
-        await collection.create_index("file_name")
+        docs_buffer = []
+        count = 0
+        async for doc in collection.find({}):
+            meili_doc = {
+                "id": str(doc['_id']),
+                "title": doc.get('title', 'Unknown'),
+                "author": doc.get('author', 'Unknown'),
+                "synopsis": doc.get('synopsis', '')[:4000],
+                "tags": doc.get('tags', ''),
+                "file_name": doc.get('file_name', '')
+            }
+            docs_buffer.append(meili_doc)
+            
+            if len(docs_buffer) >= 2000:
+                ms_client.index('books').add_documents(docs_buffer)
+                count += len(docs_buffer)
+                docs_buffer = []
+                if count % 10000 == 0: await s.edit(f"🔄 Indexed {count} books...")
         
-        # Essential uniques
-        await collection.create_index("file_unique_id", unique=True)
-        await collection.create_index("msg_id")
+        if docs_buffer:
+            ms_client.index('books').add_documents(docs_buffer)
+            count += len(docs_buffer)
+            
+        # Update Settings
+        ms_client.index('books').update_searchable_attributes(['title', 'file_name', 'author', 'tags', 'synopsis'])
+        ms_client.index('books').update_filterable_attributes(['tags'])
         
-        await s.edit("✅ **System Repaired!**\nStandard Indexes Active.")
+        await s.edit(f"✅ **Re-index Complete!**\nSynced {count} books to Search Engine.")
     except Exception as e:
         await s.edit(f"❌ Error: {e}")
 
-@app.on_message(filters.text & filters.incoming & ~filters.command(["start", "stats", "index", "stop_index", "export", "import", "migrate", "url", "fix_search"]))
+@app.on_message(filters.text & filters.incoming & ~filters.command(["start", "stats", "index", "stop_index", "export", "import", "migrate", "url", "reindex"]))
 async def search_handler(client, message):
     q = message.text.strip()
     if len(q) > 100 or not q: return
@@ -534,44 +564,31 @@ async def search_handler(client, message):
     if q.startswith("!!"): keep_result=True; real_q=q[2:].strip()
 
     try:
-        words = real_q.split()
+        # MEILISEARCH QUERY
+        # matchingStrategy='all' forces strict AND logic
+        res = ms_client.index('books').search(real_q, {
+            'limit': 10,
+            'matchingStrategy': 'all',
+            'attributesToRetrieve': ['id', 'title', 'author']
+        })
         
-        # --- FIXED SEARCH LOGIC (STRICT AND) ---
-        and_conditions = []
-        for word in words:
-            reg = re.compile(re.escape(word), re.IGNORECASE)
-            and_conditions.append({
-                "$or": [
-                    {"title": reg},
-                    {"synopsis": reg},
-                    {"file_name": reg}
-                ]
-            })
-            
-        mongo_query = { "$and": and_conditions }
+        hits = res['hits']
+        cnt = res['estimatedTotalHits']
         
-        # Fast Count
-        cnt = await collection.count_documents(mongo_query)
+        if cnt == 0: return await message.reply("❌ No matches.")
         
-        if cnt == 0:
-            return await message.reply("❌ No matches found.")
-
-        # Fetch Top 8 (No Sort)
-        cursor = collection.find(mongo_query)
-        res = await cursor.limit(8).to_list(length=8)
-
         sq = html.escape(real_q)
         txt = (f"🔎 Results for: <b>{sq}</b>\nTotal Matches: {cnt}\n{'-'*30}")
         
         btns = []
-        for b in res:
-            label = get_button_label(b)[:40]
-            cb_data = f"v:{str(b['_id'])}:k" if keep_result else f"v:{str(b['_id'])}"
-            btns.append([InlineKeyboardButton(f"{label}", callback_data=cb_data)])
+        for h in hits:
+            label = f"{h.get('title', 'Book')} - {h.get('author', 'Unk')}"
+            cb_data = f"v:{h['id']}:k" if keep_result else f"v:{h['id']}"
+            btns.append([InlineKeyboardButton(label[:40], callback_data=cb_data)])
             
         nav = []
-        nav.append(InlineKeyboardButton(f"1/{math.ceil(cnt/8)}", callback_data="nop"))
-        if cnt > 8: nav.append(InlineKeyboardButton("➡️", callback_data=f"n:1:{real_q[:20]}"))
+        nav.append(InlineKeyboardButton(f"1/{math.ceil(cnt/10)}", callback_data="nop"))
+        if cnt > 10: nav.append(InlineKeyboardButton("➡️", callback_data=f"n:1:{real_q[:20]}"))
         btns.append(nav)
         
         await message.reply(txt, reply_markup=InlineKeyboardMarkup(btns), parse_mode=ParseMode.HTML)
@@ -587,39 +604,29 @@ async def callback_handler(client, callback_query):
             _, p, q = d.split(':', 2)
             p = int(p)
             real_q = q
-            keep_result = False
-            if q.startswith("!!"): keep_result=True; real_q=q[2:].strip()
             
-            # REPLICATE LOGIC IN PAGINATION
-            words = real_q.split()
-            and_conditions = []
-            for word in words:
-                reg = re.compile(re.escape(word), re.IGNORECASE)
-                and_conditions.append({
-                    "$or": [
-                        {"title": reg},
-                        {"synopsis": reg},
-                        {"file_name": reg}
-                    ]
-                })
-            mongo_query = { "$and": and_conditions }
+            res = ms_client.index('books').search(real_q, {
+                'limit': 10,
+                'offset': p * 10,
+                'matchingStrategy': 'all',
+                'attributesToRetrieve': ['id', 'title', 'author']
+            })
             
-            cnt = await collection.count_documents(mongo_query)
-            cursor = collection.find(mongo_query)
+            hits = res['hits']
+            cnt = res['estimatedTotalHits']
             
-            res = await cursor.skip(p*8).limit(8).to_list(length=8)
-            if not res: return await callback_query.answer("End.", show_alert=True)
+            if not hits: return await callback_query.answer("End.", show_alert=True)
             
             btns = []
-            for b in res:
-                label = get_button_label(b)[:40]
-                cb_data = f"v:{str(b['_id'])}:k" if keep_result else f"v:{str(b['_id'])}"
-                btns.append([InlineKeyboardButton(f"{label}", callback_data=cb_data)])
+            for h in hits:
+                label = f"{h.get('title', 'Book')} - {h.get('author', 'Unk')}"
+                cb_data = f"v:{h['id']}"
+                btns.append([InlineKeyboardButton(label[:40], callback_data=cb_data)])
             
             nav = []
             if p > 0: nav.append(InlineKeyboardButton("⬅️", callback_data=f"n:{p-1}:{q}"))
-            nav.append(InlineKeyboardButton(f"{p+1}/{math.ceil(cnt/8)}", callback_data="nop"))
-            if p < math.ceil(cnt/8)-1: nav.append(InlineKeyboardButton("➡️", callback_data=f"n:{p+1}:{q}"))
+            nav.append(InlineKeyboardButton(f"{p+1}/{math.ceil(cnt/10)}", callback_data="nop"))
+            if p < math.ceil(cnt/10)-1: nav.append(InlineKeyboardButton("➡️", callback_data=f"n:{p+1}:{q}"))
             btns.append(nav)
             
             sq = html.escape(real_q)

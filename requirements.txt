@@ -1,8 +1,9 @@
-pyroblack
-tgcrypto
-motor
-beautifulsoup4
-quart
+Quart
 hypercorn
-jinja2
-itsdangerous
+motor
+pyrogram
+tgcrypto
+dnspython
+beautifulsoup4
+lxml
+meilisearch

@@ -65,6 +65,7 @@ if os.path.exists("sessions"):
     except: pass
 os.makedirs("sessions")
 
+# IPv6 False is critical for Northflank/Render
 app = Client("sessions/novel_bot_session", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, ipv6=False)
 
 # --- GLOBAL VARS ---
@@ -282,7 +283,7 @@ async def cb_handler(c, cb):
         await cb.answer("🚀 Sending...")
         await c.send_document(cb.message.chat.id, b['file_id'], caption=f"📖 {b.get('title')}")
 
-# --- ADMIN FEATURES (INDEXING/IMPORT) ---
+# --- ADMIN FEATURES ---
 def parse_epub_direct(file_path):
     meta = {"title": None, "author": "Unknown", "synopsis": "No synopsis.", "tags": "", "cover_image": None}
     try:
@@ -339,7 +340,8 @@ async def indexing_process(client, start_id, end_id, status_msg):
         while current <= end_id and indexing_active:
             batch = list(range(current, min(current + 50, end_id + 1)))
             if status_msg and current % 100 == 0:
-                try: await status_msg.edit(f"🔄 Scan: {current}\nFound: {files_found}\nSaved: {files_saved}")
+                try: 
+                    await status_msg.edit(f"🔄 Scan: {current}\nFound: {files_found}\nSaved: {files_saved}")
                 except: pass
             
             try:
@@ -355,8 +357,10 @@ async def indexing_process(client, start_id, end_id, status_msg):
     finally:
         for w in workers: w.cancel()
         indexing_active = False
-        if status_msg: try: await status_msg.edit(f"✅ Done!\nSaved: {files_saved}")
-        except: pass
+        if status_msg: 
+            try:
+                await status_msg.edit(f"✅ Done!\nSaved: {files_saved}")
+            except: pass
 
 @app.on_message(filters.command("index") & filters.user(ADMIN_ID))
 async def index_cmd(c, m):
@@ -408,6 +412,7 @@ async def import_cmd(c, m):
 
 # --- BACKGROUND TASKS ---
 async def ensure_indexes():
+    """Runs safely in background."""
     await asyncio.sleep(5)
     try:
         idxs = await collection.index_information()
@@ -421,6 +426,7 @@ async def main():
     logger.info("🤖 Starting...")
     await app.start()
     
+    # NUKE WEBHOOK (Fixes Polling issues)
     try: await app.delete_webhook()
     except: pass
     
@@ -429,8 +435,8 @@ async def main():
     
     asyncio.create_task(ensure_indexes())
     
+    # Start Web Server (Non-blocking task)
     config = Config(); config.bind = [f"0.0.0.0:{PORT}"]
-    logger.info(f"🚀 Web Server starting on port {PORT}")
     asyncio.create_task(serve(web_app, config))
     
     await idle()

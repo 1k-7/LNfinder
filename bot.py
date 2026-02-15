@@ -42,6 +42,7 @@ try:
     AZURE_URL = os.environ.get("AZURE_URL")
     if not AZURE_URL: raise ValueError("Missing AZURE_URL")
     
+    # Optional legacy support
     LEGACY_STR = os.environ.get("MONGO_URI") or os.environ.get("MONGO_URL") or ""
     LEGACY_URIS = LEGACY_STR.split() if LEGACY_STR else []
     
@@ -103,6 +104,7 @@ def get_display_title(book_doc):
 
 def get_button_label(book_doc):
     full = get_display_title(book_doc)
+    # Strip chapter numbers for cleaner buttons
     return re.sub(r'\s+(c|ch|chap|vol|v)\.?\s*\d+(?:[-–]\d+)?.*$', '', full, flags=re.IGNORECASE).strip()
 
 def get_pagination_list(current, total):
@@ -170,20 +172,34 @@ async def search():
         )
     
     try:
-        # STRICT AND SEARCH (No Regex)
-        # We split the user's query into words.
-        # We wrap EACH word in quotes: "Hogwarts" "Ancient"
-        # MongoDB $text search treats quoted strings as mandatory.
-        # This forces the engine to return only docs containing ALL words.
+        # --- FIXED SEARCH LOGIC (STRICT AND) ---
+        # We split the query into words.
+        # We create a specific condition for EACH word.
+        # Condition: "This word must appear in Title OR Synopsis OR Filename"
+        # Then we join all word-conditions with $and.
+        
         words = query.split()
-        search_terms = ""
-        for w in words:
-            search_terms += f"\"{w}\" "
+        and_conditions = []
+        
+        for word in words:
+            # Simple substring match (regex), case insensitive
+            reg = re.compile(re.escape(word), re.IGNORECASE)
             
-        mongo_query = {"$text": {"$search": search_terms}}
+            # The condition for THIS word
+            word_matches_any_field = {
+                "$or": [
+                    {"title": reg},
+                    {"synopsis": reg},
+                    {"file_name": reg}
+                ]
+            }
+            and_conditions.append(word_matches_any_field)
+            
+        # The Final Query: ALL word conditions must be true
+        mongo_query = { "$and": and_conditions }
 
-        # We purposely do NOT sort by textScore to avoid memory timeouts on large results.
-        # We assume natural order (insertion order) is sufficient for speed.
+        # EXECUTION (No Sort)
+        # We assume natural order to avoid timeouts on large datasets
         cnt = await collection.count_documents(mongo_query)
         cursor = collection.find(mongo_query)
         
@@ -489,14 +505,22 @@ async def import_cmd(client, message):
 
 @app.on_message(filters.command("fix_search") & filters.user(ADMIN_ID))
 async def fix_search_cmd(client, message):
-    s = await message.reply("🛠 **Optimizing Database...**\nCreating Wildcard Text Index. This enables 'All Fields' search without Regex.")
+    s = await message.reply("🛠 **Optimizing Database...**\nCreating standard field indexes for fast partial matching.")
     try:
+        # Drop old indexes (Text/Wildcard) that were causing issues or not used
         await collection.drop_indexes()
-        # Wildcard index allows $text search on ALL string fields
-        await collection.create_index([("$**", "text")])
+        
+        # Create standard indexes for fields we regex on
+        # This helps Cosmos DB optimize the $or lookups
+        await collection.create_index("title")
+        await collection.create_index("synopsis")
+        await collection.create_index("file_name")
+        
+        # Essential uniques
         await collection.create_index("file_unique_id", unique=True)
         await collection.create_index("msg_id")
-        await s.edit("✅ Indexes Reset. Wildcard Search Active.")
+        
+        await s.edit("✅ **System Repaired!**\nStandard Indexes Active.")
     except Exception as e:
         await s.edit(f"❌ Error: {e}")
 
@@ -510,20 +534,29 @@ async def search_handler(client, message):
     if q.startswith("!!"): keep_result=True; real_q=q[2:].strip()
 
     try:
-        # STRICT AND LOGIC (No Regex)
         words = real_q.split()
-        search_terms = ""
-        for w in words:
-            search_terms += f"\"{w}\" "
-            
-        mongo_query = {"$text": {"$search": search_terms}}
         
+        # --- FIXED SEARCH LOGIC (STRICT AND) ---
+        and_conditions = []
+        for word in words:
+            reg = re.compile(re.escape(word), re.IGNORECASE)
+            and_conditions.append({
+                "$or": [
+                    {"title": reg},
+                    {"synopsis": reg},
+                    {"file_name": reg}
+                ]
+            })
+            
+        mongo_query = { "$and": and_conditions }
+        
+        # Fast Count
         cnt = await collection.count_documents(mongo_query)
         
         if cnt == 0:
             return await message.reply("❌ No matches found.")
 
-        # No Sort for Speed
+        # Fetch Top 8 (No Sort)
         cursor = collection.find(mongo_query)
         res = await cursor.limit(8).to_list(length=8)
 
@@ -557,17 +590,24 @@ async def callback_handler(client, callback_query):
             keep_result = False
             if q.startswith("!!"): keep_result=True; real_q=q[2:].strip()
             
-            # REPLICATE STRICT LOGIC IN PAGINATION
+            # REPLICATE LOGIC IN PAGINATION
             words = real_q.split()
-            search_terms = ""
-            for w in words:
-                search_terms += f"\"{w}\" "
-            mongo_query = {"$text": {"$search": search_terms}}
+            and_conditions = []
+            for word in words:
+                reg = re.compile(re.escape(word), re.IGNORECASE)
+                and_conditions.append({
+                    "$or": [
+                        {"title": reg},
+                        {"synopsis": reg},
+                        {"file_name": reg}
+                    ]
+                })
+            mongo_query = { "$and": and_conditions }
             
             cnt = await collection.count_documents(mongo_query)
             cursor = collection.find(mongo_query)
-            res = await cursor.skip(p*8).limit(8).to_list(length=8)
             
+            res = await cursor.skip(p*8).limit(8).to_list(length=8)
             if not res: return await callback_query.answer("End.", show_alert=True)
             
             btns = []

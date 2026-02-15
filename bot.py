@@ -42,7 +42,7 @@ except Exception as e:
 # --- LOGGING ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-logging.getLogger("pyrogram").setLevel(logging.INFO) # Keep INFO to see connection status
+logging.getLogger("pyrogram").setLevel(logging.INFO)
 logging.getLogger("hypercorn").setLevel(logging.INFO)
 
 # --- DATABASE ---
@@ -60,13 +60,11 @@ web_app = Quart(__name__, template_folder='template')
 serializer = URLSafeTimedSerializer(SECRET_KEY)
 
 # --- BOT CLIENT ---
-# Force delete session to ensure fresh login
 if os.path.exists("sessions"):
     try: shutil.rmtree("sessions")
     except: pass
 os.makedirs("sessions")
 
-# IPV6 FALSE IS CRITICAL FOR CLOUD HOSTING
 app = Client("sessions/novel_bot_session", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, ipv6=False)
 
 # --- GLOBAL VARS ---
@@ -145,7 +143,6 @@ async def web_search():
             })
             
         total_pages = math.ceil(cnt / limit)
-        # Pagination Logic
         delta = 2; left = page - delta; right = page + delta + 1
         pagination_list = []
         l = None
@@ -297,7 +294,6 @@ def parse_epub_direct(file_path):
                 for elem in root.findall('.//{http://purl.org/dc/elements/1.1/}creator'): meta['author'] = elem.text
                 for elem in root.findall('.//{http://purl.org/dc/elements/1.1/}description'): meta['synopsis'] = elem.text
                 
-                # Cover
                 cover_id = None
                 for m in root.findall('.//{http://www.idpf.org/2007/opf}meta'):
                     if m.get('name') == 'cover': cover_id = m.get('content')
@@ -412,7 +408,6 @@ async def import_cmd(c, m):
 
 # --- BACKGROUND TASKS ---
 async def ensure_indexes():
-    """Runs safely in background."""
     await asyncio.sleep(5)
     try:
         idxs = await collection.index_information()
@@ -426,7 +421,6 @@ async def main():
     logger.info("🤖 Starting...")
     await app.start()
     
-    # NUKE WEBHOOK (Fixes Polling issues)
     try: await app.delete_webhook()
     except: pass
     
@@ -435,8 +429,8 @@ async def main():
     
     asyncio.create_task(ensure_indexes())
     
-    # Start Web Server (Non-blocking task)
     config = Config(); config.bind = [f"0.0.0.0:{PORT}"]
+    logger.info(f"🚀 Web Server starting on port {PORT}")
     asyncio.create_task(serve(web_app, config))
     
     await idle()

@@ -440,8 +440,8 @@ async def callback_handler(client, cb):
         if not b_mongo: return await cb.answer("Not found.", show_alert=True)
         
         # --- PART 1: COVER & HEADER ---
-        header_text = (f"📖 <b>{html.escape(get_display_title(b_mongo))}</b>\n"
-                       f"👤 <i>{html.escape(b_mongo.get('author','Unknown'))}</i>")
+        header_text = (f"<blockquote>📖 <b>{html.escape(get_display_title(b_mongo))}</b>\n"
+                       f"👤 <i>{html.escape(b_mongo.get('author','Unknown'))}</i></blockquote>")
         
         # Only delete if the keep flag is NOT present
         if not keep_menu: 

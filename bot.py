@@ -42,7 +42,6 @@ try:
     AZURE_URL = os.environ.get("AZURE_URL")
     if not AZURE_URL: raise ValueError("Missing AZURE_URL")
     
-    # Optional legacy support
     LEGACY_STR = os.environ.get("MONGO_URI") or os.environ.get("MONGO_URL") or ""
     LEGACY_URIS = LEGACY_STR.split() if LEGACY_STR else []
     
@@ -104,7 +103,6 @@ def get_display_title(book_doc):
 
 def get_button_label(book_doc):
     full = get_display_title(book_doc)
-    # Strip chapter numbers for cleaner buttons
     return re.sub(r'\s+(c|ch|chap|vol|v)\.?\s*\d+(?:[-–]\d+)?.*$', '', full, flags=re.IGNORECASE).strip()
 
 def get_pagination_list(current, total):
@@ -172,23 +170,37 @@ async def search():
         )
     
     try:
-        # --- FIXED SEARCH LOGIC (STRICT AND + NO REGEX) ---
-        # 1. Split the user query into words
         words = query.split()
         
-        # 2. Wrap EVERY word in quotes. 
-        # In MongoDB Text Search, a quoted phrase is mandatory.
-        # "Hogwarts" "Ancient" -> Finds docs containing BOTH phrases.
-        # This replaces the Regex scan with a fast Index Lookup.
-        search_terms = " ".join([f'"{word}"' for word in words])
+        # --- 1. Try Fast Text Search (Exact Words) ---
+        text_query = " ".join([f'"{w}"' for w in words])
+        mongo_query = {"$text": {"$search": text_query}}
         
-        mongo_query = {"$text": {"$search": search_terms}}
-
-        # 3. Execute
-        # We deliberately remove sorting to ensure speed on large collections
         cnt = await collection.count_documents(mongo_query)
-        cursor = collection.find(mongo_query)
         
+        # --- 2. Fallback: Strict AND Partial Regex ---
+        # If text search finds nothing, we use regex to match partial words (e.g. "Hog" -> "Hogwarts")
+        # FIX: We build a separate OR condition for EACH word, then AND them all together.
+        if cnt == 0:
+            and_conditions = []
+            for word in words:
+                reg = re.compile(re.escape(word), re.IGNORECASE)
+                # Word must be in Title OR Author OR File Name OR Synopsis
+                word_group = {
+                    "$or": [
+                        {"title": reg},
+                        {"author": reg},
+                        {"file_name": reg},
+                        {"synopsis": reg}
+                    ]
+                }
+                and_conditions.append(word_group)
+            
+            mongo_query = {"$and": and_conditions}
+            cnt = await collection.count_documents(mongo_query)
+
+        # Execution (No Sort for speed)
+        cursor = collection.find(mongo_query)
         books_cursor = await cursor.skip(skip).limit(limit).to_list(length=limit)
         
         results = []
@@ -491,22 +503,14 @@ async def import_cmd(client, message):
 
 @app.on_message(filters.command("fix_search") & filters.user(ADMIN_ID))
 async def fix_search_cmd(client, message):
-    s = await message.reply("🛠 **Optimizing Database...**\nCreating Wildcard Text Index. This enables 'All Fields' search.")
+    s = await message.reply("🛠 **Optimizing Database...**\nCreating Wildcard Text Index.")
     try:
-        # Drop old indexes
         await collection.drop_indexes()
-        
-        # Create Text Index on specific fields for optimization
-        await collection.create_index(
-            [("title", "text"), ("synopsis", "text"), ("author", "text")],
-            name="TextIndex"
-        )
-        
-        # Restore essential unique indexes
+        # Wildcard index to support efficient text search on all string fields
+        await collection.create_index([("$**", "text")])
         await collection.create_index("file_unique_id", unique=True)
         await collection.create_index("msg_id")
-        
-        await s.edit("✅ **System Repaired!**\nText Index Active on Title, Synopsis, and Author.")
+        await s.edit("✅ Indexes Reset.")
     except Exception as e:
         await s.edit(f"❌ Error: {e}")
 
@@ -520,19 +524,35 @@ async def search_handler(client, message):
     if q.startswith("!!"): keep_result=True; real_q=q[2:].strip()
 
     try:
-        # --- FIXED SEARCH LOGIC FOR BOT ---
-        # Same logic as web: Quote every word to force AND
         words = real_q.split()
-        search_terms = " ".join([f'"{word}"' for word in words])
         
-        mongo_query = {"$text": {"$search": search_terms}}
+        # 1. Strict Text Search (AND Logic)
+        text_query = " ".join([f'"{w}"' for w in words])
+        mongo_query = {"$text": {"$search": text_query}}
         
         cnt = await collection.count_documents(mongo_query)
         
+        # 2. Fallback to Strict Partial Regex (AND Logic)
+        # If no full text match, try partial match BUT ensure EVERY word is found.
+        if cnt == 0:
+             and_conditions = []
+             for word in words:
+                 reg = re.compile(re.escape(word), re.IGNORECASE)
+                 and_conditions.append({
+                     "$or": [
+                         {"title": reg},
+                         {"author": reg},
+                         {"file_name": reg},
+                         {"synopsis": reg}
+                     ]
+                 })
+             mongo_query = {"$and": and_conditions}
+             cnt = await collection.count_documents(mongo_query)
+
         if cnt == 0:
             return await message.reply("❌ No matches found.")
 
-        # NO SORT (Performance)
+        # Fetch Top 8 (No sort for speed)
         cursor = collection.find(mongo_query)
         res = await cursor.limit(8).to_list(length=8)
 
@@ -566,15 +586,32 @@ async def callback_handler(client, callback_query):
             keep_result = False
             if q.startswith("!!"): keep_result=True; real_q=q[2:].strip()
             
-            # REPLICATE THE STRICT LOGIC HERE TOO
             words = real_q.split()
-            search_terms = " ".join([f'"{word}"' for word in words])
-            mongo_query = {"$text": {"$search": search_terms}}
+            
+            # SAME LOGIC AS ABOVE
+            text_query = " ".join([f'"{w}"' for w in words])
+            mongo_query = {"$text": {"$search": text_query}}
             
             cnt = await collection.count_documents(mongo_query)
-            cursor = collection.find(mongo_query)
             
+            if cnt == 0:
+                 and_conditions = []
+                 for word in words:
+                     reg = re.compile(re.escape(word), re.IGNORECASE)
+                     and_conditions.append({
+                         "$or": [
+                             {"title": reg},
+                             {"author": reg},
+                             {"file_name": reg},
+                             {"synopsis": reg}
+                         ]
+                     })
+                 mongo_query = {"$and": and_conditions}
+                 cnt = await collection.count_documents(mongo_query)
+            
+            cursor = collection.find(mongo_query)
             res = await cursor.skip(p*8).limit(8).to_list(length=8)
+            
             if not res: return await callback_query.answer("End.", show_alert=True)
             
             btns = []

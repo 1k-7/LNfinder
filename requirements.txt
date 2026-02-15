@@ -1,7 +1,8 @@
-pyrogram
+pyroblack
 tgcrypto
+motor
+beautifulsoup4
 quart
 hypercorn
-motor
-dnspython
-uvloop
+jinja2
+itsdangerous

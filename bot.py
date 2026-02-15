@@ -42,6 +42,7 @@ try:
     AZURE_URL = os.environ.get("AZURE_URL")
     if not AZURE_URL: raise ValueError("Missing AZURE_URL")
     
+    # Optional legacy support
     LEGACY_STR = os.environ.get("MONGO_URI") or os.environ.get("MONGO_URL") or ""
     LEGACY_URIS = LEGACY_STR.split() if LEGACY_STR else []
     
@@ -171,23 +172,20 @@ async def search():
         )
     
     try:
-        # --- FAST & LIGHT SEARCH ---
-        # 1. Split query into words
+        # --- FIXED SEARCH LOGIC (STRICT AND + NO REGEX) ---
+        # 1. Split the user query into words
         words = query.split()
         
-        # 2. Build Text Search String
-        # We wrap each word in quotes: "Hogwarts" "Family"
-        # This forces MongoDB to find docs containing ALL words (AND logic).
-        # This uses the Text Index (O(1)) and avoids Regex scans.
-        text_query_str = ""
-        for w in words:
-            text_query_str += f"\"{w}\" "
-            
-        mongo_query = {"$text": {"$search": text_query_str}}
+        # 2. Wrap EVERY word in quotes. 
+        # In MongoDB Text Search, a quoted phrase is mandatory.
+        # "Hogwarts" "Ancient" -> Finds docs containing BOTH phrases.
+        # This replaces the Regex scan with a fast Index Lookup.
+        search_terms = " ".join([f'"{word}"' for word in words])
+        
+        mongo_query = {"$text": {"$search": search_terms}}
 
-        # 3. Execution (No Sort)
-        # We DO NOT sort by textScore here to ensure we get results instantly
-        # without loading the whole dataset into memory.
+        # 3. Execute
+        # We deliberately remove sorting to ensure speed on large collections
         cnt = await collection.count_documents(mongo_query)
         cursor = collection.find(mongo_query)
         
@@ -495,19 +493,20 @@ async def import_cmd(client, message):
 async def fix_search_cmd(client, message):
     s = await message.reply("🛠 **Optimizing Database...**\nCreating Wildcard Text Index. This enables 'All Fields' search.")
     try:
-        # 1. Drop old indexes to clear bad config
+        # Drop old indexes
         await collection.drop_indexes()
         
-        # 2. Create the Wildcard Text Index
-        # "$**" means "Index ALL string fields in the document recursively"
-        # This is the "Ingenious" way to support searching Title OR Synopsis OR Tags without complex queries
-        await collection.create_index([("$**", "text")])
+        # Create Text Index on specific fields for optimization
+        await collection.create_index(
+            [("title", "text"), ("synopsis", "text"), ("author", "text")],
+            name="TextIndex"
+        )
         
-        # 3. Restore essential unique indexes
+        # Restore essential unique indexes
         await collection.create_index("file_unique_id", unique=True)
         await collection.create_index("msg_id")
         
-        await s.edit("✅ **System Repaired!**\nWildcard Index Active. Search is now light and fast.")
+        await s.edit("✅ **System Repaired!**\nText Index Active on Title, Synopsis, and Author.")
     except Exception as e:
         await s.edit(f"❌ Error: {e}")
 
@@ -521,20 +520,19 @@ async def search_handler(client, message):
     if q.startswith("!!"): keep_result=True; real_q=q[2:].strip()
 
     try:
-        # STRICT AND LOGIC via TEXT SEARCH
+        # --- FIXED SEARCH LOGIC FOR BOT ---
+        # Same logic as web: Quote every word to force AND
         words = real_q.split()
-        text_query_str = ""
-        for w in words:
-            text_query_str += f"\"{w}\" "
-            
-        mongo_query = {"$text": {"$search": text_query_str}}
+        search_terms = " ".join([f'"{word}"' for word in words])
+        
+        mongo_query = {"$text": {"$search": search_terms}}
         
         cnt = await collection.count_documents(mongo_query)
         
         if cnt == 0:
             return await message.reply("❌ No matches found.")
 
-        # No Sort for Speed
+        # NO SORT (Performance)
         cursor = collection.find(mongo_query)
         res = await cursor.limit(8).to_list(length=8)
 
@@ -568,11 +566,10 @@ async def callback_handler(client, callback_query):
             keep_result = False
             if q.startswith("!!"): keep_result=True; real_q=q[2:].strip()
             
+            # REPLICATE THE STRICT LOGIC HERE TOO
             words = real_q.split()
-            text_query_str = ""
-            for w in words:
-                text_query_str += f"\"{w}\" "
-            mongo_query = {"$text": {"$search": text_query_str}}
+            search_terms = " ".join([f'"{word}"' for word in words])
+            mongo_query = {"$text": {"$search": search_terms}}
             
             cnt = await collection.count_documents(mongo_query)
             cursor = collection.find(mongo_query)
@@ -638,7 +635,7 @@ async def main():
     logger.info("🤖 Starting Telegram Bot...")
     await app.start()
     
-    # --- WEBHOOK NUKE (Keep this to fix ghost updates) ---
+    # --- CRITICAL FIX FOR GHOST WEBHOOK (MANUAL) ---
     try:
         logger.info("🧹 Nuking Webhook...")
         with urllib.request.urlopen(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook?drop_pending_updates=True") as response:

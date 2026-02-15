@@ -135,9 +135,15 @@ class LocalSearchDB:
         cursor = self.conn.cursor()
         offset = (page - 1) * limit
         clean_q = re.sub(r'[^\w\s]', '', query).strip()
-        if not clean_q: return [], 0
+        
+        # Handle special prefixes for parsing, but keep them for logic check later
+        search_q = clean_q
+        if search_q.startswith("!!") or search_q.startswith(".."):
+            search_q = search_q[2:].strip()
+            
+        if not search_q: return [], 0
 
-        words = clean_q.split()
+        words = search_q.split()
         try:
             if len(words) == 1:
                 sql = """
@@ -145,7 +151,7 @@ class LocalSearchDB:
                     WHERE title LIKE ? OR author LIKE ? OR synopsis LIKE ?
                     ORDER BY rank LIMIT ? OFFSET ?
                 """
-                wild = f"%{clean_q}%"
+                wild = f"%{search_q}%"
                 cursor.execute(sql, (wild, wild, wild, limit, offset))
                 rows = cursor.fetchall()
                 
@@ -201,7 +207,6 @@ class QueryCache:
     def store(self, query_text):
         qid = str(uuid.uuid4())[:8]
         self.cache[qid] = {"q": query_text, "t": time.time()}
-        # Cleanup
         if len(self.cache) > 500:
             now = time.time()
             self.cache = {k:v for k,v in self.cache.items() if now - v['t'] < 3600}
@@ -367,10 +372,7 @@ async def bot_search_handler(client, message):
     q = message.text.strip()
     if len(q) < 2: return
     
-    # Store query for pagination
     qid = q_cache.store(q)
-    
-    # Search Page 1
     await show_bot_page(client, message.chat.id, q, 1, qid)
 
 async def show_bot_page(client, chat_id, query_text, page, qid, message_to_edit=None):
@@ -388,7 +390,6 @@ async def show_bot_page(client, chat_id, query_text, page, qid, message_to_edit=
         title = b['title'][:50] if b['title'] else "Unknown"
         btns.append([InlineKeyboardButton(title, callback_data=f"v:{b['_id']}")])
     
-    # Navigation Buttons
     nav = []
     total_pages = math.ceil(count / 8)
     
@@ -417,13 +418,9 @@ async def callback_handler(client, cb):
             _, qid, page = d.split(":")
             page = int(page)
             query_text = q_cache.get(qid)
-            
-            if not query_text:
-                return await cb.answer("❌ Search expired. Please search again.", show_alert=True)
-            
+            if not query_text: return await cb.answer("❌ Search expired.", show_alert=True)
             await show_bot_page(client, cb.message.chat.id, query_text, page, qid, message_to_edit=cb.message)
         except Exception as e:
-            logger.error(f"Nav error: {e}")
             await cb.answer("Error navigating.", show_alert=True)
 
     elif d.startswith("v:"):
@@ -431,21 +428,42 @@ async def callback_handler(client, cb):
         b_mongo = await collection.find_one({"_id": ObjectId(bid)})
         if not b_mongo: return await cb.answer("Not found.", show_alert=True)
         
-        t = (f"<blockquote><b>{html.escape(get_display_title(b_mongo))}</b>\n"
-             f"<i>{html.escape(b_mongo.get('author','Unknown'))}</i></blockquote>\n\n"
-             f"<blockquote expandable>{html.escape(b_mongo.get('synopsis','No synopsis.')[:1000])}</blockquote>")
+        # 1. Prepare Title/Author Header
+        header_text = (f"📖 <b>{html.escape(get_display_title(b_mongo))}</b>\n"
+                       f"👤 <i>{html.escape(b_mongo.get('author','Unknown'))}</i>")
         
+        # 2. Prepare Synopsis/Button Body
+        synopsis_text = f"<blockquote expandable>{html.escape(b_mongo.get('synopsis','No synopsis.')[:1000])}</blockquote>"
         kb = [[InlineKeyboardButton("📥 Download", callback_data=f"d:{bid}")]]
         
-        await cb.message.delete()
+        # --- MENU PRESERVATION LOGIC ---
+        keep_menu = False
+        try:
+            if cb.message and cb.message.text:
+                for line in cb.message.text.splitlines():
+                    if "Results for:" in line:
+                        query_part = line.split("Results for:", 1)[1].strip().replace('`', '')
+                        if query_part.startswith("!!") or query_part.startswith(".."):
+                            keep_menu = True
+                        break
+        except: pass
+        
+        if not keep_menu:
+            await cb.message.delete()
+            
+        # --- MESSAGE SPLITTING ---
+        # Msg 1: Cover/Title
         if b_mongo.get('cover_image'):
             try:
                 f = io.BytesIO(b_mongo['cover_image']); f.name="c.jpg"
-                await client.send_photo(cb.message.chat.id, f, caption=t, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+                await client.send_photo(cb.message.chat.id, f, caption=header_text, parse_mode=ParseMode.HTML)
             except:
-                await client.send_message(cb.message.chat.id, t, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+                await client.send_message(cb.message.chat.id, header_text, parse_mode=ParseMode.HTML)
         else:
-            await client.send_message(cb.message.chat.id, t, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+            await client.send_message(cb.message.chat.id, header_text, parse_mode=ParseMode.HTML)
+            
+        # Msg 2: Synopsis + Button
+        await client.send_message(cb.message.chat.id, synopsis_text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
 
     elif d.startswith("d:"):
         bid = d.split(":")[1]
@@ -459,7 +477,7 @@ async def callback_handler(client, cb):
 # --- COMMANDS ---
 @app.on_message(filters.command("start"))
 async def start_handler(client, message):
-    await message.reply("👋 **Library Bot**\nCached Engine (Persistent) ⚡\nSend text to search.")
+    await message.reply("👋 **Library Bot**\nFast Engine Active ⚡")
 
 @app.on_message(filters.command("url"))
 async def url_cmd(client, message):
@@ -468,25 +486,19 @@ async def url_cmd(client, message):
 
 @app.on_message(filters.command("export_cache") & filters.user(ADMIN_ID))
 async def export_cache_cmd(client, message):
-    logger.info("📦 Export Cache command received.")
-    if not os.path.exists("cache.db"):
-        return await message.reply("❌ No cache file found.")
-        
-    status = await message.reply("📦 creating snapshot...")
+    if not os.path.exists("cache.db"): return await message.reply("❌ No cache.")
+    status = await message.reply("📦 Snapshotting...")
     try:
         shutil.copy2("cache.db", "cache_dump.db")
-        await status.edit("🚀 Uploading snapshot...")
+        await status.edit("🚀 Uploading...")
         await message.reply_document("cache_dump.db", caption="💾 **Cache Snapshot**")
         await status.delete()
         os.remove("cache_dump.db")
-    except Exception as e:
-        logger.error(f"Export failed: {e}")
-        await status.edit(f"❌ Error: {e}")
+    except Exception as e: await status.edit(f"❌ {e}")
 
 async def main():
     await asyncio.to_thread(check_and_download_cache)
     asyncio.create_task(sync_mongo_to_sqlite())
-    
     await app.start()
     try: urllib.request.urlopen(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook?drop_pending_updates=True")
     except: pass

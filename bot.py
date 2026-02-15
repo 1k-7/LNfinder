@@ -7,6 +7,7 @@ import io
 import zipfile
 import html
 import re
+import shutil
 import random
 import json
 import base64
@@ -17,7 +18,7 @@ from bs4 import BeautifulSoup
 # --- DATABASE IMPORTS ---
 from bson.objectid import ObjectId 
 from motor.motor_asyncio import AsyncIOMotorClient
-from pymongo.errors import DuplicateKeyError, OperationFailure
+from pymongo.errors import DuplicateKeyError
 
 # --- PYROGRAM IMPORTS ---
 from pyrogram import Client, filters, idle
@@ -43,7 +44,6 @@ try:
     if not AZURE_URL: raise ValueError("Missing AZURE_URL")
     
     PORT = int(os.environ.get("PORT", 8080))
-    # Remove trailing slash to prevent double // in links
     PUBLIC_URL = (os.environ.get("PUBLIC_URL") or f"http://0.0.0.0:{PORT}").rstrip('/')
     SECRET_KEY = os.environ.get("SECRET_KEY", "CHANGE_THIS_TO_RANDOM_STRING")
 
@@ -73,33 +73,27 @@ except Exception as e:
 # --- BACKGROUND TASKS ---
 async def ensure_indexes():
     """Runs in background to fix DB without freezing the bot."""
-    await asyncio.sleep(3) # Short wait to let bot login first
+    await asyncio.sleep(5) 
     try:
-        logger.info("🛠 Checking Indexes...")
-        
-        # 1. DELETE THE CONFLICTING WILDCARD INDEX
-        # This is the specific fix for your error log "Expected exactly one text index"
-        try:
-            await collection.drop_index("$**_text")
-            logger.info("🗑️ Deleted old Wildcard Index (This was causing the conflict).")
-        except Exception: 
-            pass # Index didn't exist, ignore
-            
-        # 2. CREATE THE OPTIMIZED TEXT INDEX
         indexes = await collection.index_information()
+        # Drop conflicting wildcard index if it exists
+        if "$**_text" in indexes:
+            logger.info("🗑️ Removing old wildcard index...")
+            await collection.drop_index("$**_text")
+
         if "TextIndex" not in indexes:
-            logger.info("🛠 Creating Optimized Text Index...")
+            logger.info("🛠 Creating Text Index (Background)...")
+            # background=True ensures the DB doesn't lock up during this
             await collection.create_index(
                 [("title", "text"), ("synopsis", "text")], 
                 name="TextIndex", 
-                weights={"title": 10, "synopsis": 1}
+                weights={"title": 10, "synopsis": 1},
+                background=True 
             )
         
-        # 3. ENSURE STANDARD INDEXES
-        await collection.create_index("file_unique_id", unique=True)
-        await collection.create_index("msg_id")
-        
-        logger.info("✅ Database Fully Optimized.")
+        await collection.create_index("file_unique_id", unique=True, background=True)
+        await collection.create_index("msg_id", background=True)
+        logger.info("✅ Database Indexes Verified.")
     except Exception as e:
         logger.error(f"❌ Index Error (Non-fatal): {e}")
 
@@ -159,7 +153,7 @@ async def health(): return "OK", 200
 @web_app.route('/login')
 async def login():
     token = request.args.get('token')
-    if not token: return "❌ No token provided.", 400
+    if not token: return "❌ No token.", 400
     try:
         user_id = serializer.loads(token, max_age=3600)
         resp = await make_response(redirect(url_for('index')))
@@ -175,6 +169,7 @@ async def index():
 @web_app.route('/cover/<book_id>')
 async def serve_cover(book_id):
     try:
+        # 2s Timeout to prevent hanging
         b = await collection.find_one({"_id": ObjectId(book_id)}, {"cover_image": 1})
         if b and b.get('cover_image'): return Response(b['cover_image'], mimetype='image/jpeg')
     except: pass
@@ -196,16 +191,16 @@ async def search():
         search_terms = " ".join([f'"{w}"' for w in words])
         mongo_query = {"$text": {"$search": search_terms}}
         
-        cnt = await collection.count_documents(mongo_query)
+        # Max Time 5s to prevent timeouts
+        cnt = await collection.count_documents(mongo_query, maxTimeMS=5000)
         if cnt == 0:
              and_conditions = []
              for word in words:
                  reg = re.compile(re.escape(word), re.IGNORECASE)
                  and_conditions.append({"$or": [{"title": reg}, {"synopsis": reg}, {"file_name": reg}]})
              mongo_query = { "$and": and_conditions }
-             cnt = await collection.count_documents(mongo_query)
+             cnt = await collection.count_documents(mongo_query, maxTimeMS=5000)
 
-        # FETCH SYNOPSIS FOR PAGE (Server Side)
         projection = {"title": 1, "author": 1, "synopsis": 1, "tags": 1, "file_name": 1, "_id": 1}
         
         cursor = collection.find(mongo_query, projection)
@@ -214,7 +209,7 @@ async def search():
         results = []
         for b in books_cursor:
             syn = b.get('synopsis', 'No synopsis available.').strip()
-            syn = re.sub(r'<[^>]+>', '', syn) # Strip HTML
+            syn = re.sub(r'<[^>]+>', '', syn)
             
             results.append({
                 "_id": str(b['_id']),
@@ -234,7 +229,7 @@ async def search():
         )
     except Exception as e:
         logger.error(f"Search Error: {e}")
-        return await render_template('index.html', query=query, results=[], error="Search failed. Try fewer words.", user_id=user_id)
+        return await render_template('index.html', query=query, results=[], error="Database Timeout or Error.", user_id=user_id)
 
 @web_app.route('/api/download/<book_id>')
 async def api_download(book_id):
@@ -252,7 +247,11 @@ async def api_download(book_id):
     except Exception as e: return jsonify({"status": "error", "message": str(e)}), 500
 
 # --- BOT INIT ---
-if not os.path.exists("sessions"): os.makedirs("sessions")
+if os.path.exists("sessions"):
+    try: shutil.rmtree("sessions")
+    except: pass
+os.makedirs("sessions")
+
 app = Client("sessions/novel_bot_session", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 # --- EPUB PARSER ---
@@ -351,11 +350,16 @@ async def indexing_process(client, start_id, end_id, status_msg):
             try: await status_msg.edit(f"✅ **Done!**\nScanned: `{end_id}`\nFound: `{files_found}`\nSaved: `{files_saved}`")
             except: pass
 
+@app.on_message(filters.command("ping"))
+async def ping_cmd(client, message):
+    # This command touches NO database. Use it to check if bot is alive.
+    await message.reply("🏓 Pong! Bot is alive.")
+
 @app.on_message(filters.command("url"))
 async def url_cmd(client, message):
     try:
         token = serializer.dumps(message.from_user.id)
-        await message.reply(f"🔗 <b>Your Link:</b>\n<code>{PUBLIC_URL}/login?token={token}</code>", parse_mode=ParseMode.HTML)
+        await message.reply(f"🔗 <b>Link:</b>\n<code>{PUBLIC_URL}/login?token={token}</code>", parse_mode=ParseMode.HTML)
     except: pass
 
 @app.on_message(filters.command("stats"))
@@ -427,12 +431,12 @@ async def import_cmd(client, message):
 
 @app.on_message(filters.command("fix_search") & filters.user(ADMIN_ID))
 async def fix_search_cmd(client, message):
-    s = await message.reply("🛠 **Manually Rebuilding Index...**")
+    s = await message.reply("🛠 **Rebuilding Index...**")
     await ensure_indexes()
-    await s.edit("✅ **Fixed!** Strict Search Enabled.")
+    await s.edit("✅ **Fixed!**")
 
 # --- BOT SEARCH ---
-@app.on_message(filters.text & filters.incoming & ~filters.command(["start", "index", "stop_index", "url", "export", "import", "fix_search", "stats"]))
+@app.on_message(filters.text & filters.incoming & ~filters.command(["start", "index", "stop_index", "url", "export", "import", "fix_search", "stats", "ping"]))
 async def bot_search(client, message):
     q = message.text.strip()
     if not q: return
@@ -441,29 +445,33 @@ async def bot_search(client, message):
     search_terms = " ".join([f'"{w}"' for w in words])
     mongo_query = {"$text": {"$search": search_terms}}
     
-    cnt = await collection.count_documents(mongo_query)
-    if cnt == 0:
-        and_conditions = []
-        for word in words:
-            reg = re.compile(re.escape(word), re.IGNORECASE)
-            and_conditions.append({"$or": [{"title": reg}, {"synopsis": reg}]})
-        mongo_query = { "$and": and_conditions }
-        cnt = await collection.count_documents(mongo_query)
+    # 5s Timeout on DB calls to stop bot freezing
+    try:
+        cnt = await collection.count_documents(mongo_query, maxTimeMS=5000)
+        if cnt == 0:
+            and_conditions = []
+            for word in words:
+                reg = re.compile(re.escape(word), re.IGNORECASE)
+                and_conditions.append({"$or": [{"title": reg}, {"synopsis": reg}]})
+            mongo_query = { "$and": and_conditions }
+            cnt = await collection.count_documents(mongo_query, maxTimeMS=5000)
 
-    if cnt == 0: return await message.reply("❌ No matches found.")
-    
-    cursor = collection.find(mongo_query, {"title": 1, "author": 1})
-    res = await cursor.limit(8).to_list(length=8)
-    
-    btns = []
-    for b in res:
-        btns.append([InlineKeyboardButton(get_button_label(b.get('title', 'Unknown'))[:40], callback_data=f"v:{str(b['_id'])}")])
-    
-    nav = [InlineKeyboardButton(f"1/{math.ceil(cnt/8)}", callback_data="nop")]
-    if cnt > 8: nav.append(InlineKeyboardButton("➡️", callback_data=f"n:1:{q[:20]}"))
-    btns.append(nav)
-    
-    await message.reply(f"🔎 Results: <b>{html.escape(q)}</b> ({cnt})", reply_markup=InlineKeyboardMarkup(btns), parse_mode=ParseMode.HTML)
+        if cnt == 0: return await message.reply("❌ No matches found.")
+        
+        cursor = collection.find(mongo_query, {"title": 1, "author": 1})
+        res = await cursor.limit(8).to_list(length=8)
+        
+        btns = []
+        for b in res:
+            btns.append([InlineKeyboardButton(get_button_label(b.get('title', 'Unknown'))[:40], callback_data=f"v:{str(b['_id'])}")])
+        
+        nav = [InlineKeyboardButton(f"1/{math.ceil(cnt/8)}", callback_data="nop")]
+        if cnt > 8: nav.append(InlineKeyboardButton("➡️", callback_data=f"n:1:{q[:20]}"))
+        btns.append(nav)
+        
+        await message.reply(f"🔎 Results: <b>{html.escape(q)}</b> ({cnt})", reply_markup=InlineKeyboardMarkup(btns), parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await message.reply(f"⚠️ Search Timeout. Try fewer words.")
 
 @app.on_callback_query()
 async def cb_handler(client, cb):
@@ -475,52 +483,52 @@ async def cb_handler(client, cb):
         search_terms = " ".join([f'"{w}"' for w in words])
         mongo_query = {"$text": {"$search": search_terms}}
         
-        cnt = await collection.count_documents(mongo_query)
-        if cnt == 0:
-             and_conditions = []
-             for word in words:
-                 reg = re.compile(re.escape(word), re.IGNORECASE)
-                 and_conditions.append({"$or": [{"title": reg}, {"synopsis": reg}]})
-             mongo_query = { "$and": and_conditions }
-        
-        cursor = collection.find(mongo_query, {"title": 1, "author": 1})
-        res = await cursor.skip(p*8).limit(8).to_list(length=8)
-        
-        btns = []
-        for b in res:
-            btns.append([InlineKeyboardButton(get_button_label(b.get('title', 'Unknown'))[:40], callback_data=f"v:{str(b['_id'])}")])
-        
-        nav = []
-        if p > 0: nav.append(InlineKeyboardButton("⬅️", callback_data=f"n:{p-1}:{q}"))
-        nav.append(InlineKeyboardButton(f"{p+1}/{math.ceil(cnt/8)}", callback_data="nop"))
-        if (p+1)*8 < cnt: nav.append(InlineKeyboardButton("➡️", callback_data=f"n:{p+1}:{q}"))
-        btns.append(nav)
-        
-        await cb.edit_message_text(f"🔎 Results: <b>{html.escape(q)}</b> ({cnt})", reply_markup=InlineKeyboardMarkup(btns), parse_mode=ParseMode.HTML)
+        try:
+            cnt = await collection.count_documents(mongo_query, maxTimeMS=5000)
+            if cnt == 0:
+                 and_conditions = []
+                 for word in words:
+                     reg = re.compile(re.escape(word), re.IGNORECASE)
+                     and_conditions.append({"$or": [{"title": reg}, {"synopsis": reg}]})
+                 mongo_query = { "$and": and_conditions }
+            
+            cursor = collection.find(mongo_query, {"title": 1, "author": 1})
+            res = await cursor.skip(p*8).limit(8).to_list(length=8)
+            
+            btns = []
+            for b in res:
+                btns.append([InlineKeyboardButton(get_button_label(b.get('title', 'Unknown'))[:40], callback_data=f"v:{str(b['_id'])}")])
+            
+            nav = []
+            if p > 0: nav.append(InlineKeyboardButton("⬅️", callback_data=f"n:{p-1}:{q}"))
+            nav.append(InlineKeyboardButton(f"{p+1}/{math.ceil(cnt/8)}", callback_data="nop"))
+            if (p+1)*8 < cnt: nav.append(InlineKeyboardButton("➡️", callback_data=f"n:{p+1}:{q}"))
+            btns.append(nav)
+            
+            await cb.edit_message_text(f"🔎 Results: <b>{html.escape(q)}</b> ({cnt})", reply_markup=InlineKeyboardMarkup(btns), parse_mode=ParseMode.HTML)
+        except: await cb.answer("Timeout.", show_alert=True)
     
     elif d.startswith("v:"):
         bid = d.split(':')[1]
-        try:
-            b = await collection.find_one({"_id": ObjectId(bid)})
-            if not b: return await cb.answer("Gone.", show_alert=True)
-            
-            title = html.escape(b.get('title', 'Unknown'))
-            author = html.escape(b.get('author', 'Unknown'))
-            syn = html.escape(b.get('synopsis', 'No synopsis.').strip())
-            
-            caption = (f"<blockquote><b>{title}</b>\nAuthor: {author}</blockquote>\n\n"
-                       f"<blockquote expandable><b>SYNOPSIS</b>\n\n{syn}</blockquote>")
-            
-            kb = [[InlineKeyboardButton("📥 Download", callback_data=f"d:{bid}")]]
-            
-            await cb.message.delete()
-            if b.get('cover_image'):
-                f = io.BytesIO(b['cover_image']); f.name="c.jpg"
-                try: await client.send_photo(cb.message.chat.id, f, caption=caption, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
-                except: await client.send_message(cb.message.chat.id, caption, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
-            else:
-                await client.send_message(cb.message.chat.id, caption, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
-        except: await cb.answer("Error.", show_alert=True)
+        b = await collection.find_one({"_id": ObjectId(bid)})
+        if not b: return await cb.answer("Gone.", show_alert=True)
+        
+        title = html.escape(b.get('title', 'Unknown'))
+        author = html.escape(b.get('author', 'Unknown'))
+        syn = html.escape(b.get('synopsis', 'No synopsis.').strip())
+        
+        caption = (f"<blockquote><b>{title}</b>\nAuthor: {author}</blockquote>\n\n"
+                   f"<blockquote expandable><b>SYNOPSIS</b>\n\n{syn}</blockquote>")
+        
+        kb = [[InlineKeyboardButton("📥 Download", callback_data=f"d:{bid}")]]
+        
+        await cb.message.delete()
+        if b.get('cover_image'):
+            f = io.BytesIO(b['cover_image']); f.name="c.jpg"
+            try: await client.send_photo(cb.message.chat.id, f, caption=caption, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+            except: await client.send_message(cb.message.chat.id, caption, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+        else:
+            await client.send_message(cb.message.chat.id, caption, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
     
     elif d.startswith("d:"):
         bid = d.split(':')[1]
@@ -538,7 +546,7 @@ async def main():
     global BOT_USERNAME; BOT_USERNAME = (await app.get_me()).username
     logger.info(f"✅ Started @{BOT_USERNAME}")
     
-    # LAUNCH INDEX FIXER IN BACKGROUND (Prevents startup hang)
+    # Non-blocking Index Fix
     asyncio.create_task(ensure_indexes())
     
     config = Config(); config.bind = [f"0.0.0.0:{PORT}"]

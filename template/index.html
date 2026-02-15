@@ -22,19 +22,9 @@
         .card-body { padding: 16px; flex-grow: 1; display: flex; flex-direction: column; }
         .card-title { font-size: 16px; font-weight: 700; margin: 0 0 4px 0; color: white; }
         .card-meta { font-size: 13px; color: var(--accent); margin-bottom: 8px; }
-        
-        /* CSS-Based Truncation */
-        .synopsis { 
-            font-size: 13px; color: var(--text-muted); line-height: 1.5; 
-            max-height: 4.5em; /* Show ~3 lines */
-            overflow: hidden; 
-            transition: max-height 0.3s ease-out;
-            position: relative;
-        }
-        .synopsis.expanded { max-height: 2000px; } /* Expand fully */
-        
+        .synopsis { font-size: 13px; color: var(--text-muted); line-height: 1.5; max-height: 4.5em; overflow: hidden; transition: max-height 0.3s ease-out; }
+        .synopsis.expanded { max-height: 1000px; }
         .read-more-btn { background: none; border: none; color: var(--accent); font-size: 12px; font-weight: 600; cursor: pointer; padding: 0; margin-top: 4px; }
-        
         .tags { display: flex; gap: 6px; margin-top: 10px; flex-wrap: wrap; }
         .tag { background: #333; font-size: 11px; padding: 3px 8px; border-radius: 4px; color: #ccc; }
         .card-actions { margin-left: 10px; padding: 16px; display: flex; flex-direction: column; justify-content: center; border-left: 1px solid var(--border); min-width: 100px; background: #232323; }
@@ -65,9 +55,7 @@
                     <div class="card-body">
                         <div class="card-title">{{ book.title }}</div>
                         <div class="card-meta">👤 {{ book.author }}</div>
-                        <div class="synopsis" id="syn-{{ book._id }}">
-                            {{ book.synopsis }}
-                        </div>
+                        <div class="synopsis" id="syn-{{ book._id }}">{{ book.synopsis }}</div>
                         <button class="read-more-btn" id="btn-{{ book._id }}" onclick="toggleSynopsis('{{ book._id }}')">Show More</button>
                         {% if book.tags %}
                         <div class="tags">{% for tag in book.tags[:4] %}<span class="tag">{{ tag.strip() }}</span>{% endfor %}</div>

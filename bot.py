@@ -7,6 +7,7 @@ import io
 import zipfile
 import html
 import re
+import shutil
 import random
 import json
 import base64
@@ -43,7 +44,8 @@ try:
     if not AZURE_URL: raise ValueError("Missing AZURE_URL")
     
     PORT = int(os.environ.get("PORT", 8080))
-    PUBLIC_URL = os.environ.get("PUBLIC_URL") or f"http://0.0.0.0:{PORT}"
+    # Ensure PUBLIC_URL doesn't have a trailing slash
+    PUBLIC_URL = (os.environ.get("PUBLIC_URL") or f"http://0.0.0.0:{PORT}").rstrip('/')
     SECRET_KEY = os.environ.get("SECRET_KEY", "CHANGE_THIS_TO_RANDOM_STRING")
 
     DB_NAME = os.environ.get("DB_NAME", "novel_library")
@@ -68,6 +70,24 @@ try:
 except Exception as e:
     logger.error(f"❌ DB Connection Error: {e}")
     exit(1)
+
+# --- BACKGROUND TASKS ---
+async def ensure_indexes():
+    """Runs in background to fix DB without freezing the bot."""
+    await asyncio.sleep(5) # Wait for bot to fully start first
+    try:
+        logger.info("🛠 Checking Indexes...")
+        indexes = await collection.index_information()
+        # Only create if missing to save startup time
+        if "TextIndex" not in indexes:
+            logger.info("🛠 Creating Text Index...")
+            await collection.create_index([("title", "text"), ("synopsis", "text")], name="TextIndex", weights={"title": 10, "synopsis": 1})
+        
+        await collection.create_index("file_unique_id", unique=True)
+        await collection.create_index("msg_id")
+        logger.info("✅ Database Optimized.")
+    except Exception as e:
+        logger.error(f"❌ Index Error (Non-fatal): {e}")
 
 # --- WEB APP INIT ---
 web_app = Quart(__name__, template_folder='template')
@@ -101,15 +121,21 @@ def get_button_label(book_doc):
 
 def get_pagination_list(current, total):
     if total <= 1: return []
-    delta = 2; left = current - delta; right = current + delta + 1
-    range_l = []; range_with_dots = []; l = None
+    delta = 2
+    left = current - delta
+    right = current + delta + 1
+    range_l = []
+    range_with_dots = []
+    l = None
     for i in range(1, total + 1):
-        if i == 1 or i == total or (i >= left and i < right): range_l.append(i)
+        if i == 1 or i == total or (i >= left and i < right):
+            range_l.append(i)
     for i in range_l:
         if l:
             if i - l == 2: range_with_dots.append(l + 1)
             elif i - l != 1: range_with_dots.append('...')
-        range_with_dots.append(i); l = i
+        range_with_dots.append(i)
+        l = i
     return range_with_dots
 
 # --- WEB ROUTES ---
@@ -119,7 +145,7 @@ async def health(): return "OK", 200
 @web_app.route('/login')
 async def login():
     token = request.args.get('token')
-    if not token: return "❌ No token.", 400
+    if not token: return "❌ No token provided.", 400
     try:
         user_id = serializer.loads(token, max_age=3600)
         resp = await make_response(redirect(url_for('index')))
@@ -132,14 +158,13 @@ async def index():
     user_id = get_user_from_cookie()
     return await render_template('index.html', query="", results=[], count=0, pagination_list=[], user_id=user_id, bot_username=BOT_USERNAME)
 
-# --- IMAGE SERVER ---
 @web_app.route('/cover/<book_id>')
 async def serve_cover(book_id):
     try:
         b = await collection.find_one({"_id": ObjectId(book_id)}, {"cover_image": 1})
         if b and b.get('cover_image'): return Response(b['cover_image'], mimetype='image/jpeg')
     except: pass
-    # Return 1x1 transparent pixel if no cover to prevent broken image icon
+    # 1x1 Pixel
     return Response(base64.b64decode('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7'), mimetype='image/gif')
 
 @web_app.route('/search')
@@ -147,22 +172,18 @@ async def search():
     user_id = get_user_from_cookie()
     query = request.args.get('q', '').strip()
     page = int(request.args.get('page', 1))
-    limit = 30 # Limit 30 to allow full synopsis loading without timeout
+    limit = 30
     skip = (page - 1) * limit
 
     if not query:
         return await render_template('index.html', query="", results=[], count=0, user_id=user_id, bot_username=BOT_USERNAME)
     
     try:
-        # STRICT AND SEARCH
         words = query.split()
         search_terms = " ".join([f'"{w}"' for w in words])
         mongo_query = {"$text": {"$search": search_terms}}
         
-        # Count First
         cnt = await collection.count_documents(mongo_query)
-        
-        # Fallback to Regex if Text Search misses (e.g. partial words)
         if cnt == 0:
              and_conditions = []
              for word in words:
@@ -171,8 +192,8 @@ async def search():
              mongo_query = { "$and": and_conditions }
              cnt = await collection.count_documents(mongo_query)
 
-        # PROJECTION: Fetch Text Data, EXCLUDE Covers (fetch via /cover/ID)
-        projection = {"title": 1, "author": 1, "tags": 1, "synopsis": 1, "file_name": 1, "_id": 1}
+        # FETCH SYNOPSIS HERE FOR SERVER SIDE RENDER
+        projection = {"title": 1, "author": 1, "synopsis": 1, "tags": 1, "file_name": 1, "_id": 1}
         
         cursor = collection.find(mongo_query, projection)
         books_cursor = await cursor.skip(skip).limit(limit).to_list(length=limit)
@@ -180,14 +201,13 @@ async def search():
         results = []
         for b in books_cursor:
             syn = b.get('synopsis', 'No synopsis available.').strip()
-            # Clean HTML
-            syn = re.sub(r'<[^>]+>', '', syn)
+            syn = re.sub(r'<[^>]+>', '', syn) # Strip HTML
             
             results.append({
                 "_id": str(b['_id']),
                 "title": get_display_title(b),
                 "author": b.get('author', 'Unknown'),
-                "synopsis": syn, # Full synopsis loaded server-side
+                "synopsis": syn,
                 "tags": b.get('tags', '').split(',') if b.get('tags') else []
             })
 
@@ -201,7 +221,7 @@ async def search():
         )
     except Exception as e:
         logger.error(f"Search Error: {e}")
-        return await render_template('index.html', query=query, results=[], error=str(e), user_id=user_id)
+        return await render_template('index.html', query=query, results=[], error="Search failed. Try fewer words.", user_id=user_id)
 
 @web_app.route('/api/download/<book_id>')
 async def api_download(book_id):
@@ -219,49 +239,41 @@ async def api_download(book_id):
     except Exception as e: return jsonify({"status": "error", "message": str(e)}), 500
 
 # --- BOT INIT ---
-if not os.path.exists("sessions"): os.makedirs("sessions")
+# Clean session to force new login and fix connection issues
+if os.path.exists("sessions"):
+    try: shutil.rmtree("sessions")
+    except: pass
+os.makedirs("sessions")
+
 app = Client("sessions/novel_bot_session", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# --- EPUB PARSER (RESTORED) ---
+# --- EPUB PARSER ---
 def parse_epub_direct(file_path):
     meta = {"title": None, "author": "Unknown", "synopsis": "No synopsis.", "tags": "", "cover_image": None}
     try:
         with zipfile.ZipFile(file_path, 'r') as z:
-            opf_path = None
-            try:
-                root = ET.fromstring(z.read('META-INF/container.xml'))
-                for child in root.iter():
-                    if child.get('full-path'): opf_path = child.get('full-path'); break
-            except: pass
-            if not opf_path:
-                for n in z.namelist():
-                    if n.endswith('.opf'): opf_path = n; break
+            opf_path = next((n for n in z.namelist() if n.endswith('.opf')), None)
             if not opf_path: return meta
-            try:
-                root = ET.fromstring(z.read(opf_path))
-                ns = {'dc': 'http://purl.org/dc/elements/1.1/', 'opf': 'http://www.idpf.org/2007/opf'}
-                # Extract Metadata
-                for elem in root.findall('.//{http://purl.org/dc/elements/1.1/}title'): meta['title'] = elem.text
-                for elem in root.findall('.//{http://purl.org/dc/elements/1.1/}creator'): meta['author'] = elem.text
-                for elem in root.findall('.//{http://purl.org/dc/elements/1.1/}description'): meta['synopsis'] = elem.text
-                for elem in root.findall('.//{http://purl.org/dc/elements/1.1/}subject'): meta['tags'] += (elem.text or "") + ", "
-                
-                # Extract Cover
-                cover_id = None
-                for meta_tag in root.findall('.//{http://www.idpf.org/2007/opf}meta'):
-                    if meta_tag.get('name') == 'cover': cover_id = meta_tag.get('content')
-                
-                for item in root.findall('.//{http://www.idpf.org/2007/opf}item'):
-                    if item.get('id') == cover_id or 'cover-image' in item.get('properties', ''):
-                        href = item.get('href')
-                        if '/' in opf_path: href = os.path.join(os.path.dirname(opf_path), href)
-                        if href in z.namelist(): meta['cover_image'] = z.read(href); break
-            except: pass
+            root = ET.fromstring(z.read(opf_path))
+            for elem in root.findall('.//{http://purl.org/dc/elements/1.1/}title'): meta['title'] = elem.text
+            for elem in root.findall('.//{http://purl.org/dc/elements/1.1/}creator'): meta['author'] = elem.text
+            for elem in root.findall('.//{http://purl.org/dc/elements/1.1/}description'): meta['synopsis'] = elem.text
+            for elem in root.findall('.//{http://purl.org/dc/elements/1.1/}subject'): 
+                if elem.text: meta['tags'] += elem.text + ", "
+            
+            cover_id = None
+            for meta_tag in root.findall('.//{http://www.idpf.org/2007/opf}meta'):
+                if meta_tag.get('name') == 'cover': cover_id = meta_tag.get('content')
+            
+            for item in root.findall('.//{http://www.idpf.org/2007/opf}item'):
+                if item.get('id') == cover_id or 'cover-image' in item.get('properties', '').lower():
+                    href = item.get('href')
+                    if '/' in opf_path: href = os.path.join(os.path.dirname(opf_path), href)
+                    if href in z.namelist(): meta['cover_image'] = z.read(href); break
     except: pass
     if meta['tags'].endswith(", "): meta['tags'] = meta['tags'][:-2]
     return meta
 
-# --- BACKGROUND WORKER (RESTORED) ---
 async def indexing_process(client, start_id, end_id, status_msg):
     global indexing_active, files_found, files_saved
     files_found = 0; files_saved = 0
@@ -331,12 +343,19 @@ async def indexing_process(client, start_id, end_id, status_msg):
             try: await status_msg.edit(f"✅ **Done!**\nScanned: `{end_id}`\nFound: `{files_found}`\nSaved: `{files_saved}`")
             except: pass
 
-# --- ADMIN COMMANDS (RESTORED) ---
 @app.on_message(filters.command("url"))
 async def url_cmd(client, message):
     try:
         token = serializer.dumps(message.from_user.id)
         await message.reply(f"🔗 <b>Link:</b>\n<code>{PUBLIC_URL}/login?token={token}</code>", parse_mode=ParseMode.HTML)
+    except: pass
+
+@app.on_message(filters.command("stats"))
+async def stats_handler(client, message):
+    try:
+        c = await collection.count_documents({})
+        cv = await collection.count_documents({"cover_image": {"$ne": None}})
+        await message.reply(f"📊 **Stats**\n📚 Books: `{c}`\n🖼️ Covers: `{cv}`")
     except: pass
 
 @app.on_message(filters.command("index") & filters.user(ADMIN_ID))
@@ -400,16 +419,12 @@ async def import_cmd(client, message):
 
 @app.on_message(filters.command("fix_search") & filters.user(ADMIN_ID))
 async def fix_search_cmd(client, message):
-    s = await message.reply("🛠 **Optimizing Database...**")
-    try:
-        await collection.drop_indexes()
-        await collection.create_index([("title", "text"), ("synopsis", "text")], name="TextIndex")
-        await collection.create_index("file_unique_id", unique=True)
-        await s.edit("✅ **Fixed!** Strict Search Enabled.")
-    except Exception as e: await s.edit(f"❌ Error: {e}")
+    # Manual Trigger for Indexing
+    s = await message.reply("🛠 **Rebuilding Index...**")
+    await ensure_indexes()
+    await s.edit("✅ **Done!**")
 
-# --- BOT SEARCH (STRICT AND) ---
-@app.on_message(filters.text & filters.incoming & ~filters.command(["start", "index", "stop_index", "url", "export", "import", "fix_search"]))
+@app.on_message(filters.text & filters.incoming & ~filters.command(["start", "index", "stop_index", "url", "export", "import", "fix_search", "stats"]))
 async def bot_search(client, message):
     q = message.text.strip()
     if not q: return
@@ -420,7 +435,6 @@ async def bot_search(client, message):
     
     cnt = await collection.count_documents(mongo_query)
     if cnt == 0:
-        # Fallback to Regex for partial matches
         and_conditions = []
         for word in words:
             reg = re.compile(re.escape(word), re.IGNORECASE)
@@ -431,14 +445,14 @@ async def bot_search(client, message):
     if cnt == 0: return await message.reply("❌ No matches found.")
     
     cursor = collection.find(mongo_query, {"title": 1, "author": 1})
-    res = await cursor.limit(10).to_list(length=10)
+    res = await cursor.limit(8).to_list(length=8)
     
     btns = []
     for b in res:
         btns.append([InlineKeyboardButton(get_button_label(b.get('title', 'Unknown'))[:40], callback_data=f"v:{str(b['_id'])}")])
     
-    nav = [InlineKeyboardButton(f"1/{math.ceil(cnt/10)}", callback_data="nop")]
-    if cnt > 10: nav.append(InlineKeyboardButton("➡️", callback_data=f"n:1:{q[:20]}"))
+    nav = [InlineKeyboardButton(f"1/{math.ceil(cnt/8)}", callback_data="nop")]
+    if cnt > 8: nav.append(InlineKeyboardButton("➡️", callback_data=f"n:1:{q[:20]}"))
     btns.append(nav)
     
     await message.reply(f"🔎 Results: <b>{html.escape(q)}</b> ({cnt})", reply_markup=InlineKeyboardMarkup(btns), parse_mode=ParseMode.HTML)
@@ -462,7 +476,7 @@ async def cb_handler(client, cb):
              mongo_query = { "$and": and_conditions }
         
         cursor = collection.find(mongo_query, {"title": 1, "author": 1})
-        res = await cursor.skip(p*10).limit(10).to_list(length=10)
+        res = await cursor.skip(p*8).limit(8).to_list(length=8)
         
         btns = []
         for b in res:
@@ -470,58 +484,58 @@ async def cb_handler(client, cb):
         
         nav = []
         if p > 0: nav.append(InlineKeyboardButton("⬅️", callback_data=f"n:{p-1}:{q}"))
-        nav.append(InlineKeyboardButton(f"{p+1}/{math.ceil(cnt/10)}", callback_data="nop"))
-        if (p+1)*10 < cnt: nav.append(InlineKeyboardButton("➡️", callback_data=f"n:{p+1}:{q}"))
+        nav.append(InlineKeyboardButton(f"{p+1}/{math.ceil(cnt/8)}", callback_data="nop"))
+        if (p+1)*8 < cnt: nav.append(InlineKeyboardButton("➡️", callback_data=f"n:{p+1}:{q}"))
         btns.append(nav)
         
         await cb.edit_message_text(f"🔎 Results: <b>{html.escape(q)}</b> ({cnt})", reply_markup=InlineKeyboardMarkup(btns), parse_mode=ParseMode.HTML)
     
     elif d.startswith("v:"):
         bid = d.split(':')[1]
-        try:
-            b = await collection.find_one({"_id": ObjectId(bid)})
-            if not b: return await cb.answer("Gone.", show_alert=True)
-            
-            title = html.escape(b.get('title', 'Unknown'))
-            author = html.escape(b.get('author', 'Unknown'))
-            syn = html.escape(b.get('synopsis', 'No synopsis.').strip())
-            
-            # THE RESTORED FORMATTING
-            caption = (
-                f"<blockquote><b>{title}</b>\n"
-                f"👤 {author}</blockquote>\n\n"
-                f"<blockquote expandable>{syn}</blockquote>"
-            )
-            kb = [[InlineKeyboardButton("📥 Download", callback_data=f"d:{bid}")]]
-            
-            await cb.message.delete()
-            if b.get('cover_image'):
-                f = io.BytesIO(b['cover_image']); f.name="cover.jpg"
-                try: await client.send_photo(cb.message.chat.id, f, caption=caption, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
-                except: await client.send_message(cb.message.chat.id, caption, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
-            else:
-                await client.send_message(cb.message.chat.id, caption, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
-        except: await cb.answer("Error.", show_alert=True)
+        b = await collection.find_one({"_id": ObjectId(bid)})
+        if not b: return await cb.answer("Gone.", show_alert=True)
+        
+        title = html.escape(b.get('title', 'Unknown'))
+        author = html.escape(b.get('author', 'Unknown'))
+        syn = html.escape(b.get('synopsis', 'No synopsis.').strip())
+        
+        caption = (f"<blockquote><b>{title}</b>\nAuthor: {author}</blockquote>\n\n"
+                   f"<blockquote expandable>{syn}</blockquote>")
+        
+        kb = [[InlineKeyboardButton("📥 Download", callback_data=f"d:{bid}")]]
+        
+        await cb.message.delete()
+        if b.get('cover_image'):
+            f = io.BytesIO(b['cover_image']); f.name="c.jpg"
+            try: await client.send_photo(cb.message.chat.id, f, caption=caption, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+            except: await client.send_message(cb.message.chat.id, caption, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+        else:
+            await client.send_message(cb.message.chat.id, caption, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
     
     elif d.startswith("d:"):
         bid = d.split(':')[1]
-        try:
-            b = await collection.find_one({"_id": ObjectId(bid)})
-            await cb.answer("🚀 Sending...")
-            await client.send_document(cb.message.chat.id, b['file_id'], caption=f"📖 {b.get('title')}")
-        except: await cb.answer("File missing.", show_alert=True)
+        b = await collection.find_one({"_id": ObjectId(bid)})
+        await cb.answer("🚀 Sending...")
+        await client.send_document(cb.message.chat.id, b['file_id'], caption=f"📖 {b.get('title')}")
 
 async def main():
     logger.info("🤖 Starting...")
     await app.start()
-    try: urllib.request.urlopen(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook?drop_pending_updates=True")
+    
+    # Force delete webhook to ensure polling works
+    try: await app.delete_webhook()
     except: pass
+    
     global BOT_USERNAME; BOT_USERNAME = (await app.get_me()).username
     logger.info(f"✅ Started @{BOT_USERNAME}")
+    
+    # Run Indexer in Background (Non-blocking)
+    asyncio.create_task(ensure_indexes())
+    
     config = Config(); config.bind = [f"0.0.0.0:{PORT}"]
-    logger.info(f"🚀 Web Server on {PORT}")
-    await serve(web_app, config)
-    await idle(); await app.stop()
+    asyncio.create_task(serve(web_app, config))
+    await idle()
+    await app.stop()
 
 if __name__ == '__main__':
     try: asyncio.run(main())

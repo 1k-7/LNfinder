@@ -42,6 +42,7 @@ try:
     AZURE_URL = os.environ.get("AZURE_URL")
     if not AZURE_URL: raise ValueError("Missing AZURE_URL")
     
+    # Optional legacy support
     LEGACY_STR = os.environ.get("MONGO_URI") or os.environ.get("MONGO_URL") or ""
     LEGACY_URIS = LEGACY_STR.split() if LEGACY_STR else []
     
@@ -103,6 +104,7 @@ def get_display_title(book_doc):
 
 def get_button_label(book_doc):
     full = get_display_title(book_doc)
+    # Strip chapter numbers for cleaner buttons
     return re.sub(r'\s+(c|ch|chap|vol|v)\.?\s*\d+(?:[-–]\d+)?.*$', '', full, flags=re.IGNORECASE).strip()
 
 def get_pagination_list(current, total):
@@ -172,34 +174,36 @@ async def search():
     try:
         words = query.split()
         
-        # --- 1. Try Fast Text Search (Exact Words) ---
+        # --- 1. PRIMARY: Text Search (Fast AND Logic) ---
+        # Wrapping in quotes forces mandatory match for each word
         text_query = " ".join([f'"{w}"' for w in words])
         mongo_query = {"$text": {"$search": text_query}}
         
         cnt = await collection.count_documents(mongo_query)
         
-        # --- 2. Fallback: Strict AND Partial Regex ---
-        # If text search finds nothing, we use regex to match partial words (e.g. "Hog" -> "Hogwarts")
-        # FIX: We build a separate OR condition for EACH word, then AND them all together.
+        # --- 2. FALLBACK: Strict Regex AND Logic ---
+        # If text search misses (e.g. partial words), use Regex.
+        # CRITICAL FIX: We build a list of conditions where EVERY word 
+        # must appear in (Title OR Synopsis OR File).
         if cnt == 0:
             and_conditions = []
             for word in words:
                 reg = re.compile(re.escape(word), re.IGNORECASE)
-                # Word must be in Title OR Author OR File Name OR Synopsis
+                # This group means: "This specific word must be in one of these fields"
                 word_group = {
                     "$or": [
                         {"title": reg},
-                        {"author": reg},
-                        {"file_name": reg},
-                        {"synopsis": reg}
+                        {"synopsis": reg},
+                        {"file_name": reg}
                     ]
                 }
                 and_conditions.append(word_group)
             
+            # Combine all word groups with $and
             mongo_query = {"$and": and_conditions}
             cnt = await collection.count_documents(mongo_query)
 
-        # Execution (No Sort for speed)
+        # Execute Query (No Sort for Performance)
         cursor = collection.find(mongo_query)
         books_cursor = await cursor.skip(skip).limit(limit).to_list(length=limit)
         
@@ -506,7 +510,7 @@ async def fix_search_cmd(client, message):
     s = await message.reply("🛠 **Optimizing Database...**\nCreating Wildcard Text Index.")
     try:
         await collection.drop_indexes()
-        # Wildcard index to support efficient text search on all string fields
+        # Wildcard index allows $text search on ALL string fields
         await collection.create_index([("$**", "text")])
         await collection.create_index("file_unique_id", unique=True)
         await collection.create_index("msg_id")
@@ -526,14 +530,13 @@ async def search_handler(client, message):
     try:
         words = real_q.split()
         
-        # 1. Strict Text Search (AND Logic)
+        # 1. Text Search (Strict AND via quotes)
         text_query = " ".join([f'"{w}"' for w in words])
         mongo_query = {"$text": {"$search": text_query}}
         
         cnt = await collection.count_documents(mongo_query)
         
-        # 2. Fallback to Strict Partial Regex (AND Logic)
-        # If no full text match, try partial match BUT ensure EVERY word is found.
+        # 2. Fallback (Strict Regex AND)
         if cnt == 0:
              and_conditions = []
              for word in words:
@@ -541,9 +544,8 @@ async def search_handler(client, message):
                  and_conditions.append({
                      "$or": [
                          {"title": reg},
-                         {"author": reg},
-                         {"file_name": reg},
-                         {"synopsis": reg}
+                         {"synopsis": reg},
+                         {"file_name": reg}
                      ]
                  })
              mongo_query = {"$and": and_conditions}
@@ -552,7 +554,7 @@ async def search_handler(client, message):
         if cnt == 0:
             return await message.reply("❌ No matches found.")
 
-        # Fetch Top 8 (No sort for speed)
+        # Fetch Top 8
         cursor = collection.find(mongo_query)
         res = await cursor.limit(8).to_list(length=8)
 
@@ -583,12 +585,9 @@ async def callback_handler(client, callback_query):
             _, p, q = d.split(':', 2)
             p = int(p)
             real_q = q
-            keep_result = False
-            if q.startswith("!!"): keep_result=True; real_q=q[2:].strip()
             
+            # --- SAME STRICT LOGIC FOR PAGINATION ---
             words = real_q.split()
-            
-            # SAME LOGIC AS ABOVE
             text_query = " ".join([f'"{w}"' for w in words])
             mongo_query = {"$text": {"$search": text_query}}
             
@@ -601,9 +600,8 @@ async def callback_handler(client, callback_query):
                      and_conditions.append({
                          "$or": [
                              {"title": reg},
-                             {"author": reg},
-                             {"file_name": reg},
-                             {"synopsis": reg}
+                             {"synopsis": reg},
+                             {"file_name": reg}
                          ]
                      })
                  mongo_query = {"$and": and_conditions}
@@ -617,7 +615,7 @@ async def callback_handler(client, callback_query):
             btns = []
             for b in res:
                 label = get_button_label(b)[:40]
-                cb_data = f"v:{str(b['_id'])}:k" if keep_result else f"v:{str(b['_id'])}"
+                cb_data = f"v:{str(b['_id'])}"
                 btns.append([InlineKeyboardButton(f"{label}", callback_data=cb_data)])
             
             nav = []
@@ -672,7 +670,6 @@ async def main():
     logger.info("🤖 Starting Telegram Bot...")
     await app.start()
     
-    # --- CRITICAL FIX FOR GHOST WEBHOOK (MANUAL) ---
     try:
         logger.info("🧹 Nuking Webhook...")
         with urllib.request.urlopen(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook?drop_pending_updates=True") as response:

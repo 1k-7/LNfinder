@@ -130,9 +130,18 @@ class LocalSearchDB:
     def search(self, query, page=1, limit=24):
         cursor = self.conn.cursor()
         offset = (page - 1) * limit
-        clean_q = re.sub(r'[^\w\s]', '', query).strip()
         
-        # Handle special prefixes for parsing, but keep them for logic check later
+        # 1. Handle the new title-only prefix BEFORE stripping punctuation
+        raw_query = query.strip()
+        title_only = False
+        if raw_query.startswith("**"):
+            title_only = True
+            raw_query = raw_query[2:].strip()
+            
+        # 2. Clean the query
+        clean_q = re.sub(r'[^\w\s]', '', raw_query).strip()
+        
+        # Handle original special prefixes for parsing 
         search_q = clean_q
         if search_q.startswith("!!") or search_q.startswith(".."):
             search_q = search_q[2:].strip()
@@ -142,20 +151,31 @@ class LocalSearchDB:
         words = search_q.split()
         try:
             if len(words) == 1:
-                # Single Word: Loose LIKE search
-                sql = "SELECT *, rowid FROM books_fts WHERE title LIKE ? OR author LIKE ? OR synopsis LIKE ? ORDER BY rank LIMIT ? OFFSET ?"
-                wild = f"%{search_q}%"
-                cursor.execute(sql, (wild, wild, wild, limit, offset))
-                rows = cursor.fetchall()
-                c_sql = "SELECT count(*) FROM books_fts WHERE title LIKE ? OR author LIKE ? OR synopsis LIKE ?"
-                cursor.execute(c_sql, (wild, wild, wild))
-                total = cursor.fetchone()[0]
-            else:
-                # Multi Word: Strict FTS5 AND
-                fts_query = " AND ".join([f'"{w}"' for w in words])
+                # FIXED: Now uses FTS MATCH instead of slow LIKE
+                w = words[0]
+                if title_only:
+                    fts_query = f'title:"{w}"'
+                else:
+                    fts_query = f'"{w}"'
+                
                 sql = "SELECT *, rowid FROM books_fts WHERE books_fts MATCH ? ORDER BY rank LIMIT ? OFFSET ?"
                 cursor.execute(sql, (fts_query, limit, offset))
                 rows = cursor.fetchall()
+                
+                c_sql = "SELECT count(*) FROM books_fts WHERE books_fts MATCH ?"
+                cursor.execute(c_sql, (fts_query,))
+                total = cursor.fetchone()[0]
+            else:
+                # Multi Word: Strict FTS5 AND (Kept original logic, added title_only support)
+                if title_only:
+                    fts_query = " AND ".join([f'title:"{w}"' for w in words])
+                else:
+                    fts_query = " AND ".join([f'"{w}"' for w in words])
+                    
+                sql = "SELECT *, rowid FROM books_fts WHERE books_fts MATCH ? ORDER BY rank LIMIT ? OFFSET ?"
+                cursor.execute(sql, (fts_query, limit, offset))
+                rows = cursor.fetchall()
+                
                 cursor.execute("SELECT count(*) FROM books_fts WHERE books_fts MATCH ?", (fts_query,))
                 total = cursor.fetchone()[0]
 
@@ -340,7 +360,7 @@ async def api_download(book_id):
 if not os.path.exists("sessions"): os.makedirs("sessions")
 app = Client("sessions/novel_bot_session", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, sleep_threshold=60)
 
-@app.on_message(filters.text & filters.private & ~filters.command(["start", "url", "index", "stats", "export_cache"]))
+@app.on_message(filters.text & filters.private & ~filters.command(["start", "url", "index", "stats", "export_cache", "spoilcover"]))
 async def bot_search_handler(client, message):
     q = message.text.strip()
     if len(q) < 2: return
@@ -412,12 +432,23 @@ async def callback_handler(client, cb):
         else:
             await cb.answer("Opening...")
 
+        # --- CHECK USER SPOILER SETTING ---
+        user_setting = await db['user_settings'].find_one({"_id": cb.message.chat.id})
+        spoil_cover = user_setting.get("spoil_cover", False) if user_setting else False
+
         # Send Msg 1: Cover/Title
         if b_mongo.get('cover_image'):
             try:
                 f = io.BytesIO(b_mongo['cover_image']); f.name="c.jpg"
-                await client.send_photo(cb.message.chat.id, f, caption=header_text, parse_mode=ParseMode.HTML)
-            except: 
+                await client.send_photo(
+                    cb.message.chat.id, 
+                    f, 
+                    caption=header_text, 
+                    parse_mode=ParseMode.HTML,
+                    has_spoiler=spoil_cover
+                )
+            except Exception as e: 
+                logger.error(f"Failed to send photo: {e}")
                 await client.send_message(cb.message.chat.id, header_text, parse_mode=ParseMode.HTML)
         else:
             await client.send_message(cb.message.chat.id, header_text, parse_mode=ParseMode.HTML)
@@ -435,6 +466,23 @@ async def callback_handler(client, cb):
             await cb.answer("Error.", show_alert=True)
 
 # --- COMMANDS ---
+@app.on_message(filters.command("spoilcover") & filters.private)
+async def spoilcover_cmd(client, message):
+    if len(message.command) < 2:
+        return await message.reply("⚙️ **Usage:** `/spoilcover on` or `/spoilcover off`")
+    
+    state = message.command[1].lower()
+    user_id = message.from_user.id
+
+    if state == "on":
+        await db['user_settings'].update_one({"_id": user_id}, {"$set": {"spoil_cover": True}}, upsert=True)
+        await message.reply("✅ **Cover Spoilers Enabled:** Cover images will now be sent with spoilers.")
+    elif state == "off":
+        await db['user_settings'].update_one({"_id": user_id}, {"$set": {"spoil_cover": False}}, upsert=True)
+        await message.reply("❌ **Cover Spoilers Disabled:** Cover images will be sent normally.")
+    else:
+        await message.reply("⚙️ **Usage:** `/spoilcover on` or `/spoilcover off`")
+
 @app.on_message(filters.command("start"))
 async def start_handler(client, message): await message.reply("👋 **LN Library**\nCached Engine Active ⚡")
 
